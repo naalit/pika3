@@ -40,7 +40,7 @@
 // --> parent module accumulator
 // CORE SYNTAX (TYPED) FOR PARENT MODULE (`Definition`? `Module`?)
 
-use std::{collections::HashMap, sync::RwLock};
+use std::{borrow::Borrow, collections::HashMap, marker::PhantomData, sync::RwLock};
 
 use crate::common::*;
 
@@ -55,32 +55,61 @@ use crate::common::*;
 // So I'll stick with internal mutability for now
 
 // Other option: put the Str directly in here. Pro: lookup without DB, Con: 8 bytes instead of 4
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Name(u32);
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Interned<T>(u32, PhantomData<T>);
+impl<T: Clone> Copy for Interned<T> {}
+
+// TODO should this be a newtype instead of an alias?
+pub type Name = Interned<Str>;
+
+#[derive(Clone, Default)]
+struct Interner<T> {
+    t_to_x: Arc<RwLock<HashMap<T, Interned<T>>>>,
+    x_to_t: Arc<RwLock<Vec<T>>>,
+}
+impl<T: Clone + Eq + std::hash::Hash> Interner<T> {
+    // TODO determine if these are the right bounds
+    fn intern<U: Eq + std::hash::Hash + ?Sized>(&self, s: &U) -> Interned<T>
+    where
+        T: Borrow<U>,
+        for<'a> &'a U: Into<T>,
+    {
+        let str_to_name = self.t_to_x.read().unwrap();
+        match str_to_name.get(&s) {
+            Some(n) => *n,
+            None => {
+                drop(str_to_name);
+                let mut t_to_x = self.t_to_x.write().unwrap();
+                let mut x_to_t = self.x_to_t.write().unwrap();
+                let n = Interned(x_to_t.len() as u32, PhantomData);
+                let value = s.into();
+                x_to_t.push(value.clone());
+                t_to_x.insert(value, n);
+                n
+            }
+        }
+    }
+
+    fn get(&self, n: Name) -> T {
+        self.x_to_t
+            .read()
+            .unwrap()
+            .get(n.0 as usize)
+            .unwrap()
+            .clone()
+    }
+}
 
 #[derive(Clone, Default)]
 pub struct DB {
-  str_to_name: Arc<RwLock<HashMap<Str, Name>>>,
-  name_to_str: Arc<RwLock<Vec<Str>>>,
+    names: Interner<Str>,
 }
 impl DB {
-  pub fn name(&self, s: &str) -> Name {
-    let str_to_name = self.str_to_name.read().unwrap();
-    match str_to_name.get(s) {
-        Some(n) => *n,
-        None => {
-          drop(str_to_name);
-          let mut str_to_name = self.str_to_name.write().unwrap();
-          let mut name_to_str = self.name_to_str.write().unwrap();
-          let n = Name(name_to_str.len() as u32);
-          name_to_str.push(s.into());
-          str_to_name.insert(s.into(), n);
-          n
-        }
+    pub fn name(&self, s: &str) -> Name {
+        self.names.intern(s)
     }
-  }
 
-  pub fn get(&self, n: Name) -> Str {
-    self.name_to_str.read().unwrap().get(n.0 as usize).unwrap().clone()
-  }
+    pub fn get(&self, n: Name) -> Str {
+        self.names.get(n)
+    }
 }
