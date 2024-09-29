@@ -1,0 +1,2 @@
+# comment
+def f : a -> a = x => x

@@ -1,10 +1,9 @@
-use std::{num::NonZeroU32, sync::Arc};
+mod common;
+mod query;
 
-use tap::Tap;
+use std::{fs::File, io::Read};
 
-fn default<T: Default>() -> T {
-    Default::default()
-}
+use crate::common::*;
 
 // types
 
@@ -21,12 +20,13 @@ impl Idx {
     }
 }
 
-type Name = &'static str;
-
 enum Term {
     Var(Name, Idx), // really Spanned<Name>
     App(Box<Term>, Box<Term>),
-    Lam(Name, Arc<Term>), // no type annotations for now
+    /// Argument type annotation
+    Fun(Class, Name, Box<Term>, Arc<Term>),
+    Error,
+    Type,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -34,10 +34,19 @@ struct Sym(Name, NonZeroU32);
 
 type Env = im::Vector<Val>;
 
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum Class {
+    Lam,
+    Pi,
+}
+use Class::*;
+
 #[derive(Clone)]
 enum Val {
-    Neutral(Sym, Vec<Val>),    // will be im::Vector<Elim> in the future pry?
-    Lam(Name, Arc<Term>, Env), // oh update im::Vector is *way* bigger than Vec in terms of stack size
+    Neutral(Sym, Vec<Val>), // will be im::Vector<Elim> in the future pry?
+    Fun(Class, Name, Arc<Val>, Arc<Term>, Env), // oh update im::Vector is *way* bigger than Vec in terms of stack size. 64 vs 24 bytes. so it might be best to stick with Vec(Cow<Vec>?) or roll our own
+    Error,
+    Type,
 }
 
 // eval
@@ -46,7 +55,9 @@ impl Val {
     pub fn app(self, other: Val) -> Val {
         match self {
             Val::Neutral(s, vec) => Val::Neutral(s, vec.tap_mut(|v| v.push(other))),
-            Val::Lam(_, body, env) => body.eval(&env.tap_mut(|v| v.push_back(other))),
+            Val::Fun(Lam, _, _, body, env) => body.eval(&env.tap_mut(|v| v.push_back(other))),
+            Val::Error => Val::Error,
+            _ => unreachable!(),
         }
     }
 }
@@ -56,58 +67,260 @@ impl Term {
         match self {
             Term::Var(_, idx) => idx.at(env),
             Term::App(f, x) => f.eval(env).app(x.eval(env)),
-            Term::Lam(s, body) => Val::Lam(*s, body.clone(), env.clone()),
+            Term::Fun(c, s, aty, body) => {
+                Val::Fun(*c, *s, Arc::new(aty.eval(env)), body.clone(), env.clone())
+            }
+            Term::Error => Val::Error,
+            Term::Type => Val::Type,
         }
     }
 }
 
-type QEnv = (im::HashMap<Sym, u32>, NonZeroU32);
-impl Sym {
-    fn at(self, qenv: &QEnv) -> Idx {
-        // i don't *think* this is an off-by-one error...
-        Idx((1 + qenv.0.len() as u32 - qenv.0.get(&self).unwrap())
-            .try_into()
-            .unwrap())
+#[derive(Copy, Clone)]
+struct SymCxt(NonZeroU32);
+impl Default for SymCxt {
+    fn default() -> Self {
+        Self(1.try_into().unwrap())
+    }
+}
+impl SymCxt {
+    fn bind(&mut self, s: Name) -> Sym {
+        let s = Sym(s, self.0);
+        self.0 = self.0.checked_add(1).unwrap();
+        s
     }
 }
 
+#[derive(Clone, Default)]
+struct QEnv {
+    lvls: im::HashMap<Sym, u32>,
+    scxt: SymCxt,
+}
+impl QEnv {
+    fn get(&self, sym: Sym) -> Idx {
+        // i don't *think* this is an off-by-one error...
+        Idx((1 + self.lvls.len() as u32 - self.lvls.get(&sym).unwrap())
+            .try_into()
+            .unwrap())
+    }
+
+    fn bind(&self, s: Name, env: &Env) -> (Sym, SEnv) {
+        let mut scxt = self.scxt;
+        let sym = scxt.bind(s);
+        let mut env = env.clone();
+        let mut qenv = self.clone();
+        env.push_back(Val::Neutral(sym, Vec::new()));
+        qenv.scxt = scxt;
+        qenv.lvls.insert(sym, qenv.lvls.len() as u32 + 1);
+        (sym, SEnv { qenv, env })
+    }
+}
+
+#[derive(Clone, Default)]
+struct SEnv {
+    qenv: QEnv,
+    env: Env,
+}
+
 impl Term {
-    pub fn subst(&self, env: &Env, qenv: &QEnv) -> Term {
+    pub fn subst(&self, env: &SEnv) -> Term {
         match self {
-            Term::Var(_, idx) => idx.at(env).quote(qenv),
-            Term::App(f, x) => {
-                Term::App(Box::new(f.subst(env, qenv)), Box::new(x.subst(env, qenv)))
+            Term::Var(_, idx) => idx.at(&env.env).quote(&env.qenv),
+            Term::App(f, x) => Term::App(Box::new(f.subst(env)), Box::new(x.subst(env))),
+            Term::Fun(c, s, aty, body) => Term::Fun(
+                *c,
+                *s,
+                Box::new(aty.subst(env)),
+                Arc::new(body.subst(&env.qenv.bind(*s, &env.env).1)),
+            ),
+            Term::Error => Term::Error,
+            Term::Type => Term::Type,
+        }
+    }
+}
+
+impl Val {
+    pub fn quote(&self, env: &QEnv) -> Term {
+        match self {
+            Val::Neutral(s, spine) => spine.iter().fold(Term::Var(s.0, env.get(*s)), |acc, x| {
+                Term::App(Box::new(acc), Box::new(x.quote(env)))
+            }),
+            Val::Fun(c, s, aty, body, inner_env) => Term::Fun(
+                *c,
+                *s,
+                Box::new(aty.quote(env)),
+                Arc::new(body.subst(&env.bind(*s, inner_env).1)),
+            ),
+            Val::Error => Term::Error,
+            Val::Type => Term::Type,
+        }
+    }
+}
+
+// presyntax
+
+enum Pre {
+    Var(Name),
+    App(SPre, SPre),
+    /// Argument type annotation
+    Fun(Class, Name, Option<SPre>, SPre),
+}
+type SPre = S<Box<Pre>>;
+
+// elaboration
+
+#[derive(Clone, Default)]
+struct Cxt {
+    db: DB,
+    // levels, starting at 0
+    bindings: im::HashMap<Name, (u32, Val)>,
+    env: SEnv,
+    errors: Ref<Vec<S<Str>>>,
+}
+impl Cxt {
+    fn err(&self, err: impl Into<Str>, span: Span) {
+        self.errors.with_mut(|v| v.push(S(err.into(), span)));
+    }
+    fn lookup(&self, n: Name) -> Option<(Idx, Val)> {
+        self.bindings.get(&n).map(|(lvl, val)| {
+            (
+                Idx(NonZeroU32::new(self.bindings.len() as u32 - lvl).unwrap()),
+                val.clone(),
+            )
+        })
+    }
+    fn bind(&self, n: Name, ty: Val) -> (Sym, Cxt) {
+        let mut s = self.clone();
+        s.bindings.insert(n, (s.bindings.len() as u32, ty));
+        let (sym, env) = s.env.qenv.bind(n, &s.env.env);
+        s.env = env;
+        (sym, s)
+    }
+    fn env(&self) -> &Env {
+        &self.env.env
+    }
+    fn qenv(&self) -> &QEnv {
+        &self.env.qenv
+    }
+    fn senv(&self) -> &SEnv {
+        &self.env
+    }
+    fn scxt(&self) -> SymCxt {
+        self.env.qenv.scxt
+    }
+}
+
+impl Val {
+    fn unify(&self, other: &Val, scxt: SymCxt) -> bool {
+        match (self, other) {
+            (Val::Error, _) | (_, Val::Error) => true,
+            (Val::Type, Val::Type) => true,
+            (Val::Neutral(s, sp), Val::Neutral(s2, sp2)) if s == s2 => {
+                sp.len() == sp2.len() && sp.iter().zip(sp2).all(|(x, y)| x.unify(y, scxt))
             }
-            Term::Lam(s, body) => {
-                let sym = Sym(*s, qenv.1);
-                let mut env = env.clone();
-                let mut qenv = qenv.clone();
-                env.push_back(Val::Neutral(sym, Vec::new()));
-                qenv.1 = qenv.1.checked_add(1).unwrap();
-                qenv.0.insert(sym, qenv.0.len() as u32 + 1);
-                Term::Lam(*s, Arc::new(body.subst(&env, &qenv)))
+            (Val::Fun(Pi, n1, aty, _, _), Val::Fun(Pi, _, aty2, _, _)) => {
+                let mut scxt2 = scxt;
+                let s = scxt2.bind(*n1);
+                let arg = Val::Neutral(s, Vec::new());
+                aty.unify(aty2, scxt)
+                    && self
+                        .clone()
+                        .app(arg.clone())
+                        .unify(&other.clone().app(arg), scxt2)
+            }
+            (_, _) => false,
+        }
+    }
+}
+
+impl SPre {
+    fn infer(&self, cxt: &Cxt) -> (Term, Val) {
+        match &***self {
+            Pre::Var(name) => match cxt.lookup(*name) {
+                Some((ix, ty)) => (Term::Var(*name, ix), ty),
+                None => {
+                    cxt.err(format!("not found: {}", cxt.db.get(*name)), self.span());
+                    (Term::Error, Val::Error)
+                }
+            },
+            Pre::App(fs, x) => {
+                let (f, fty) = fs.infer(cxt);
+                let aty = match &fty {
+                    Val::Error => Val::Error,
+                    Val::Fun(Pi, _, aty, _, _) => (**aty).clone(),
+                    _ => {
+                        cxt.err(format!("not a function type: {}", fty.show(cxt)), fs.span());
+                        Val::Error
+                    }
+                };
+                let x = x.check(aty, cxt);
+                let vx = x.eval(cxt.env());
+                (Term::App(Box::new(f), Box::new(x)), fty.app(vx))
+            }
+            Pre::Fun(Pi, n, aty, body) => {
+                if aty.is_none() {
+                    cxt.err("could not infer type of pi parameter", self.span());
+                }
+                let aty = aty
+                    .as_ref()
+                    .map(|x| x.check(Val::Type, cxt))
+                    .unwrap_or_else(|| {
+                        cxt.err("could not infer type of pi parameter", self.span());
+                        Term::Error
+                    });
+                let vaty = aty.eval(cxt.env());
+                let body = body.check(Val::Type, &cxt.bind(*n, vaty).1);
+                (Term::Fun(Pi, *n, Box::new(aty), Arc::new(body)), Val::Type)
+            }
+            Pre::Fun(Lam, _, _, _) => {
+                cxt.err("could not infer type of lambda", self.span());
+                (Term::Error, Val::Error)
+            }
+        }
+    }
+    fn check(&self, ty: Val, cxt: &Cxt) -> Term {
+        match (&***self, &ty) {
+            (Pre::Fun(Lam, n, aty, body), Val::Fun(Pi, _, aty2, _, _)) => {
+                if let Some(aty) = aty {
+                    let aty = aty.check(Val::Type, cxt).eval(cxt.env());
+                    if !aty.unify(&aty2, cxt.scxt()) {
+                        cxt.err(
+                            format!(
+                                "wrong parameter type: expected {}, found {}",
+                                aty2.show(cxt),
+                                aty.show(cxt)
+                            ),
+                            self.span(),
+                        );
+                    }
+                }
+                let aty = aty2.quote(cxt.qenv());
+                let (sym, cxt) = cxt.bind(*n, (**aty2).clone());
+                let rty = ty.app(Val::Neutral(sym, Vec::new()));
+                let body = body.check(rty, &cxt);
+                Term::Fun(Lam, *n, Box::new(aty), Arc::new(body))
+            }
+            (_, _) => {
+                let (s, sty) = self.infer(cxt);
+                if !ty.unify(&sty, cxt.scxt()) {
+                    cxt.err(
+                        format!(
+                            "could not match types: expected {}, found {}",
+                            ty.show(cxt),
+                            sty.show(cxt)
+                        ),
+                        self.span(),
+                    );
+                }
+                s
             }
         }
     }
 }
 
 impl Val {
-    pub fn quote(&self, qenv: &QEnv) -> Term {
-        match self {
-            Val::Neutral(s, spine) => spine.iter().fold(Term::Var(s.0, s.at(qenv)), |acc, x| {
-                Term::App(Box::new(acc), Box::new(x.quote(qenv)))
-            }),
-            Val::Lam(s, body, env) => {
-                let sym = Sym(*s, qenv.1);
-                let mut env = env.clone();
-                let mut qenv = qenv.clone();
-                env.push_back(Val::Neutral(sym, Vec::new()));
-                qenv.1 = qenv.1.checked_add(1).unwrap();
-                qenv.0.insert(sym, qenv.0.len() as u32 + 1);
-
-                Term::Lam(*s, Arc::new(body.subst(&env, &qenv)))
-            }
-        }
+    fn show(&self, cxt: &Cxt) -> Show {
+        self.quote(cxt.qenv()).show(&cxt.db)
     }
 }
 
@@ -117,23 +330,25 @@ type ParseError = String;
 
 // not as nice as combinators :(
 struct Parser {
-    input: &'static str,
+    input: Rope,
     pos: usize,
     errors: Vec<(ParseError, usize)>,
+    db: DB,
 }
 impl Parser {
-    fn new(input: &'static str) -> Parser {
+    fn new(input: impl Into<Rope>, db: &DB) -> Parser {
         Parser {
-            input,
+            input: input.into(),
             pos: 0,
             errors: Vec::new(),
+            db: db.clone(),
         }
     }
     fn peek(&self) -> Option<char> {
-        self.input[self.pos..].chars().next()
+        self.input.subrope(self.pos..).chars().next()
     }
     fn peekn(&self, n: usize) -> Option<char> {
-        self.input[self.pos..].chars().nth(n)
+        self.input.subrope(self.pos..).chars().nth(n)
     }
     fn skip_ws(&mut self) {
         while self.peek().map_or(false, |x| x.is_whitespace()) {
@@ -169,8 +384,11 @@ impl Parser {
         self.skip_ws();
         true
     }
+    fn pos(&self) -> u32 {
+        self.pos as u32
+    }
 
-    fn name(&mut self) -> &'static str {
+    fn name(&mut self) -> Name {
         let start = self.pos;
         while self.peek().map_or(false, |x| x.is_alphabetic()) {
             self.next_raw();
@@ -180,41 +398,33 @@ impl Parser {
             self.error("expected name");
         }
         self.skip_ws();
-        &self.input[start..end]
+        self.db.name(&self.input.subrope(start..end).to_string())
     }
-    fn atom(&mut self, bindings: &im::HashMap<Name, u32>) -> Term {
-        if self.maybe("λ") {
+    fn atom(&mut self) -> SPre {
+        let start = self.pos();
+        let pre = if self.maybe("λ") {
             // lambda
             let s = self.name();
             self.expect(".");
-            let body = self.term(&bindings.clone().tap_mut(|v| {
-                v.insert(s, bindings.len() as u32);
-            }));
-            Term::Lam(s, Arc::new(body))
+            let body = self.term();
+            Pre::Fun(Lam, s, None, body)
         } else if self.maybe("(") {
             // paren
-            let term = self.term(bindings);
+            let term = self.term();
             self.expect(")");
-            term
+            *term.0
         } else {
             // var
             let s = self.name();
-            Term::Var(
-                s,
-                Idx((bindings.len() as u32
-                    - bindings.get(&s).copied().unwrap_or_else(|| {
-                        self.error(format!("not found: {}", s));
-                        0
-                    }))
-                .try_into()
-                .unwrap()),
-            )
-        }
+            Pre::Var(s)
+        };
+        S(Box::new(pre), Span(start, self.pos()))
     }
-    fn term(&mut self, bindings: &im::HashMap<Name, u32>) -> Term {
-        let mut a = self.atom(bindings);
+    fn term(&mut self) -> SPre {
+        let start = self.pos();
+        let mut a = self.atom();
         while self.peek().map_or(false, |x| x != ')') && self.errors.is_empty() {
-            a = Term::App(Box::new(a), Box::new(self.atom(bindings)));
+            a = S(Box::new(Pre::App(a, self.atom())), Span(start, self.pos()));
         }
         a
     }
@@ -223,6 +433,11 @@ impl Parser {
 // simple pretty-printer
 
 struct Show(im_rope::Rope, u32);
+impl std::fmt::Display for Show {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
 impl std::ops::Add<Show> for Show {
     type Output = Show;
 
@@ -259,11 +474,21 @@ impl Show {
 }
 
 impl Term {
-    pub fn show(&self) -> Show {
+    pub fn show(&self, db: &DB) -> Show {
         match self {
-            Term::Var(n, i) => Show((*n).into(), 0), // + &*format!("{}", i.0.get() - 1),
-            Term::App(f, x) => f.show().nest(1) + " " + x.show().nest(0),
-            Term::Lam(s, body) => Show("λ".into(), 2) + *s + ". " + body.show(),
+            Term::Var(n, _) => Show(db.get(*n).rope(), 0), // + &*format!("{}", i.0.get() - 1),
+            Term::App(f, x) => f.show(db).nest(1) + " " + x.show(db).nest(0),
+            Term::Fun(Lam, s, _, body) => Show("λ".into(), 2) + &*db.get(*s) + ". " + body.show(db),
+            Term::Fun(Pi, s, aty, body) => {
+                Show("(".into(), 2)
+                    + &*db.get(*s)
+                    + ": "
+                    + aty.show(db).nest(1)
+                    + ") -> "
+                    + body.show(db)
+            }
+            Term::Error => Show("error".into(), 0),
+            Term::Type => Show("Type".into(), 0),
         }
     }
 }
@@ -273,27 +498,40 @@ fn main() {
     // The Haskell version is ~50 lines lol. It's probably faster too bc the RTS is very well-optimized out of the box.
     // But the Rust version probably has higher like performance potential? Certainly we have more control over representations etc.
     // Well and also the Haskell version is fully-named (but no renaming bc only evaluating to WHNF), whereas we're doing locally nameless which is probably more code.
-    let s = r#"(λzero.λsuc.λplus.λmul.
-            (λtwo. mul two (plus two two))
-            (suc (suc zero))
-        )
-        (λf.λx. x)
-        (λz.λf.λx. f (z f x))
-        (λm.λn.λf.λx. m f (n f x))
-        (λm.λn.λf.λx. m (n f) x)
-        (λx.λy. y x) (λx. x)
-        "#;
-    let mut p = Parser::new(s);
-    println!(
-        "{}",
-        p.term(&default())
-            .eval(&default())
-            .quote(&(default(), 1.try_into().unwrap()))
-            .show()
-            .0
-    );
+    // let s = r#"(λzero.λsuc.λplus.λmul.
+    //         (λtwo. mul two (plus two two))
+    //         (suc (suc zero))
+    //     )
+    //     (λf.λx. x)
+    //     (λz.λf.λx. f (z f x))
+    //     (λm.λn.λf.λx. m f (n f x))
+    //     (λm.λn.λf.λx. m (n f) x)
+    //     (λx.λy. y x) (λx. x)
+    //     "#;
+    let input = {
+        let mut file = File::open("demo.pk").unwrap();
+        let mut input = String::new();
+        file.read_to_string(&mut input).unwrap();
+        input.rope()
+    };
+
+    let cxt = Cxt::default();
+    let mut p = Parser::new(input.clone(), &cxt.db);
+    let pre = p.term();
+    let (x, xty) = pre.infer(&cxt);
+    println!("{}", x.eval(cxt.env()).show(&cxt));
+    println!(": {}", xty.show(&cxt));
+    cxt.errors.with(|e| {
+        e.iter().for_each(|S(e, sp)| {
+            eprintln!("{}: error: {}", sp.0, e);
+            eprintln!(
+                "|{}",
+                input.subrope(sp.0 as usize..).lines().next().unwrap()
+            );
+        })
+    });
     for (e, sp) in p.errors {
         eprintln!("{}: error: {}", sp, e);
-        eprintln!("|{}", s[sp..].lines().next().unwrap());
+        eprintln!("|{}", input.subrope(sp..).lines().next().unwrap());
     }
 }
