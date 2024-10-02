@@ -249,7 +249,7 @@ impl Parser {
         let start = self.pos();
         let lhs = self.app();
         if self.maybe(Tok::Colon) {
-            let rhs = self.app();
+            let rhs = self.fun();
             S(Box::new(Pre::Binder(lhs, rhs)), Span(start, self.pos()))
         } else {
             lhs

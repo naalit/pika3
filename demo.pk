@@ -1,2 +1,4 @@
 # comment
-def f : (a: Type) -> a -> a = _ => x => x
+def q : (a: Type) -> a -> a = _ => x => x
+
+def one : (a : Type) -> (a -> a) -> a -> a = _ => f => x => f x

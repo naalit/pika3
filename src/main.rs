@@ -14,15 +14,14 @@ use crate::common::*;
 // types
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct Idx(NonZeroU32);
+struct Idx(u32);
 impl Idx {
     fn at(self, env: &Env) -> Val {
         // [a, b] at 1 is a (vec[0]), at 0 is b (vec[1])
-        // and the idx is stored as 1+i since it's a NonZeroU32 so this works
-        if env.len() < self.0.get() as usize {
+        if env.len() < self.0 as usize + 1 {
             panic!("idx {} at {}", self.0, env.len())
         }
-        env[env.len() - self.0.get() as usize].clone()
+        env[env.len() - self.0 as usize - 1].clone()
     }
 }
 
@@ -99,9 +98,7 @@ struct QEnv {
 impl QEnv {
     fn get(&self, sym: Sym) -> Idx {
         // i don't *think* this is an off-by-one error...
-        Idx((1 + self.lvls.len() as u32 - self.lvls.get(&sym).unwrap())
-            .try_into()
-            .unwrap())
+        Idx(self.lvls.len() as u32 - self.lvls.get(&sym).unwrap() - 1)
     }
 
     fn bind(&self, s: Name, env: &Env) -> (Sym, SEnv) {
@@ -111,7 +108,7 @@ impl QEnv {
         let mut qenv = self.clone();
         env.push_back(Val::Neutral(sym, Vec::new()));
         qenv.scxt = scxt;
-        qenv.lvls.insert(sym, qenv.lvls.len() as u32 + 1);
+        qenv.lvls.insert(sym, qenv.lvls.len() as u32);
         (sym, SEnv { qenv, env })
     }
 }
@@ -173,17 +170,17 @@ impl Cxt {
     fn err(&self, err: impl Into<Doc>, span: Span) {
         self.errors.with_mut(|v| v.push(Error::simple(err, span)));
     }
+    fn size(&self) -> u32 {
+        self.env.env.len() as u32
+    }
     fn lookup(&self, n: Name) -> Option<(Idx, Val)> {
-        self.bindings.get(&n).map(|(lvl, val)| {
-            (
-                Idx(NonZeroU32::new(self.bindings.len() as u32 - lvl).unwrap()),
-                val.clone(),
-            )
-        })
+        self.bindings
+            .get(&n)
+            .map(|(lvl, val)| (Idx(self.size() - lvl - 1), val.clone()))
     }
     fn bind(&self, n: Name, ty: Val) -> (Sym, Cxt) {
         let mut s = self.clone();
-        s.bindings.insert(n, (s.bindings.len() as u32, ty));
+        s.bindings.insert(n, (s.size(), ty));
         let (sym, env) = s.env.qenv.bind(n, &s.env.env);
         s.env = env;
         (sym, s)
@@ -367,9 +364,12 @@ impl Show {
 impl Term {
     pub fn show(&self, db: &DB) -> Show {
         match self {
-            Term::Var(n, _) => Show(db.get(*n).rope(), 0), // + &*format!("{}", i.0.get() - 1),
+            Term::Var(n, _i) => Show(db.get(*n).rope(), 0), // + &*format!("{}", _i.0),
             Term::App(f, x) => f.show(db).nest(1) + " " + x.show(db).nest(0),
             Term::Fun(Lam, s, _, body) => Show("λ".into(), 2) + &*db.get(*s) + ". " + body.show(db),
+            Term::Fun(Pi, s, aty, body) if *s == db.name("_") => {
+                (aty.show(db).nest(1) + " -> " + body.show(db)).with(2)
+            }
             Term::Fun(Pi, s, aty, body) => {
                 Show("(".into(), 2)
                     + &*db.get(*s)
