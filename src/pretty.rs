@@ -65,6 +65,27 @@ impl std::fmt::Display for Doc {
         f.write_str(&buf)
     }
 }
+impl std::ops::Add<Doc> for Doc {
+    type Output = Doc;
+
+    fn add(self, rhs: Doc) -> Self::Output {
+        self.chain(rhs)
+    }
+}
+impl std::ops::Add<&str> for Doc {
+    type Output = Doc;
+
+    fn add(self, rhs: &str) -> Self::Output {
+        self.add(rhs, ())
+    }
+}
+impl std::ops::Add<Doc> for &str {
+    type Output = Doc;
+
+    fn add(self, rhs: Doc) -> Self::Output {
+        Doc::start(self) + rhs
+    }
+}
 
 impl Doc {
     // The first few colors from ariadne::ColorGenerator
@@ -174,7 +195,7 @@ impl Doc {
     }
 
     /// Create a new `Doc` representing the given object
-    pub fn start<D: std::fmt::Display>(x: D) -> Self {
+    pub fn start<D: ToString>(x: D) -> Self {
         Doc {
             data: std::iter::once(x)
                 .map(|x| DocEntry::String(x.to_string(), Style::default()))
@@ -184,8 +205,12 @@ impl Doc {
         }
     }
 
+    pub fn keyword<D: ToString>(x: D) -> Self {
+        Doc::start(x).style(Doc::style_keyword())
+    }
+
     /// Appends some text or an object to the `Doc`
-    pub fn add<D: std::fmt::Display, S: IntoStyle>(mut self, x: D, style: S) -> Self {
+    pub fn add<D: ToString, S: IntoStyle>(mut self, x: D, style: S) -> Self {
         self.data.push_back(DocEntry::String(
             x.to_string(),
             style.into_style().unwrap_or_default(),

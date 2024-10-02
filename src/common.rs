@@ -9,7 +9,10 @@ pub use tap::Tap;
 
 use crate::pretty::Pretty;
 pub use crate::query::DB;
-pub use crate::{pretty::Doc, query::Interned};
+pub use crate::{
+    pretty::{Doc, Prec},
+    query::Interned,
+};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Class {

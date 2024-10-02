@@ -228,7 +228,7 @@ impl SPre {
             Pre::Var(name) => match cxt.lookup(*name) {
                 Some((ix, ty)) => (Term::Var(*name, ix), ty),
                 None => {
-                    cxt.err(&format!("not found: {}", cxt.db.get(*name)), self.span());
+                    cxt.err("not found: {}" + name.pretty(&cxt.db), self.span());
                     (Term::Error, Val::Error)
                 }
             },
@@ -238,10 +238,7 @@ impl SPre {
                     Val::Error => Val::Error,
                     Val::Fun(Pi, _, aty, _, _) => (**aty).clone(),
                     _ => {
-                        cxt.err(
-                            &format!("not a function type: {}", fty.show(cxt)),
-                            fs.span(),
-                        );
+                        cxt.err("not a function type: " + fty.pretty(cxt), fs.span());
                         Val::Error
                     }
                 };
@@ -279,11 +276,10 @@ impl SPre {
                     let aty = aty.check(Val::Type, cxt).eval(cxt.env());
                     if !aty.unify(&aty2, cxt.scxt()) {
                         cxt.err(
-                            &format!(
-                                "wrong parameter type: expected {}, found {}",
-                                aty2.show(cxt),
-                                aty.show(cxt)
-                            ),
+                            "wrong parameter type: expected "
+                                + aty2.pretty(cxt)
+                                + ", found "
+                                + aty.pretty(cxt),
                             self.span(),
                         );
                     }
@@ -298,11 +294,10 @@ impl SPre {
                 let (s, sty) = self.infer(cxt);
                 if !ty.unify(&sty, cxt.scxt()) {
                     cxt.err(
-                        &format!(
-                            "could not match types: expected {}, found {}",
-                            ty.show(cxt),
-                            sty.show(cxt)
-                        ),
+                        "could not match types: expected "
+                            + ty.pretty(cxt)
+                            + ", found "
+                            + sty.pretty(cxt),
                         self.span(),
                     );
                 }
@@ -313,73 +308,33 @@ impl SPre {
 }
 
 impl Val {
-    fn show(&self, cxt: &Cxt) -> Show {
-        self.quote(cxt.qenv()).show(&cxt.db)
+    fn pretty(&self, cxt: &Cxt) -> Doc {
+        self.quote(cxt.qenv()).pretty(&cxt.db)
     }
 }
 
-// simple pretty-printer
+// pretty-printing
 
-struct Show(im_rope::Rope, u32);
-impl std::fmt::Display for Show {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
-    }
-}
-impl std::ops::Add<Show> for Show {
-    type Output = Show;
-
-    fn add(self, rhs: Show) -> Self::Output {
-        Show(self.0 + rhs.0, self.1.max(rhs.1))
-    }
-}
-impl std::ops::Add<&str> for Show {
-    type Output = Show;
-
-    fn add(self, rhs: &str) -> Self::Output {
-        Show(self.0.tap_mut(|x| x.append(rhs)), self.1)
-    }
-}
-impl std::ops::Add<Show> for &str {
-    type Output = Show;
-
-    fn add(self, rhs: Show) -> Self::Output {
-        Show(rhs.0.tap_mut(|x| x.prepend(self)), rhs.1)
-    }
-}
-impl Show {
-    fn nest(self, prec: u32) -> Show {
-        if self.1 > prec {
-            ("(" + self + ")").with(0)
-        } else {
-            self
-        }
-    }
-
-    fn with(self, prec: u32) -> Show {
-        Show(self.0, prec)
-    }
-}
-
-impl Term {
-    pub fn show(&self, db: &DB) -> Show {
+impl Pretty for Term {
+    fn pretty(&self, db: &DB) -> Doc {
         match self {
-            Term::Var(n, _i) => Show(db.get(*n).rope(), 0), // + &*format!("{}", _i.0),
-            Term::App(f, x) => f.show(db).nest(1) + " " + x.show(db).nest(0),
-            Term::Fun(Lam, s, _, body) => Show("λ".into(), 2) + &*db.get(*s) + ". " + body.show(db),
+            Term::Var(n, _i) => Doc::start(db.get(*n)), // + &*format!("{}", _i.0),
+            Term::App(f, x) => f.pretty(db).nest(Prec::App) + " " + x.pretty(db).nest(Prec::Atom),
+            Term::Fun(Lam, s, _, body) => {
+                (Doc::start("λ") + &*db.get(*s) + ". " + body.pretty(db)).prec(Prec::Term)
+            }
             Term::Fun(Pi, s, aty, body) if *s == db.name("_") => {
-                (aty.show(db).nest(1) + " -> " + body.show(db)).with(2)
+                (aty.pretty(db).nest(Prec::App) + " -> " + body.pretty(db)).prec(Prec::Pi)
             }
-            Term::Fun(Pi, s, aty, body) => {
-                Show("(".into(), 2)
-                    + &*db.get(*s)
-                    + ": "
-                    + aty.show(db).nest(1)
-                    + ") -> "
-                    + body.show(db)
-            }
-            Term::Error => Show("error".into(), 0),
-            Term::Type => Show("Type".into(), 0),
+            Term::Fun(Pi, s, aty, body) => (Doc::start("(")
+                + &*db.get(*s)
+                + ": "
+                + aty.pretty(db).nest(Prec::Pi)
+                + ") -> "
+                + body.pretty(db))
+            .prec(Prec::Pi),
+            Term::Error => Doc::keyword("error"),
+            Term::Type => Doc::keyword("Type"),
         }
     }
 }
@@ -424,19 +379,10 @@ fn main() {
             }
             None => val.infer(&cxt),
         }) {
-            i.name
-                .pretty(&cxt.db)
-                .add(" : ", ())
-                .add(ty.show(&cxt), ())
-                .add(" = ", ())
-                .add(val.show(&cxt.db), ())
+            (i.name.pretty(&cxt.db) + " : " + ty.pretty(&cxt) + " = " + val.pretty(&cxt.db))
                 .emit_stderr();
         } else if let Some(ty) = ty {
-            i.name
-                .pretty(&cxt.db)
-                .add(" : ", ())
-                .add(ty.show(&cxt.db), ())
-                .emit_stderr();
+            (i.name.pretty(&cxt.db) + " : " + ty.pretty(&cxt.db)).emit_stderr();
         } else {
             i.name.pretty(&cxt.db).add(" : ??", ()).emit_stderr();
         }
