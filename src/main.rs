@@ -1,13 +1,19 @@
 mod common;
+mod lexer;
+mod parser;
+mod pretty;
 mod query;
 
 use std::{fs::File, io::Read};
+
+use lsp_types::Url;
+use pretty::Pretty;
 
 use crate::common::*;
 
 // types
 
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct Idx(NonZeroU32);
 impl Idx {
     fn at(self, env: &Env) -> Val {
@@ -20,6 +26,7 @@ impl Idx {
     }
 }
 
+#[derive(Debug)]
 enum Term {
     Var(Name, Idx), // really Spanned<Name>
     App(Box<Term>, Box<Term>),
@@ -29,19 +36,12 @@ enum Term {
     Type,
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct Sym(Name, NonZeroU32);
 
 type Env = im::Vector<Val>;
 
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-enum Class {
-    Lam,
-    Pi,
-}
-use Class::*;
-
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 enum Val {
     Neutral(Sym, Vec<Val>), // will be im::Vector<Elim> in the future pry?
     Fun(Class, Name, Arc<Val>, Arc<Term>, Env), // oh update im::Vector is *way* bigger than Vec in terms of stack size. 64 vs 24 bytes. so it might be best to stick with Vec(Cow<Vec>?) or roll our own
@@ -55,9 +55,9 @@ impl Val {
     pub fn app(self, other: Val) -> Val {
         match self {
             Val::Neutral(s, vec) => Val::Neutral(s, vec.tap_mut(|v| v.push(other))),
-            Val::Fun(Lam, _, _, body, env) => body.eval(&env.tap_mut(|v| v.push_back(other))),
+            Val::Fun(_, _, _, body, env) => body.eval(&env.tap_mut(|v| v.push_back(other))),
             Val::Error => Val::Error,
-            _ => unreachable!(),
+            _ => unreachable!("illegal app to {:?}", self),
         }
     }
 }
@@ -157,17 +157,9 @@ impl Val {
     }
 }
 
-// presyntax
-
-enum Pre {
-    Var(Name),
-    App(SPre, SPre),
-    /// Argument type annotation
-    Fun(Class, Name, Option<SPre>, SPre),
-}
-type SPre = S<Box<Pre>>;
-
 // elaboration
+
+use crate::parser::{Pre, PreDef, PrePat, SPre};
 
 #[derive(Clone, Default)]
 struct Cxt {
@@ -175,11 +167,11 @@ struct Cxt {
     // levels, starting at 0
     bindings: im::HashMap<Name, (u32, Val)>,
     env: SEnv,
-    errors: Ref<Vec<S<Str>>>,
+    errors: Ref<Vec<Error>>,
 }
 impl Cxt {
-    fn err(&self, err: impl Into<Str>, span: Span) {
-        self.errors.with_mut(|v| v.push(S(err.into(), span)));
+    fn err(&self, err: impl Into<Doc>, span: Span) {
+        self.errors.with_mut(|v| v.push(Error::simple(err, span)));
     }
     fn lookup(&self, n: Name) -> Option<(Idx, Val)> {
         self.bindings.get(&n).map(|(lvl, val)| {
@@ -239,7 +231,7 @@ impl SPre {
             Pre::Var(name) => match cxt.lookup(*name) {
                 Some((ix, ty)) => (Term::Var(*name, ix), ty),
                 None => {
-                    cxt.err(format!("not found: {}", cxt.db.get(*name)), self.span());
+                    cxt.err(&format!("not found: {}", cxt.db.get(*name)), self.span());
                     (Term::Error, Val::Error)
                 }
             },
@@ -249,7 +241,10 @@ impl SPre {
                     Val::Error => Val::Error,
                     Val::Fun(Pi, _, aty, _, _) => (**aty).clone(),
                     _ => {
-                        cxt.err(format!("not a function type: {}", fty.show(cxt)), fs.span());
+                        cxt.err(
+                            &format!("not a function type: {}", fty.show(cxt)),
+                            fs.span(),
+                        );
                         Val::Error
                     }
                 };
@@ -257,35 +252,37 @@ impl SPre {
                 let vx = x.eval(cxt.env());
                 (Term::App(Box::new(f), Box::new(x)), fty.app(vx))
             }
-            Pre::Fun(Pi, n, aty, body) => {
-                if aty.is_none() {
-                    cxt.err("could not infer type of pi parameter", self.span());
-                }
-                let aty = aty
-                    .as_ref()
-                    .map(|x| x.check(Val::Type, cxt))
-                    .unwrap_or_else(|| {
-                        cxt.err("could not infer type of pi parameter", self.span());
-                        Term::Error
-                    });
+            Pre::Pi(n, aty, body) => {
+                let aty = aty.check(Val::Type, cxt);
                 let vaty = aty.eval(cxt.env());
                 let body = body.check(Val::Type, &cxt.bind(*n, vaty).1);
                 (Term::Fun(Pi, *n, Box::new(aty), Arc::new(body)), Val::Type)
             }
-            Pre::Fun(Lam, _, _, _) => {
+            Pre::Lam(_, _) => {
                 cxt.err("could not infer type of lambda", self.span());
                 (Term::Error, Val::Error)
             }
+            Pre::Binder(_, _) => {
+                cxt.err("binder not allowed in this context", self.span());
+                (Term::Error, Val::Error)
+            }
+            Pre::Type => (Term::Type, Val::Type),
+            Pre::Error => (Term::Error, Val::Error),
         }
     }
     fn check(&self, ty: Val, cxt: &Cxt) -> Term {
         match (&***self, &ty) {
-            (Pre::Fun(Lam, n, aty, body), Val::Fun(Pi, _, aty2, _, _)) => {
+            (Pre::Lam(pat, body), Val::Fun(Pi, _, aty2, _, _)) => {
+                let (n, aty) = match &**pat {
+                    PrePat::Name(s) => (*s, None),
+                    PrePat::Binder(s, s1) => (*s, Some(s1.clone())),
+                    PrePat::Error => (S(cxt.db.name("_"), pat.span()), None),
+                };
                 if let Some(aty) = aty {
                     let aty = aty.check(Val::Type, cxt).eval(cxt.env());
                     if !aty.unify(&aty2, cxt.scxt()) {
                         cxt.err(
-                            format!(
+                            &format!(
                                 "wrong parameter type: expected {}, found {}",
                                 aty2.show(cxt),
                                 aty.show(cxt)
@@ -304,7 +301,7 @@ impl SPre {
                 let (s, sty) = self.infer(cxt);
                 if !ty.unify(&sty, cxt.scxt()) {
                     cxt.err(
-                        format!(
+                        &format!(
                             "could not match types: expected {}, found {}",
                             ty.show(cxt),
                             sty.show(cxt)
@@ -321,112 +318,6 @@ impl SPre {
 impl Val {
     fn show(&self, cxt: &Cxt) -> Show {
         self.quote(cxt.qenv()).show(&cxt.db)
-    }
-}
-
-// simple parser
-
-type ParseError = String;
-
-// not as nice as combinators :(
-struct Parser {
-    input: Rope,
-    pos: usize,
-    errors: Vec<(ParseError, usize)>,
-    db: DB,
-}
-impl Parser {
-    fn new(input: impl Into<Rope>, db: &DB) -> Parser {
-        Parser {
-            input: input.into(),
-            pos: 0,
-            errors: Vec::new(),
-            db: db.clone(),
-        }
-    }
-    fn peek(&self) -> Option<char> {
-        self.input.subrope(self.pos..).chars().next()
-    }
-    fn peekn(&self, n: usize) -> Option<char> {
-        self.input.subrope(self.pos..).chars().nth(n)
-    }
-    fn skip_ws(&mut self) {
-        while self.peek().map_or(false, |x| x.is_whitespace()) {
-            self.next_raw();
-        }
-    }
-    fn next_raw(&mut self) -> Option<char> {
-        let r = self.peek()?;
-        self.pos += r.len_utf8();
-        Some(r)
-    }
-    fn next(&mut self) -> Option<char> {
-        let n = self.next_raw();
-        self.skip_ws();
-        n
-    }
-    fn error(&mut self, e: impl Into<String>) {
-        self.errors.push((e.into(), self.pos));
-    }
-
-    fn expect(&mut self, s: &str) {
-        if !self.maybe(s) {
-            self.error(format!("expected {}", s));
-        }
-    }
-    fn maybe(&mut self, s: &str) -> bool {
-        for (i, c) in s.chars().enumerate() {
-            if self.peekn(i) != Some(c) {
-                return false;
-            }
-        }
-        self.pos += s.len();
-        self.skip_ws();
-        true
-    }
-    fn pos(&self) -> u32 {
-        self.pos as u32
-    }
-
-    fn name(&mut self) -> Name {
-        let start = self.pos;
-        while self.peek().map_or(false, |x| x.is_alphabetic()) {
-            self.next_raw();
-        }
-        let end = self.pos;
-        if start == end {
-            self.error("expected name");
-        }
-        self.skip_ws();
-        self.db.name(&self.input.subrope(start..end).to_string())
-    }
-    fn atom(&mut self) -> SPre {
-        let start = self.pos();
-        let pre = if self.maybe("λ") {
-            // lambda
-            let s = self.name();
-            self.expect(".");
-            let body = self.term();
-            Pre::Fun(Lam, s, None, body)
-        } else if self.maybe("(") {
-            // paren
-            let term = self.term();
-            self.expect(")");
-            *term.0
-        } else {
-            // var
-            let s = self.name();
-            Pre::Var(s)
-        };
-        S(Box::new(pre), Span(start, self.pos()))
-    }
-    fn term(&mut self) -> SPre {
-        let start = self.pos();
-        let mut a = self.atom();
-        while self.peek().map_or(false, |x| x != ')') && self.errors.is_empty() {
-            a = S(Box::new(Pre::App(a, self.atom())), Span(start, self.pos()));
-        }
-        a
     }
 }
 
@@ -508,30 +399,72 @@ fn main() {
     //     (λm.λn.λf.λx. m (n f) x)
     //     (λx.λy. y x) (λx. x)
     //     "#;
-    let input = {
+    let (input, input_s) = {
         let mut file = File::open("demo.pk").unwrap();
         let mut input = String::new();
         file.read_to_string(&mut input).unwrap();
-        input.rope()
+        (input.rope(), input)
     };
+    let mut cxt = Cxt::default();
+    let file = cxt.db.ifiles.intern(&FileLoc::Url(
+        Url::from_file_path(std::path::Path::new("demo.pk").canonicalize().unwrap()).unwrap(),
+    ));
+    cxt.db
+        .set_file_source(file, input.clone(), Some(input_s.into()));
 
-    let cxt = Cxt::default();
-    let mut p = Parser::new(input.clone(), &cxt.db);
-    let pre = p.term();
-    let (x, xty) = pre.infer(&cxt);
-    println!("{}", x.eval(cxt.env()).show(&cxt));
-    println!(": {}", xty.show(&cxt));
-    cxt.errors.with(|e| {
-        e.iter().for_each(|S(e, sp)| {
-            eprintln!("{}: error: {}", sp.0, e);
-            eprintln!(
-                "|{}",
-                input.subrope(sp.0 as usize..).lines().next().unwrap()
-            );
-        })
-    });
-    for (e, sp) in p.errors {
-        eprintln!("{}: error: {}", sp, e);
-        eprintln!("|{}", input.subrope(sp..).lines().next().unwrap());
+    let r = crate::parser::parse(input.clone(), &cxt.db);
+    // println!("{:?}", r);
+    let mut cache = FileCache::new(cxt.db.clone());
+    for i in r.defs {
+        let ty = i.0.ty.as_ref().map(|ty| ty.check(Val::Type, &cxt));
+        if let Some((val, ty)) = i.0.value.as_ref().map(|val| match &ty {
+            Some(ty) => {
+                let vty = ty.eval(&cxt.env());
+                (val.check(vty.clone(), &cxt), vty)
+            }
+            None => val.infer(&cxt),
+        }) {
+            i.name
+                .pretty(&cxt.db)
+                .add(" : ", ())
+                .add(ty.show(&cxt), ())
+                .add(" = ", ())
+                .add(val.show(&cxt.db), ())
+                .emit_stderr();
+        } else if let Some(ty) = ty {
+            i.name
+                .pretty(&cxt.db)
+                .add(" : ", ())
+                .add(ty.show(&cxt.db), ())
+                .emit_stderr();
+        } else {
+            i.name.pretty(&cxt.db).add(" : ??", ()).emit_stderr();
+        }
     }
+    for i in r.errors {
+        i.write_cli(file, &mut cache);
+    }
+    for i in cxt.errors.take() {
+        i.write_cli(file, &mut cache);
+    }
+
+    // let cxt = Cxt::default();
+    // let mut p = Parser::new(input.clone(), &cxt.db);
+    // let pre = p.term();
+    // let (x, xty) = pre.infer(&cxt);
+    // println!("{}", x.eval(cxt.env()).show(&cxt));
+    // println!(": {}", xty.show(&cxt));
+    // cxt.errors.with(|e| {
+    //     e.iter().for_each(|S(e, sp)| {
+    //         eprintln!("{}: error: {}", sp.0, e);
+    //         eprintln!(
+    //             "|{}",
+    //             input.subrope(sp.0 as usize..).lines().next().unwrap()
+    //         );
+    //     })
+    // });
+    // for (e, sp) in p.errors {
+    //     eprintln!("{}: error: {}", sp, e);
+    //     eprintln!("|{}", input.subrope(sp..).lines().next().unwrap());
+    // }
 }

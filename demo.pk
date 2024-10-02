@@ -1,2 +1,2 @@
 # comment
-def f : a -> a = x => x
+def f : (a: Type) -> a -> a = _ => x => x
