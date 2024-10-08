@@ -53,6 +53,8 @@ struct Parser {
     starts: Vec<u32>,
     pos: usize,
     errors: Vec<Error>,
+    // once we emit a parse error on a given token, we don't emit errors for subsequent expect()s that fail on the same token
+    this_tok_err: bool,
     db: DB,
 }
 impl Parser {
@@ -69,6 +71,7 @@ impl Parser {
                 .into_iter()
                 .map(|e| lexerror_to_error(e.0, e.1))
                 .collect(),
+            this_tok_err: false,
             db,
         }
     }
@@ -83,6 +86,7 @@ impl Parser {
         let t = self.peek();
         if t != Tok::Eof {
             self.pos += 1;
+            self.this_tok_err = false;
         }
         t
     }
@@ -106,6 +110,11 @@ impl Parser {
             None => Tok::Eof,
         }
     }
+    fn reset_to(&mut self, tok: Tok) {
+        while !self.maybe(tok) {
+            self.next();
+        }
+    }
 
     fn pos(&self) -> u32 {
         *self
@@ -127,7 +136,7 @@ impl Parser {
     }
     fn error(&mut self, e: impl Into<Doc>, span: Span) {
         let message = Doc::start("parse error: ").chain(e.into());
-        eprintln!("span: {:?}", span);
+        self.this_tok_err = true;
         self.errors.push(Error {
             severity: Severity::Error,
             message: message.clone(),
@@ -151,7 +160,7 @@ impl Parser {
         }
     }
     fn expect(&mut self, t: Tok) {
-        if !self.maybe(t) {
+        if !self.maybe(t) && self.this_tok_err {
             self.error(
                 &format!("expected {}, found {}", t, self.peek()),
                 self.tok_span(),
@@ -290,7 +299,7 @@ impl Parser {
         let mut last = self.pos();
         while self.peek() != Tok::Eof {
             v.push(self.spanned(Self::def));
-            self.expect(Tok::Newline);
+            self.reset_to(Tok::Newline);
             if last == self.pos() {
                 self.error("expected end of file", self.tok_span());
                 break;

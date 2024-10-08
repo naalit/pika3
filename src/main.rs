@@ -4,7 +4,7 @@ mod parser;
 mod pretty;
 mod query;
 
-use std::{fs::File, io::Read};
+use std::io::Read;
 
 use lsp_types::Url;
 use pretty::Pretty;
@@ -167,6 +167,9 @@ struct Cxt {
     errors: Ref<Vec<Error>>,
 }
 impl Cxt {
+    fn new(db: DB) -> Cxt {
+        Cxt { db, ..default() }
+    }
     fn err(&self, err: impl Into<Doc>, span: Span) {
         self.errors.with_mut(|v| v.push(Error::simple(err, span)));
     }
@@ -355,42 +358,20 @@ fn main() {
     //     (λx.λy. y x) (λx. x)
     //     "#;
     let (input, input_s) = {
-        let mut file = File::open("demo.pk").unwrap();
+        let mut file = std::fs::File::open("demo.pk").unwrap();
         let mut input = String::new();
         file.read_to_string(&mut input).unwrap();
         (input.rope(), input)
     };
-    let mut cxt = Cxt::default();
-    let file = cxt.db.ifiles.intern(&FileLoc::Url(
+    let mut db = DB::default();
+    let file = db.ifiles.intern(&FileLoc::Url(
         Url::from_file_path(std::path::Path::new("demo.pk").canonicalize().unwrap()).unwrap(),
     ));
-    cxt.db
-        .set_file_source(file, input.clone(), Some(input_s.into()));
+    db.set_file_source(file, input.clone(), Some(input_s.into()));
 
-    let r = crate::parser::parse(input.clone(), &cxt.db);
-    // println!("{:?}", r);
-    let mut cache = FileCache::new(cxt.db.clone());
-    for i in r.defs {
-        let ty = i.0.ty.as_ref().map(|ty| ty.check(Val::Type, &cxt));
-        if let Some((val, ty)) = i.0.value.as_ref().map(|val| match &ty {
-            Some(ty) => {
-                let vty = ty.eval(&cxt.env());
-                (val.check(vty.clone(), &cxt), vty)
-            }
-            None => val.infer(&cxt),
-        }) {
-            (i.name.pretty(&cxt.db) + " : " + ty.pretty(&cxt) + " = " + val.pretty(&cxt.db))
-                .emit_stderr();
-        } else if let Some(ty) = ty {
-            (i.name.pretty(&cxt.db) + " : " + ty.pretty(&cxt.db)).emit_stderr();
-        } else {
-            i.name.pretty(&cxt.db).add(" : ??", ()).emit_stderr();
-        }
-    }
-    for i in r.errors {
-        i.write_cli(file, &mut cache);
-    }
-    for i in cxt.errors.take() {
+    let errors = all_errors(file, &db);
+    let mut cache = FileCache::new(db.clone());
+    for i in errors {
         i.write_cli(file, &mut cache);
     }
 
@@ -413,4 +394,31 @@ fn main() {
     //     eprintln!("{}: error: {}", sp, e);
     //     eprintln!("|{}", input.subrope(sp..).lines().next().unwrap());
     // }
+}
+
+fn all_errors(file: File, db: &DB) -> Vec<Error> {
+    let input = db.file_rope(file);
+    let r = crate::parser::parse(input.clone(), &db);
+    let mut errors = r.errors;
+    // println!("{:?}", r);
+    for i in r.defs {
+        let cxt = Cxt::new(db.clone());
+        let ty = i.0.ty.as_ref().map(|ty| ty.check(Val::Type, &cxt));
+        if let Some((val, ty)) = i.0.value.as_ref().map(|val| match &ty {
+            Some(ty) => {
+                let vty = ty.eval(&cxt.env());
+                (val.check(vty.clone(), &cxt), vty)
+            }
+            None => val.infer(&cxt),
+        }) {
+            (i.name.pretty(&cxt.db) + " : " + ty.pretty(&cxt) + " = " + val.pretty(&cxt.db))
+                .emit_stderr();
+        } else if let Some(ty) = ty {
+            (i.name.pretty(&cxt.db) + " : " + ty.pretty(&cxt.db)).emit_stderr();
+        } else {
+            i.name.pretty(&cxt.db).add(" : ??", ()).emit_stderr();
+        }
+        errors.append(&mut cxt.errors.take());
+    }
+    errors
 }
