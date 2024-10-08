@@ -134,9 +134,6 @@ struct FileSource {
     str: Option<Str>,
 }
 
-#[derive(Clone, PartialEq)]
-struct ElabResult {}
-
 #[derive(Clone)]
 pub struct DB {
     names: Interner<Str>,

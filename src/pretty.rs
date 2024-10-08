@@ -101,7 +101,7 @@ impl Doc {
     }
 
     pub fn style_keyword() -> Style {
-        Color::Magenta.style()
+        Color::Fixed(197).style()
     }
 
     pub fn style_literal() -> Style {

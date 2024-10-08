@@ -111,7 +111,7 @@ impl Parser {
         }
     }
     fn reset_to(&mut self, tok: Tok) {
-        while !self.maybe(tok) {
+        while !self.maybe(tok) && self.peek() != Tok::Eof {
             self.next();
         }
     }

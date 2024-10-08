@@ -7,10 +7,9 @@ use yansi::Color;
 pub use im_rope::Rope;
 pub use tap::Tap;
 
-use crate::pretty::Pretty;
 pub use crate::query::DB;
 pub use crate::{
-    pretty::{Doc, Prec},
+    pretty::{Doc, Prec, Pretty},
     query::Interned,
 };
 
