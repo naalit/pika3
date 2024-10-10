@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 ariadne = "0.4.1"
+educe = "0.6.0"
 im = "15.1.0"
 im-rope = "*"
 lsp-server = "0.7.7"

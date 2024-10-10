@@ -48,7 +48,11 @@ use std::{
     sync::RwLock,
 };
 
-use crate::common::*;
+use crate::{
+    common::*,
+    elab::{DefElabResult, Val},
+    parser::ParseResult,
+};
 
 // For the database, do we want to use internal mutability like Salsa does? Probably, bc we do need to pass it around like literally everywhere
 // So I think ideally we have an Arc<DB> that we pass around so we can store it in various cxts
@@ -61,22 +65,16 @@ use crate::common::*;
 // So I'll stick with internal mutability for now
 
 // Other option: put the Str directly in here. Pro: lookup without DB, Con: 8 bytes instead of 4
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[derive(Educe)]
+#[educe(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct Interned<T>(u32, PhantomData<T>);
 impl<T: Clone> Copy for Interned<T> {}
 
-#[derive(Clone)]
+#[derive(Educe)]
+#[educe(Clone, Default)]
 pub struct Interner<T> {
     t_to_x: Arc<RwLock<HashMap<T, Interned<T>>>>,
     x_to_t: Arc<RwLock<Vec<T>>>,
-}
-impl<T> Default for Interner<T> {
-    fn default() -> Self {
-        Self {
-            t_to_x: Default::default(),
-            x_to_t: Default::default(),
-        }
-    }
 }
 impl<T: Clone + Eq + Hash> Interner<T> {
     // TODO determine if these are the right bounds
@@ -134,24 +132,17 @@ struct FileSource {
     str: Option<Str>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct DB {
     names: Interner<Str>,
     pub ifiles: Interner<FileLoc>,
     pub idefs: Interner<DefLoc>,
-    // elab: Cache<Def, ElabResult>,
+    pub elab: ElabCache,
     files: HashMap<File, FileSource>,
-}
-impl Default for DB {
-    fn default() -> Self {
-        Self {
-            names: default(),
-            ifiles: default(),
-            idefs: default(),
-            files: default(),
-            // elab: todo!(),
-        }
-    }
+    def_file: HashMap<Def, File>,
+    // TODO is this the direction the map should go? should this even be a map?
+    crate_roots: HashMap<File, Name>,
+    parsed: HashMap<File, Arc<ParseResult>>,
 }
 impl DB {
     pub fn name(&self, s: &str) -> Name {
@@ -162,9 +153,81 @@ impl DB {
         self.names.get(n)
     }
 
+    pub fn def_file(&self, def: Def) -> (File, Def) {
+        match self.def_file.get(&def) {
+            Some(f) => (*f, def),
+            None => match self.idefs.get(def) {
+                DefLoc::Crate(n) => panic!("no root file for crate {}", self.get(n)),
+                DefLoc::Child(d, _) => self.def_file(d),
+            },
+        }
+    }
+
+    pub fn init_crate(&mut self, name: Name, path: File) -> Def {
+        self.crate_roots.insert(path, name);
+        self.idefs.intern(&DefLoc::Crate(name))
+    }
+
+    pub fn lookup_def_name(&self, at: Def, name: Name) -> Option<(Def, Val)> {
+        let mut at = at;
+        loop {
+            let def = self.idefs.intern(&DefLoc::Child(at, name));
+            match self.elab.def_type(def, self) {
+                Some(t) => break Some((def, t)),
+                None => match self.idefs.get(at).parent() {
+                    Some(a) => {
+                        at = a;
+                        continue;
+                    }
+                    None => break None,
+                },
+            }
+        }
+    }
+
     pub fn set_file_source(&mut self, f: File, rope: Rope, str: Option<Str>) {
-        self.files.insert(f, FileSource { rope, str });
-        // TODO invalidate elab cache
+        if self
+            .files
+            .insert(
+                f,
+                FileSource {
+                    rope: rope.clone(),
+                    str,
+                },
+            )
+            .is_none()
+        {
+            // we just added this file, so we need to establish its root Def
+            // this only depends on the path so we only have to do this when a file is first added
+            let mut file = f;
+            let mut v = Vec::new();
+            let crate_root = loop {
+                match self.crate_roots.get(&file) {
+                    Some(c) => break c,
+                    None => match self.ifiles.get(file).parent() {
+                        Some(f2) => {
+                            v.push(self.name(&self.ifiles.get(file).name()));
+                            file = self.ifiles.intern(&f2);
+                            continue;
+                        }
+                        None => panic!("file {} is not in any crate", self.ifiles.get(f)),
+                    },
+                }
+            };
+            let def = v
+                .into_iter()
+                .fold(self.idefs.intern(&DefLoc::Crate(*crate_root)), |acc, x| {
+                    self.idefs.intern(&DefLoc::Child(acc, x))
+                });
+            self.def_file.insert(def, f);
+        }
+        let parsed = crate::parser::parse(rope, self);
+        self.parsed.insert(f, Arc::new(parsed));
+        self.elab.invalidate_file(f, self);
+    }
+
+    pub fn file_ast(&self, f: File) -> Arc<ParseResult> {
+        self.parsed.get(&f).unwrap().clone()
     }
 
     pub fn file_str(&self, f: File) -> Str {
@@ -182,42 +245,53 @@ impl DB {
     }
 }
 
-// TODO we're going to want the cache to track dependencies on values separately from dependencies on types
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum Query {
+    DefType(Def),
+    DefVal(Def),
+}
+impl Query {
+    fn def(self) -> Def {
+        match self {
+            Query::DefType(a) | Query::DefVal(a) => a,
+        }
+    }
+}
 
-#[derive(Clone, Default)]
-struct CacheEntry<K, V> {
-    value: V,
-    dependencies: HashSet<K>,
-    changed_revision: u64,
+struct CacheEntry {
+    result: DefElabResult,
+    dependencies: HashSet<Query>,
+    changed_revision: (u64, u64),
     checked_revision: u64,
 }
 
-#[derive(Clone)]
-struct Cache<K, V> {
-    cache: Ref<HashMap<K, CacheEntry<K, V>>>,
-    in_progress: Ref<HashSet<K>>,
+#[derive(Clone, Default)]
+pub struct ElabCache {
+    cache: Ref<HashMap<Def, CacheEntry>>,
+    current_deps: Ref<HashSet<Query>>,
     revision: u64,
-    func: Arc<dyn Fn(K) -> V>,
 }
-impl<K: Clone + Eq + Hash, V: Clone + PartialEq> Cache<K, V> {
-    fn recompute(&self, key: K) {
-        let stored = self.in_progress.take();
-        let value = (self.func)(key.clone()); // kind of silly that this syntax is necessary
-        let dependencies = self.in_progress.set(stored);
-        self.cache.with_mut(|c| {
-            c.insert(
-                key,
-                CacheEntry {
-                    value: value.clone(),
-                    dependencies,
-                    changed_revision: self.revision,
-                    checked_revision: self.revision,
-                },
-            )
-        });
+impl ElabCache {
+    fn recompute(&self, key: Def, db: &DB) {
+        let stored = self.current_deps.take();
+        // TODO what's the right thing to do with defs that don't exist (this returns None)?
+        if let Some(result) = crate::elab::elab_def(key, db) {
+            let dependencies = self.current_deps.set(stored);
+            self.cache.with_mut(|c| {
+                c.insert(
+                    key,
+                    CacheEntry {
+                        result,
+                        dependencies,
+                        changed_revision: (self.revision, self.revision),
+                        checked_revision: self.revision,
+                    },
+                )
+            });
+        }
     }
 
-    fn check_valid(&self, key: K) -> bool {
+    fn check_valid(&self, key: Def, db: &DB) -> bool {
         let t = self.cache.with(|c| match c.get(&key) {
             Some(entry) if entry.checked_revision == self.revision => Some(true),
             Some(entry) => {
@@ -227,7 +301,7 @@ impl<K: Clone + Eq + Hash, V: Clone + PartialEq> Cache<K, V> {
                 for k in &entry.dependencies {
                     // if *any* dependencies change, bail out early - we know we need to recompute this query and it's possible it might not need all the dependencies now!
                     // the thing we're checking is whether it changed *since the last time we checked*
-                    if self.maybe_recompute(k.clone()) > entry.checked_revision {
+                    if self.maybe_recompute_(*k, db) > entry.checked_revision {
                         return Some(false);
                     }
                 }
@@ -248,33 +322,67 @@ impl<K: Clone + Eq + Hash, V: Clone + PartialEq> Cache<K, V> {
         }
     }
 
-    // Returns the revision where the value last changed, for convenience
-    fn maybe_recompute(&self, key: K) -> u64 {
-        if self.check_valid(key.clone()) {
-            self.cache.with(|x| x.get(&key).unwrap().changed_revision)
-        } else if let Some((value, revision)) = self
-            .cache
-            .with(|x| x.get(&key).map(|x| (x.value.clone(), x.changed_revision)))
-        {
-            self.recompute(key.clone());
-            let b = self.cache.with(|x| x.get(&key).unwrap().value != value);
-            if !b {
-                // put the changed_revision back to where it was since it didn't change
-                self.cache
-                    .with_mut(|x| x.get_mut(&key).unwrap().changed_revision = revision);
-                revision
-            } else {
-                self.revision
-            }
-        } else {
-            self.recompute(key);
-            self.revision
+    fn maybe_recompute_(&self, key: Query, db: &DB) -> u64 {
+        let (t, v) = self.maybe_recompute(key.def(), db);
+        match key {
+            Query::DefType(_) => t,
+            Query::DefVal(_) => v,
         }
     }
 
-    pub fn get(&self, key: K) -> V {
-        self.in_progress.with_mut(|a| a.insert(key.clone()));
-        self.maybe_recompute(key.clone());
-        self.cache.with(|c| c.get(&key).unwrap().value.clone())
+    // Returns the revision where the value last changed, for convenience
+    // (type, value)
+    fn maybe_recompute(&self, key: Def, db: &DB) -> (u64, u64) {
+        if self.check_valid(key.clone(), db) {
+            self.cache.with(|x| x.get(&key).unwrap().changed_revision)
+        } else if let Some(entry) = self.cache.with_mut(|x| x.remove(&key)) {
+            self.recompute(key, db);
+            let tb = self.cache.with(|x| {
+                x.get(&key)
+                    .map_or(false, |x| x.result.def.ty != entry.result.def.ty)
+            });
+            let vb = self.cache.with(|x| {
+                x.get(&key)
+                    .map_or(false, |x| x.result.def.body != entry.result.def.body)
+            });
+            let revision = (
+                if tb {
+                    self.revision
+                } else {
+                    entry.changed_revision.0
+                },
+                // if the type changes and the value doesn't, that still counts as a value change
+                if tb || vb {
+                    self.revision
+                } else {
+                    entry.changed_revision.1
+                },
+            );
+            self.cache
+                .with_mut(|x| x.get_mut(&key).unwrap().changed_revision = revision);
+            revision
+        } else {
+            self.recompute(key, db);
+            (self.revision, self.revision)
+        }
+    }
+
+    fn invalidate_file(&self, f: File, db: &DB) {
+        self.cache
+            .with_mut(|m| m.retain(|k, _| db.def_file(*k).0 != f))
+    }
+
+    pub fn def_value(&self, key: Def, db: &DB) -> Option<DefElabResult> {
+        self.current_deps.with_mut(|a| a.insert(Query::DefVal(key)));
+        self.maybe_recompute(key.clone(), db);
+        self.cache.with(|c| c.get(&key).map(|e| e.result.clone()))
+    }
+
+    pub fn def_type(&self, key: Def, db: &DB) -> Option<Val> {
+        self.current_deps
+            .with_mut(|a| a.insert(Query::DefType(key)));
+        self.maybe_recompute(key.clone(), db);
+        self.cache
+            .with(|c| c.get(&key).map(|e| e.result.def.ty.clone()))
     }
 }

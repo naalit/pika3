@@ -1,9 +1,11 @@
 use lsp_types::Url;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::{fmt::Display, sync::RwLock};
 pub use std::{num::NonZeroU32, sync::Arc};
 use yansi::Color;
 
+pub use educe::Educe;
 pub use im_rope::Rope;
 pub use tap::Tap;
 
@@ -35,7 +37,8 @@ pub fn default<T: Default>() -> T {
     Default::default()
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Educe)]
+#[educe(Clone, Debug, Default)]
 pub struct Ref<A>(Arc<RwLock<A>>);
 
 impl<A: std::hash::Hash> std::hash::Hash for Ref<A> {
@@ -113,31 +116,34 @@ pub type SName = S<Name>;
 // from pika2
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum FileLoc {
-    Url(Url),
+    File(PathBuf),
     Input,
 }
 impl FileLoc {
     pub fn to_url(self) -> Option<Url> {
         match self {
-            FileLoc::Url(url) => Some(url),
+            FileLoc::File(path) => Url::from_file_path(path).ok(),
             FileLoc::Input => None,
+        }
+    }
+    pub fn parent(self) -> Option<FileLoc> {
+        match self {
+            FileLoc::File(path) => Some(FileLoc::File(path.parent()?.to_owned())),
+            FileLoc::Input => None,
+        }
+    }
+    /// The file name without the file extension
+    pub fn name(self) -> Str {
+        match self {
+            FileLoc::File(path) => path.file_stem().unwrap().to_str().unwrap().into(),
+            FileLoc::Input => "<input>".into(),
         }
     }
 }
 impl Display for FileLoc {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            FileLoc::Url(url) => write!(
-                f,
-                "{}",
-                url.to_file_path()
-                    .ok()
-                    .unwrap()
-                    .file_name()
-                    .unwrap()
-                    .to_str()
-                    .unwrap()
-            ),
+            FileLoc::File(path) => write!(f, "{}", path.file_name().unwrap().to_str().unwrap()),
             FileLoc::Input => write!(f, "<input>"),
         }
     }
@@ -149,6 +155,20 @@ pub type File = Interned<FileLoc>;
 pub enum DefLoc {
     Crate(Name),
     Child(Def, Name),
+}
+impl DefLoc {
+    pub fn parent(&self) -> Option<Def> {
+        match self {
+            DefLoc::Crate(_) => None,
+            DefLoc::Child(d, _) => Some(*d),
+        }
+    }
+    pub fn name(&self) -> Name {
+        match self {
+            DefLoc::Crate(n) => *n,
+            DefLoc::Child(_, n) => *n,
+        }
+    }
 }
 pub type Def = Interned<DefLoc>;
 impl Pretty for Def {

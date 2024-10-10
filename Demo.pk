@@ -1,0 +1,42 @@
+# comment
+def q : (a: Type) -> a -> a = _ => x => x
+
+def Nat : Type = (a : Type) -> (a -> a) -> a -> a
+
+def Eq : (a : Type) -> a -> a -> Type = a => x => y => (P : a -> Type) -> P x -> P y
+
+def refl : (a : Type) -> (x : a) -> Eq a x x = a => x => P => px => px
+
+def one : Nat = _ => f => x => f x
+
+def suc : Nat -> Nat = z => a => f => x => f (z a f x)
+
+def add : Nat -> Nat -> Nat = m => n => a => f => x => m a f (n a f x)
+
+def mul : Nat -> Nat -> Nat = m => n => a => f => x => m a (n a f) x
+
+def m2 = suc one
+def m5 = add one (add m2 m2)
+def m10 = add m5 m5
+def m10b = mul m5 m2
+def m100 = mul m10 m10
+def m100b = mul m10b m10b
+def m1k = mul m100 m10
+def m1kb = mul m100b m10b
+def m2k = mul m2 m1k
+def m2kb = add m1kb m1kb
+def m5k = mul m1k m5
+def m5kb = mul m1kb m5
+def m5kc = add m1k (mul m2k m2)
+def m6k = add m5k m1k
+def m6kb = add m5k m1k
+
+def c10 : Eq Nat m10 m10b = refl Nat m10
+def c100 : Eq Nat m100 m100b = refl Nat m100
+#def c5k : Eq Nat m5k m5kb = refl Nat m5k
+ #def c5b : Eq[FNat, m5k, m5kc] = Eq.Refl
+#def c6k : Eq Nat m6k m6kb = refl Nat m6k
+
+# def e : Eq Nat m2 (a => f => x => f (f x)) = refl Nat m2
+# def e : Eq Nat m2 m2 = refl Nat m2
+#def e : Eq Nat m10 m10b = refl Nat m10
