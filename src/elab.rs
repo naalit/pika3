@@ -110,7 +110,8 @@ pub enum Term {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Sym(Name, NonZeroU32);
 
-type Env = im::Vector<Val>;
+// It would be nice for this to be im::Vector, but that's slower in practice since it's like 5x the stack size...
+type Env = Vec<Val>;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum VHead {
@@ -120,8 +121,8 @@ pub enum VHead {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Val {
-    Neutral(VHead, Vec<Val>), // will be im::Vector<Elim> in the future pry?
-    Fun(Class, Name, Arc<Val>, Arc<Term>, Env), // oh update im::Vector is *way* bigger than Vec in terms of stack size. 64 vs 24 bytes. so it might be best to stick with Vec(Cow<Vec>?) or roll our own
+    Neutral(VHead, Vec<Val>),
+    Fun(Class, Name, Arc<Val>, Arc<Term>, Arc<Env>),
     Error,
     Type,
 }
@@ -132,7 +133,9 @@ impl Val {
     pub fn app(self, other: Val) -> Val {
         match self {
             Val::Neutral(s, vec) => Val::Neutral(s, vec.tap_mut(|v| v.push(other))),
-            Val::Fun(_, _, _, body, env) => body.eval(&env.tap_mut(|v| v.push_back(other))),
+            Val::Fun(_, _, _, body, mut env) => {
+                body.eval(&Arc::make_mut(&mut env).tap_mut(|v| v.push(other)))
+            }
             Val::Error => Val::Error,
             _ => unreachable!("illegal app to {:?}", self),
         }
@@ -145,9 +148,13 @@ impl Term {
             Term::Var(_, idx) => idx.at(env),
             Term::Def(d) => Val::Neutral(VHead::Def(*d), Vec::new()),
             Term::App(f, x) => f.eval(env).app(x.eval(env)),
-            Term::Fun(c, s, aty, body) => {
-                Val::Fun(*c, *s, Arc::new(aty.eval(env)), body.clone(), env.clone())
-            }
+            Term::Fun(c, s, aty, body) => Val::Fun(
+                *c,
+                *s,
+                Arc::new(aty.eval(env)),
+                body.clone(),
+                Arc::new(env.clone()),
+            ),
             Term::Error => Val::Error,
             Term::Type => Val::Type,
         }
@@ -194,7 +201,7 @@ impl QEnv {
         let sym = scxt.bind(s);
         let mut env = env.clone();
         let mut qenv = self.clone();
-        env.push_back(Val::Neutral(VHead::Sym(sym), Vec::new()));
+        env.push(Val::Neutral(VHead::Sym(sym), Vec::new()));
         qenv.scxt = scxt;
         qenv.lvls.insert(sym, qenv.lvls.len() as u32);
         (sym, SEnv { qenv, env })
@@ -369,6 +376,15 @@ impl Val {
                 let arg = Val::Neutral(VHead::Sym(s), Vec::new());
                 aty.unify_(aty2, scxt, db, mode) && a.app(arg.clone()).unify(&b.app(arg), scxt2, db)
             }
+            // eta-expand if there's a lambda on only one side
+            (a @ Val::Fun(Lam, n, _, _, _), b) | (b, a @ Val::Fun(Lam, n, _, _, _)) => {
+                let mut scxt2 = scxt;
+                let s = scxt2.bind(*n);
+                let arg = Val::Neutral(VHead::Sym(s), Vec::new());
+                a.clone()
+                    .app(arg.clone())
+                    .unify(&b.clone().app(arg), scxt2, db)
+            }
             (_, _) => false,
         }
     }
@@ -380,7 +396,7 @@ impl SPre {
             Pre::Var(name) => match cxt.lookup(*name) {
                 Some((term, ty)) => (term, ty),
                 None => {
-                    cxt.err("not found: {}" + name.pretty(&cxt.db), self.span());
+                    cxt.err("name not found: " + name.pretty(&cxt.db), self.span());
                     (Term::Error, Val::Error)
                 }
             },

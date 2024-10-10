@@ -1,20 +1,18 @@
 # comment
 def q : (a: Type) -> a -> a = _ => x => x
 
-def Nat : Type = (a : Type) -> (a -> a) -> a -> a
+# Church equality and naturals
 
 def Eq : (a : Type) -> a -> a -> Type = a => x => y => (P : a -> Type) -> P x -> P y
-
 def refl : (a : Type) -> (x : a) -> Eq a x x = a => x => P => px => px
 
+def Nat : Type = (a : Type) -> (a -> a) -> a -> a
 def one : Nat = _ => f => x => f x
-
 def suc : Nat -> Nat = z => a => f => x => f (z a f x)
-
 def add : Nat -> Nat -> Nat = m => n => a => f => x => m a f (n a f x)
-
 def mul : Nat -> Nat -> Nat = m => n => a => f => x => m a (n a f) x
 
+# Benchmarks for conversion checking
 def m2 = suc one
 def m5 = add one (add m2 m2)
 def m10 = add m5 m5
@@ -33,10 +31,10 @@ def m6kb = add m5k m1k
 
 def c10 : Eq Nat m10 m10b = refl Nat m10
 def c100 : Eq Nat m100 m100b = refl Nat m100
-#def c5k : Eq Nat m5k m5kb = refl Nat m5k
+# these two stack overflow in debug mode, so they're commented out
+# def c5k : Eq Nat m5k m5kb = refl Nat m5k
+# def c6k : Eq Nat m6k m6kb = refl Nat m6k
  #def c5b : Eq[FNat, m5k, m5kc] = Eq.Refl
-#def c6k : Eq Nat m6k m6kb = refl Nat m6k
 
-# def e : Eq Nat m2 (a => f => x => f (f x)) = refl Nat m2
-# def e : Eq Nat m2 m2 = refl Nat m2
-#def e : Eq Nat m10 m10b = refl Nat m10
+# eta-expansion
+def e : (f : Type -> Type) -> Eq (Type -> Type) (x => f x) f = f => refl (Type -> Type) f
