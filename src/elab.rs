@@ -639,9 +639,33 @@ impl SPre {
                     Val::Type,
                 )
             }
-            Pre::Lam(_, _, _) => {
-                cxt.err("could not infer type of lambda", self.span());
-                (Term::Error, Val::Error)
+            // If no type is given, assume monomorphic lambdas
+            Pre::Lam(i, pat, body) => {
+                let (n, aty) = match &**pat {
+                    PrePat::Name(s) => (*s, None),
+                    PrePat::Binder(s, s1) => (*s, Some(s1.clone())),
+                    PrePat::Error => (S(cxt.db.name("_"), pat.span()), None),
+                };
+                let aty = match aty {
+                    Some(aty) => aty.check(Val::Type, cxt).eval(&cxt.env()),
+                    None => cxt.new_meta(Val::Type, pat.span()),
+                };
+
+                let aty2 = aty.quote(cxt.qenv());
+                let (_, cxt2) = cxt.bind(*n, aty.clone());
+                let (body, rty) = body.infer(&cxt2, true);
+                let rty = rty.quote(&cxt2.qenv());
+                (
+                    Term::Fun(Lam, *i, *n, Box::new(aty2), Arc::new(body)),
+                    Val::Fun(
+                        Pi,
+                        *i,
+                        *n,
+                        Arc::new(aty),
+                        Arc::new(rty),
+                        Arc::new(cxt.env().clone()),
+                    ),
+                )
             }
             Pre::Binder(_, _) => {
                 cxt.err("binder not allowed in this context", self.span());

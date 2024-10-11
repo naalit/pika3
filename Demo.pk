@@ -53,3 +53,7 @@ def i1 = {Type} -> {b: Type} -> b -> b
 def i2 : i1 -> Nat = f => f {Nat} {Nat} one
 def i3 : i1 -> Nat = f => f one # note that we can't find a solution for the first implicit parameter here! this will be an error at some point
 def i4 : {a : Type} -> a -> a = x => x
+
+# inferred lambdas
+def l1 = n => mul n m2
+def l2 = x => y => x -> y
