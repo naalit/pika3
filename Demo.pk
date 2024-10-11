@@ -38,3 +38,12 @@ def c100 : Eq Nat m100 m100b = refl Nat m100
 
 # eta-expansion
 def e : (f : Type -> Type) -> Eq (Type -> Type) (x => f x) f = f => refl (Type -> Type) f
+
+# meta tests
+def c10b : Eq _ m10 m10b = refl _ _
+def q1 : (a : _) -> (b : _) -> a -> b -> _ = _ => _ => x => y => x
+def q2 : (a : _) -> (b : _) -> a -> b -> _ = _ => _ => x => y => y
+
+# testing for meta scope errors
+# def a1 : _ = _
+# def a2 : (a : Type) -> a = a => a1

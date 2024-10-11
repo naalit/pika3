@@ -69,6 +69,11 @@ use crate::{
 #[educe(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct Interned<T>(u32, PhantomData<T>);
 impl<T: Clone> Copy for Interned<T> {}
+impl<T> Interned<T> {
+    pub fn num(self) -> u32 {
+        self.0
+    }
+}
 
 #[derive(Educe)]
 #[educe(Clone, Default)]

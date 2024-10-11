@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use smallvec::SmallVec;
 
 use crate::common::*;
@@ -36,7 +38,7 @@ pub fn elab_def(def: Def, db: &DB) -> Option<DefElabResult> {
 
     let cxt = Cxt::new(def, db.clone());
     let ty = pre.0.ty.as_ref().map(|ty| ty.check(Val::Type, &cxt));
-    let (body, ty) = if let Some((val, ty)) = pre.0.value.as_ref().map(|val| match &ty {
+    let (mut body, ty) = if let Some((val, ty)) = pre.0.value.as_ref().map(|val| match &ty {
         Some(ty) => {
             let vty = ty.eval(&cxt.env());
             (val.check(vty.clone(), &cxt), vty)
@@ -49,6 +51,8 @@ pub fn elab_def(def: Def, db: &DB) -> Option<DefElabResult> {
     } else {
         (None, Val::Error)
     };
+    body.as_mut().map(|x| x.zonk(&cxt));
+    let ty = ty.zonk(&cxt);
 
     Some(DefElabResult {
         def: Arc::new(DefElab {
@@ -98,10 +102,11 @@ impl Idx {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Term {
     Var(Name, Idx),
     Def(Def),
+    Meta(Meta),
     App(Box<Term>, Box<Term>),
     /// Argument type annotation
     Fun(Class, Name, Box<Term>, Arc<Term>),
@@ -113,12 +118,13 @@ pub enum Term {
 pub struct Sym(Name, NonZeroU32);
 
 // It would be nice for this to be im::Vector, but that's slower in practice since it's like 5x the stack size...
-type Env = SmallVec<[Arc<Val>; 4]>;
+type Env = SmallVec<[Arc<Val>; 3]>;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum VHead {
     Sym(Sym),
     Def(Def),
+    Meta(Meta),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -149,6 +155,7 @@ impl Term {
         match self {
             Term::Var(_, idx) => Arc::unwrap_or_clone(idx.at(env)),
             Term::Def(d) => Val::Neutral(VHead::Def(*d), default()),
+            Term::Meta(m) => Val::Neutral(VHead::Meta(*m), default()),
             Term::App(f, x) => f.eval(env).app(x.eval(env)),
             Term::Fun(c, s, aty, body) => Val::Fun(
                 *c,
@@ -185,15 +192,15 @@ struct QEnv {
     partial_cxt: bool,
 }
 impl QEnv {
-    fn get(&self, sym: Sym) -> Term {
+    fn get(&self, sym: Sym) -> Option<Term> {
         // i don't *think* this is an off-by-one error...
         if let Some(l) = self.lvls.get(&sym) {
-            Term::Var(sym.0, Idx(self.lvls.len() as u32 - l - 1))
+            Some(Term::Var(sym.0, Idx(self.lvls.len() as u32 - l - 1)))
         } else {
             if self.partial_cxt {
-                Term::Var(sym.0, Idx(0))
+                Some(Term::Var(sym.0, Idx(0)))
             } else {
-                panic!("not in qenv")
+                None
             }
         }
     }
@@ -221,6 +228,7 @@ impl Term {
         match self {
             Term::Var(_, idx) => idx.at(&env.env).quote(&env.qenv),
             Term::Def(d) => Term::Def(*d),
+            Term::Meta(m) => Term::Meta(*m),
             Term::App(f, x) => Term::App(Box::new(f.subst(env)), Box::new(x.subst(env))),
             Term::Fun(c, s, aty, body) => Term::Fun(
                 *c,
@@ -236,11 +244,15 @@ impl Term {
 
 impl Val {
     fn quote(&self, env: &QEnv) -> Term {
-        match self {
+        self.quote_(env).unwrap()
+    }
+    fn quote_(&self, env: &QEnv) -> Result<Term, Sym> {
+        Ok(match self {
             Val::Neutral(s, spine) => spine.iter().fold(
                 match s {
-                    VHead::Sym(s) => env.get(*s),
+                    VHead::Sym(s) => env.get(*s).ok_or(*s)?,
                     VHead::Def(d) => Term::Def(*d),
+                    VHead::Meta(m) => Term::Meta(*m),
                 },
                 |acc, x| Term::App(Box::new(acc), Box::new(x.quote(env))),
             ),
@@ -252,7 +264,51 @@ impl Val {
             ),
             Val::Error => Term::Error,
             Val::Type => Term::Type,
+        })
+    }
+}
+
+impl Term {
+    fn zonk(&mut self, cxt: &Cxt) {
+        self.zonk_(cxt, &cxt.senv());
+    }
+    fn zonk_(&mut self, cxt: &Cxt, senv: &SEnv) -> bool {
+        match self {
+            Term::Meta(meta) => match cxt.meta_val(*meta) {
+                // Meta solutions are evaluated with an empty environment, so we can quote them with an empty environment
+                Some(t) => {
+                    *self = t.quote(&default());
+                    // inline further metas in the solution
+                    self.zonk_(cxt, senv);
+                    return true;
+                }
+                None => (),
+            },
+            Term::App(term, term1) => {
+                // β-reduce meta spines by eval-quoting
+                let solved_meta = term.zonk_(cxt, senv);
+                term1.zonk_(cxt, senv);
+                if solved_meta {
+                    *self = self.eval(&senv.env).quote(&senv.qenv);
+                    return true;
+                }
+            }
+            Term::Fun(_, n, aty, body) => {
+                aty.zonk_(cxt, senv);
+                Arc::make_mut(body).zonk_(cxt, &senv.qenv.bind(*n, &senv.env).1);
+            }
+            Term::Var { .. } | Term::Def { .. } | Term::Error | Term::Type => (),
         }
+        false
+    }
+}
+
+impl Val {
+    fn zonk(&self, cxt: &Cxt) -> Val {
+        // We could do this without quote-eval'ing, but it'd need a bunch of Arc::make_mut()s
+        self.quote(&cxt.qenv())
+            .tap_mut(|x| x.zonk(cxt))
+            .eval(&cxt.env())
     }
 }
 
@@ -262,21 +318,16 @@ use crate::parser::{Pre, PrePat, SPre};
 
 enum MetaEntry {
     Unsolved(Span),
-    Solved(Val),
+    Solved(Arc<Val>),
 }
-// okay so there are three checks that smalltt does for metas right:
-// 1. scope check (w/ renaming): ensure that `?0 a b c` only depends on `a b c` and not other locals
-//    - I'm not sure how we want to do scope; it'd be nice to do something simpler than smalltt, but if there were a nice simple performant solution smalltt would've used it...
-// 2. occurs check: `?0` doesn't occur in its own solution
-//    - this is difficult if metas can occur in other definitions (including child definitions), because in theory we need to unfold...
-// 3. spine check: ????? uhhh checking that the spine is all locals ???
-// -> is there anything else??
-//
-// so what actually happens if we violate these (and don't catch it)?
-// 1 => we might try to unfold the solved meta in a context that doesn't have the appropriate locals available, which would be invalid
-// 2 => i think this might lead to contrived type safety violations with recursive meta solutions? as in you get like infinite terms (`?0 = (U32, ?0) = (U32, U32, ?0) = (U32, U32, ...)`)
-//      -> but we can already do `def P : Type = (U32, P)`, though the backend might not super love it... if it's `imm` and boxed you can construct a cycle that would work though
-// 3 =>
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct Meta(Def, u32);
+impl Pretty for Meta {
+    fn pretty(&self, _db: &DB) -> Doc {
+        "?" + Doc::start(self.0.num()) + "." + Doc::start(self.1)
+    }
+}
 
 #[derive(Clone)]
 struct Cxt {
@@ -284,7 +335,7 @@ struct Cxt {
     def: Def,
     // levels, starting at 0
     bindings: im::HashMap<Name, (u32, Val)>,
-    // metas:
+    metas: Ref<HashMap<Meta, MetaEntry>>,
     env: SEnv,
     errors: Ref<Vec<Error>>,
 }
@@ -296,6 +347,7 @@ impl Cxt {
             bindings: default(),
             env: default(),
             errors: default(),
+            metas: default(),
         }
     }
     fn err(&self, err: impl Into<Doc>, span: Span) {
@@ -334,6 +386,61 @@ impl Cxt {
     fn scxt(&self) -> SymCxt {
         self.env.qenv.scxt
     }
+
+    fn new_meta(&self, span: Span) -> Val {
+        // This can skip numbers in the presence of solved external metas but that shouldn't matter
+        let m = Meta(self.def, self.metas.with(|x| x.len()) as u32);
+        self.metas
+            .with_mut(|x| x.insert(m, MetaEntry::Unsolved(span)));
+        let v = Val::Neutral(VHead::Meta(m), self.env.env.clone());
+        v
+    }
+    fn meta_val(&self, m: Meta) -> Option<Arc<Val>> {
+        self.metas.with(|x| {
+            x.get(&m).and_then(|x| match x {
+                MetaEntry::Unsolved(_) => None,
+                MetaEntry::Solved(arc) => Some(arc.clone()),
+            })
+        })
+    }
+    fn solve_meta(&self, meta: Meta, spine: &Env, solution: Val, span: Span) {
+        let qenv = QEnv {
+            lvls: spine
+                .iter()
+                .enumerate()
+                .filter_map(|(l, v)| match &**v {
+                    Val::Neutral(VHead::Sym(s), sp) if sp.is_empty() => Some((*s, l as u32)),
+                    _ => None,
+                })
+                .collect(),
+            ..default()
+        };
+        // There are more checks than this that we could do, that we don't do
+        // For now this is enough, but in the future we might need to do more
+        match solution.quote_(&qenv) {
+            Ok(body) => {
+                let term = spine.iter().fold(body, |acc, _| {
+                    Term::Fun(Lam, self.db.name("_"), Box::new(Term::Error), Arc::new(acc))
+                });
+                // Eval in an empty environment
+                let val = term.eval(&default());
+                self.metas
+                    .with_mut(|m| m.insert(meta, MetaEntry::Solved(Arc::new(val))));
+            }
+            Err(s) => {
+                self.err(
+                    Doc::start("cannot solve meta ")
+                        + meta.pretty(&self.db)
+                        + " to a term referencing local variable "
+                        + s.0.pretty(&self.db)
+                        + ": `"
+                        + solution.pretty(&self.db)
+                        + "`",
+                    span,
+                );
+            }
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -353,12 +460,12 @@ impl UnfoldState {
 }
 
 impl Val {
-    fn whnf(&mut self, db: &DB) {
+    fn whnf(&mut self, cxt: &Cxt) {
         match self {
             Val::Neutral(VHead::Def(d), spine) => {
-                if let Some(elab) = db.elab.def_value(*d, db) {
-                    if let Some(term) = elab.def.body.as_ref() {
-                        match term {
+                if let Some(elab) = cxt.db.elab.def_value(*d, &cxt.db) {
+                    if let Some(val) = elab.def.body.as_ref() {
+                        match val {
                             // fast path for neutrals (this makes like a 5-10% difference on Bench.pk)
                             Val::Neutral(head, v) => {
                                 *self =
@@ -370,22 +477,30 @@ impl Val {
                                     .fold(term.clone(), |acc, x| acc.app((**x).clone()))
                             }
                         }
-                        self.whnf(db);
+                        self.whnf(cxt);
                     }
+                }
+            }
+            Val::Neutral(VHead::Meta(m), spine) => {
+                if let Some(val) = cxt.meta_val(*m) {
+                    *self = spine
+                        .iter()
+                        .fold((*val).clone(), |acc, x| acc.app((**x).clone()));
+                    self.whnf(cxt);
                 }
             }
             _ => (),
         }
     }
-    fn unify(&self, other: &Val, scxt: SymCxt, db: &DB) -> bool {
-        self.unify_(other, scxt, db, UnfoldState::Maybe)
+    fn unify(&self, other: &Val, scxt: SymCxt, cxt: &Cxt) -> bool {
+        self.unify_(other, scxt, cxt, UnfoldState::Maybe)
     }
-    fn unify_(&self, other: &Val, mut scxt: SymCxt, db: &DB, mut mode: UnfoldState) -> bool {
+    fn unify_(&self, other: &Val, mut scxt: SymCxt, cxt: &Cxt, mut mode: UnfoldState) -> bool {
         let (mut a, mut b) = (self.clone(), other.clone());
         loop {
             if mode == UnfoldState::Yes {
-                a.whnf(db);
-                b.whnf(db);
+                a.whnf(cxt);
+                b.whnf(cxt);
             }
             break match (&a, &b) {
                 (Val::Error, _) | (_, Val::Error) => true,
@@ -396,8 +511,16 @@ impl Val {
                         && sp
                             .iter()
                             .zip(sp2)
-                            .all(|(x, y)| x.unify_(y, scxt, db, mode.spine_mode())) =>
+                            .all(|(x, y)| x.unify_(y, scxt, cxt, mode.spine_mode())) =>
                 {
+                    true
+                }
+                (Val::Neutral(VHead::Meta(m), spine), b)
+                | (b, Val::Neutral(VHead::Meta(m), spine))
+                    if !matches!(b, Val::Neutral(VHead::Meta(m2), _) if m2 == m)
+                        && cxt.meta_val(*m).is_none() =>
+                {
+                    cxt.solve_meta(*m, spine, b.clone(), Span(0, 0));
                     true
                 }
                 (Val::Neutral(_, _), _) | (_, Val::Neutral(_, _)) if mode == UnfoldState::Maybe => {
@@ -408,7 +531,7 @@ impl Val {
                     let mut scxt2 = scxt;
                     let s = scxt2.bind(*n1);
                     let arg = Val::Neutral(VHead::Sym(s), default());
-                    if !aty.unify_(aty2, scxt, db, mode) {
+                    if !aty.unify_(aty2, scxt, cxt, mode) {
                         false
                     } else {
                         a = a.app(arg.clone());
@@ -437,6 +560,12 @@ impl Val {
 impl SPre {
     fn infer(&self, cxt: &Cxt) -> (Term, Val) {
         match &***self {
+            Pre::Var(name) if cxt.db.name("_") == *name => {
+                // hole
+                let mty = cxt.new_meta(self.span());
+                let m = cxt.new_meta(self.span()).quote(&cxt.qenv());
+                (m, mty)
+            }
             Pre::Var(name) => match cxt.lookup(*name) {
                 Some((term, ty)) => (term, ty),
                 None => {
@@ -446,7 +575,7 @@ impl SPre {
             },
             Pre::App(fs, x) => {
                 let (f, mut fty) = fs.infer(cxt);
-                fty.whnf(&cxt.db);
+                fty.whnf(cxt);
                 let aty = match &fty {
                     Val::Error => Val::Error,
                     Val::Fun(Pi, _, aty, _, _) => (**aty).clone(),
@@ -480,7 +609,7 @@ impl SPre {
         }
     }
     fn check(&self, mut ty: Val, cxt: &Cxt) -> Term {
-        ty.whnf(&cxt.db);
+        ty.whnf(cxt);
         match (&***self, &ty) {
             (Pre::Lam(pat, body), Val::Fun(Pi, _, aty2, _, _)) => {
                 let (n, aty) = match &**pat {
@@ -490,7 +619,7 @@ impl SPre {
                 };
                 if let Some(aty) = aty {
                     let aty = aty.check(Val::Type, cxt).eval(cxt.env());
-                    if !aty.unify(&aty2, cxt.scxt(), &cxt.db) {
+                    if !aty.unify(&aty2, cxt.scxt(), cxt) {
                         cxt.err(
                             "wrong parameter type: expected "
                                 + aty2.pretty_at(cxt)
@@ -508,7 +637,7 @@ impl SPre {
             }
             (_, _) => {
                 let (s, sty) = self.infer(cxt);
-                if !ty.unify(&sty, cxt.scxt(), &cxt.db) {
+                if !ty.unify(&sty, cxt.scxt(), cxt) {
                     cxt.err(
                         "could not match types: expected "
                             + ty.pretty_at(cxt)
@@ -527,7 +656,9 @@ impl Val {
     fn pretty_at(&self, cxt: &Cxt) -> Doc {
         self.quote(cxt.qenv()).pretty(&cxt.db)
     }
-    pub fn pretty(&self, db: &DB) -> Doc {
+}
+impl Pretty for Val {
+    fn pretty(&self, db: &DB) -> Doc {
         self.quote(&QEnv {
             partial_cxt: true,
             ..default()
@@ -544,6 +675,7 @@ impl Pretty for Term {
             // TODO how do we get types of local variables for e.g. semantic highlights or hover?
             Term::Var(n, _i) => Doc::start(db.get(*n)), // + &*format!("{}", _i.0),
             Term::Def(d) => db.idefs.get(*d).name().pretty(db),
+            Term::Meta(m) => m.pretty(db),
             Term::App(f, x) => {
                 (f.pretty(db).nest(Prec::App) + " " + x.pretty(db).nest(Prec::Atom)).prec(Prec::App)
             }
