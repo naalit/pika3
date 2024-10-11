@@ -16,5 +16,6 @@ smallvec = "1.13.2"
 tap = "1.0.1"
 yansi = "*"
 
+# for profiling
 [profile.release]
 debug = true

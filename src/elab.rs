@@ -380,44 +380,56 @@ impl Val {
     fn unify(&self, other: &Val, scxt: SymCxt, db: &DB) -> bool {
         self.unify_(other, scxt, db, UnfoldState::Maybe)
     }
-    fn unify_(&self, other: &Val, scxt: SymCxt, db: &DB, mode: UnfoldState) -> bool {
+    fn unify_(&self, other: &Val, mut scxt: SymCxt, db: &DB, mut mode: UnfoldState) -> bool {
         let (mut a, mut b) = (self.clone(), other.clone());
-        if mode == UnfoldState::Yes {
-            a.whnf(db);
-            b.whnf(db);
-        }
-        match (&a, &b) {
-            (Val::Error, _) | (_, Val::Error) => true,
-            (Val::Type, Val::Type) => true,
-            (Val::Neutral(s, sp), Val::Neutral(s2, sp2))
-                if s == s2
-                    && sp.len() == sp2.len()
-                    && sp
-                        .iter()
-                        .zip(sp2)
-                        .all(|(x, y)| x.unify_(y, scxt, db, mode.spine_mode())) =>
-            {
-                true
+        loop {
+            if mode == UnfoldState::Yes {
+                a.whnf(db);
+                b.whnf(db);
             }
-            (Val::Neutral(_, _), _) | (_, Val::Neutral(_, _)) if mode == UnfoldState::Maybe => {
-                a.unify_(&b, scxt, db, UnfoldState::Yes)
-            }
-            (Val::Fun(c, n1, aty, _, _), Val::Fun(c2, _, aty2, _, _)) if c == c2 => {
-                let mut scxt2 = scxt;
-                let s = scxt2.bind(*n1);
-                let arg = Val::Neutral(VHead::Sym(s), default());
-                aty.unify_(aty2, scxt, db, mode) && a.app(arg.clone()).unify(&b.app(arg), scxt2, db)
-            }
-            // eta-expand if there's a lambda on only one side
-            (a @ Val::Fun(Lam, n, _, _, _), b) | (b, a @ Val::Fun(Lam, n, _, _, _)) => {
-                let mut scxt2 = scxt;
-                let s = scxt2.bind(*n);
-                let arg = Val::Neutral(VHead::Sym(s), default());
-                a.clone()
-                    .app(arg.clone())
-                    .unify(&b.clone().app(arg), scxt2, db)
-            }
-            (_, _) => false,
+            break match (&a, &b) {
+                (Val::Error, _) | (_, Val::Error) => true,
+                (Val::Type, Val::Type) => true,
+                (Val::Neutral(s, sp), Val::Neutral(s2, sp2))
+                    if s == s2
+                        && sp.len() == sp2.len()
+                        && sp
+                            .iter()
+                            .zip(sp2)
+                            .all(|(x, y)| x.unify_(y, scxt, db, mode.spine_mode())) =>
+                {
+                    true
+                }
+                (Val::Neutral(_, _), _) | (_, Val::Neutral(_, _)) if mode == UnfoldState::Maybe => {
+                    mode = UnfoldState::Yes;
+                    continue;
+                }
+                (Val::Fun(c, n1, aty, _, _), Val::Fun(c2, _, aty2, _, _)) if c == c2 => {
+                    let mut scxt2 = scxt;
+                    let s = scxt2.bind(*n1);
+                    let arg = Val::Neutral(VHead::Sym(s), default());
+                    if !aty.unify_(aty2, scxt, db, mode) {
+                        false
+                    } else {
+                        a = a.app(arg.clone());
+                        b = b.app(arg);
+                        scxt = scxt2;
+                        mode = UnfoldState::Maybe;
+                        continue;
+                    }
+                }
+                // eta-expand if there's a lambda on only one side
+                (Val::Fun(Lam, n, _, _, _), _) | (_, Val::Fun(Lam, n, _, _, _)) => {
+                    let mut scxt2 = scxt;
+                    let s = scxt2.bind(*n);
+                    let arg = Val::Neutral(VHead::Sym(s), default());
+                    a = a.app(arg.clone());
+                    b = b.app(arg);
+                    scxt = scxt2;
+                    continue;
+                }
+                (_, _) => false,
+            };
         }
     }
 }
