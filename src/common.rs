@@ -22,6 +22,21 @@ pub enum Class {
 }
 pub use Class::*;
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Icit {
+    Impl,
+    Expl,
+}
+pub use Icit::*;
+impl Display for Icit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Impl => write!(f, "implicit"),
+            Expl => write!(f, "explicit"),
+        }
+    }
+}
+
 pub type Str = Arc<str>;
 
 pub trait ToRope {

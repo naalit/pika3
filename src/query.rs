@@ -158,6 +158,14 @@ impl DB {
         self.names.get(n)
     }
 
+    /// Modifies a name to be inaccessible in the source language, for hygiene
+    /// Specifically, appends a tilde character ~ which is not legal in identifiers
+    pub fn inaccessible(&self, n: Name) -> Name {
+        let mut s = self.get(n).to_string();
+        s.push('~');
+        self.name(&s)
+    }
+
     pub fn def_file(&self, def: Def) -> (File, Def) {
         match self.def_file.get(&def) {
             Some(f) => (*f, def),

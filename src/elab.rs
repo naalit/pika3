@@ -43,7 +43,7 @@ pub fn elab_def(def: Def, db: &DB) -> Option<DefElabResult> {
             let vty = ty.eval(&cxt.env());
             (val.check(vty.clone(), &cxt), vty)
         }
-        None => val.infer(&cxt),
+        None => val.infer(&cxt, true),
     }) {
         (Some(val), ty)
     } else if let Some(ty) = ty {
@@ -109,7 +109,7 @@ pub enum Term {
     Meta(Meta),
     App(Box<Term>, Box<Term>),
     /// Argument type annotation
-    Fun(Class, Name, Box<Term>, Arc<Term>),
+    Fun(Class, Icit, Name, Box<Term>, Arc<Term>),
     Error,
     Type,
 }
@@ -130,7 +130,7 @@ pub enum VHead {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Val {
     Neutral(VHead, SmallVec<[Arc<Val>; 3]>),
-    Fun(Class, Name, Arc<Val>, Arc<Term>, Arc<Env>),
+    Fun(Class, Icit, Name, Arc<Val>, Arc<Term>, Arc<Env>),
     Error,
     Type,
 }
@@ -141,7 +141,7 @@ impl Val {
     pub fn app(self, other: Val) -> Val {
         match self {
             Val::Neutral(s, vec) => Val::Neutral(s, vec.tap_mut(|v| v.push(Arc::new(other)))),
-            Val::Fun(_, _, _, body, mut env) => {
+            Val::Fun(_, _, _, _, body, mut env) => {
                 body.eval(&Arc::make_mut(&mut env).tap_mut(|v| v.push(Arc::new(other))))
             }
             Val::Error => Val::Error,
@@ -157,8 +157,9 @@ impl Term {
             Term::Def(d) => Val::Neutral(VHead::Def(*d), default()),
             Term::Meta(m) => Val::Neutral(VHead::Meta(*m), default()),
             Term::App(f, x) => f.eval(env).app(x.eval(env)),
-            Term::Fun(c, s, aty, body) => Val::Fun(
+            Term::Fun(c, i, s, aty, body) => Val::Fun(
                 *c,
+                *i,
                 *s,
                 Arc::new(aty.eval(env)),
                 body.clone(),
@@ -230,8 +231,9 @@ impl Term {
             Term::Def(d) => Term::Def(*d),
             Term::Meta(m) => Term::Meta(*m),
             Term::App(f, x) => Term::App(Box::new(f.subst(env)), Box::new(x.subst(env))),
-            Term::Fun(c, s, aty, body) => Term::Fun(
+            Term::Fun(c, i, s, aty, body) => Term::Fun(
                 *c,
+                *i,
                 *s,
                 Box::new(aty.subst(env)),
                 Arc::new(body.subst(&env.qenv.bind(*s, &env.env).1)),
@@ -256,8 +258,9 @@ impl Val {
                 },
                 |acc, x| Term::App(Box::new(acc), Box::new(x.quote(env))),
             ),
-            Val::Fun(c, s, aty, body, inner_env) => Term::Fun(
+            Val::Fun(c, i, s, aty, body, inner_env) => Term::Fun(
                 *c,
+                *i,
                 *s,
                 Box::new(aty.quote(env)),
                 Arc::new(body.subst(&env.bind(*s, inner_env).1)),
@@ -293,7 +296,7 @@ impl Term {
                     return true;
                 }
             }
-            Term::Fun(_, n, aty, body) => {
+            Term::Fun(_, _, n, aty, body) => {
                 aty.zonk_(cxt, senv);
                 Arc::make_mut(body).zonk_(cxt, &senv.qenv.bind(*n, &senv.env).1);
             }
@@ -317,7 +320,9 @@ impl Val {
 use crate::parser::{Pre, PrePat, SPre};
 
 enum MetaEntry {
-    Unsolved(Span),
+    // The first field is the type; we'll need that eventually for typeclass resolution, but it doesn't matter right now
+    // TODO error on unsolved metas (that's why the span is here)
+    Unsolved(Arc<Val>, Span),
     Solved(Arc<Val>),
 }
 
@@ -387,18 +392,18 @@ impl Cxt {
         self.env.qenv.scxt
     }
 
-    fn new_meta(&self, span: Span) -> Val {
+    fn new_meta(&self, ty: Val, span: Span) -> Val {
         // This can skip numbers in the presence of solved external metas but that shouldn't matter
         let m = Meta(self.def, self.metas.with(|x| x.len()) as u32);
         self.metas
-            .with_mut(|x| x.insert(m, MetaEntry::Unsolved(span)));
+            .with_mut(|x| x.insert(m, MetaEntry::Unsolved(Arc::new(ty), span)));
         let v = Val::Neutral(VHead::Meta(m), self.env.env.clone());
         v
     }
     fn meta_val(&self, m: Meta) -> Option<Arc<Val>> {
         self.metas.with(|x| {
             x.get(&m).and_then(|x| match x {
-                MetaEntry::Unsolved(_) => None,
+                MetaEntry::Unsolved(_, _) => None,
                 MetaEntry::Solved(arc) => Some(arc.clone()),
             })
         })
@@ -420,7 +425,13 @@ impl Cxt {
         match solution.quote_(&qenv) {
             Ok(body) => {
                 let term = spine.iter().fold(body, |acc, _| {
-                    Term::Fun(Lam, self.db.name("_"), Box::new(Term::Error), Arc::new(acc))
+                    Term::Fun(
+                        Lam,
+                        Expl,
+                        self.db.name("_"),
+                        Box::new(Term::Error),
+                        Arc::new(acc),
+                    )
                 });
                 // Eval in an empty environment
                 let val = term.eval(&default());
@@ -527,7 +538,9 @@ impl Val {
                     mode = UnfoldState::Yes;
                     continue;
                 }
-                (Val::Fun(c, n1, aty, _, _), Val::Fun(c2, _, aty2, _, _)) if c == c2 => {
+                (Val::Fun(c, i1, n1, aty, _, _), Val::Fun(c2, i2, _, aty2, _, _))
+                    if c == c2 && i1 == i2 =>
+                {
                     let mut scxt2 = scxt;
                     let s = scxt2.bind(*n1);
                     let arg = Val::Neutral(VHead::Sym(s), default());
@@ -542,7 +555,8 @@ impl Val {
                     }
                 }
                 // eta-expand if there's a lambda on only one side
-                (Val::Fun(Lam, n, _, _, _), _) | (_, Val::Fun(Lam, n, _, _, _)) => {
+                // TODO this might have problems since we don't make sure the icits match?
+                (Val::Fun(Lam, _, n, _, _, _), _) | (_, Val::Fun(Lam, _, n, _, _, _)) => {
                     let mut scxt2 = scxt;
                     let s = scxt2.bind(*n);
                     let arg = Val::Neutral(VHead::Sym(s), default());
@@ -557,13 +571,27 @@ impl Val {
     }
 }
 
+// don't call this if checking against an implicit lambda
+fn insert_metas(term: Term, mut ty: Val, cxt: &Cxt, span: Span) -> (Term, Val) {
+    ty.whnf(cxt);
+    match &ty {
+        Val::Fun(Pi, Impl, _, aty, _, _) => {
+            let m = cxt.new_meta((**aty).clone(), span);
+            let term = Term::App(Box::new(term), Box::new(m.quote(&cxt.qenv())));
+            let ty = ty.app(m);
+            insert_metas(term, ty, cxt, span)
+        }
+        _ => (term, ty),
+    }
+}
+
 impl SPre {
-    fn infer(&self, cxt: &Cxt) -> (Term, Val) {
-        match &***self {
+    fn infer(&self, cxt: &Cxt, should_insert_metas: bool) -> (Term, Val) {
+        let (s, sty) = match &***self {
             Pre::Var(name) if cxt.db.name("_") == *name => {
                 // hole
-                let mty = cxt.new_meta(self.span());
-                let m = cxt.new_meta(self.span()).quote(&cxt.qenv());
+                let mty = cxt.new_meta(Val::Type, self.span());
+                let m = cxt.new_meta(mty.clone(), self.span()).quote(&cxt.qenv());
                 (m, mty)
             }
             Pre::Var(name) => match cxt.lookup(*name) {
@@ -573,12 +601,24 @@ impl SPre {
                     (Term::Error, Val::Error)
                 }
             },
-            Pre::App(fs, x) => {
-                let (f, mut fty) = fs.infer(cxt);
+            Pre::App(fs, x, i) => {
+                let (f, mut fty) = fs.infer(cxt, *i == Expl);
                 fty.whnf(cxt);
                 let aty = match &fty {
                     Val::Error => Val::Error,
-                    Val::Fun(Pi, _, aty, _, _) => (**aty).clone(),
+                    Val::Fun(Pi, i2, _, aty, _, _) if i == i2 => (**aty).clone(),
+                    Val::Fun(Pi, _, _, _, _, _) => {
+                        cxt.err(
+                            "wrong function type: expected "
+                                + Doc::start(*i)
+                                + " function but got "
+                                + fty.pretty_at(cxt),
+                            fs.span(),
+                        );
+                        // prevent .app() from panicking
+                        fty = Val::Error;
+                        Val::Error
+                    }
                     _ => {
                         cxt.err("not a function type: " + fty.pretty_at(cxt), fs.span());
                         // prevent .app() from panicking
@@ -590,13 +630,16 @@ impl SPre {
                 let vx = x.eval(cxt.env());
                 (Term::App(Box::new(f), Box::new(x)), fty.app(vx))
             }
-            Pre::Pi(n, aty, body) => {
+            Pre::Pi(i, n, aty, body) => {
                 let aty = aty.check(Val::Type, cxt);
                 let vaty = aty.eval(cxt.env());
                 let body = body.check(Val::Type, &cxt.bind(*n, vaty).1);
-                (Term::Fun(Pi, *n, Box::new(aty), Arc::new(body)), Val::Type)
+                (
+                    Term::Fun(Pi, *i, *n, Box::new(aty), Arc::new(body)),
+                    Val::Type,
+                )
             }
-            Pre::Lam(_, _) => {
+            Pre::Lam(_, _, _) => {
                 cxt.err("could not infer type of lambda", self.span());
                 (Term::Error, Val::Error)
             }
@@ -606,12 +649,18 @@ impl SPre {
             }
             Pre::Type => (Term::Type, Val::Type),
             Pre::Error => (Term::Error, Val::Error),
+        };
+        if should_insert_metas {
+            insert_metas(s, sty, cxt, self.span())
+        } else {
+            (s, sty)
         }
     }
+
     fn check(&self, mut ty: Val, cxt: &Cxt) -> Term {
         ty.whnf(cxt);
         match (&***self, &ty) {
-            (Pre::Lam(pat, body), Val::Fun(Pi, _, aty2, _, _)) => {
+            (Pre::Lam(i, pat, body), Val::Fun(Pi, i2, _, aty2, _, _)) if i == i2 => {
                 let (n, aty) = match &**pat {
                     PrePat::Name(s) => (*s, None),
                     PrePat::Binder(s, s1) => (*s, Some(s1.clone())),
@@ -633,10 +682,21 @@ impl SPre {
                 let (sym, cxt) = cxt.bind(*n, (**aty2).clone());
                 let rty = ty.app(Val::Neutral(VHead::Sym(sym), default()));
                 let body = body.check(rty, &cxt);
-                Term::Fun(Lam, *n, Box::new(aty), Arc::new(body))
+                Term::Fun(Lam, *i, *n, Box::new(aty), Arc::new(body))
             }
+            // insert lambda when checking (non-implicit lambda) against implicit function type
+            (_, Val::Fun(Pi, Impl, n, aty, _, _)) => {
+                let aty2 = aty.quote(cxt.qenv());
+                // don't let them access the name in the term (shadowing existing names would be unintuitive)
+                let n = cxt.db.inaccessible(*n);
+                let (sym, cxt) = cxt.bind(n, (**aty).clone());
+                let rty = ty.app(Val::Neutral(VHead::Sym(sym), default()));
+                let body = self.check(rty, &cxt);
+                Term::Fun(Lam, Impl, n, Box::new(aty2), Arc::new(body))
+            }
+
             (_, _) => {
-                let (s, sty) = self.infer(cxt);
+                let (s, sty) = self.infer(cxt, !matches!(ty, Val::Fun(Pi, Impl, _, _, _, _)));
                 if !ty.unify(&sty, cxt.scxt(), cxt) {
                     cxt.err(
                         "could not match types: expected "
@@ -669,6 +729,16 @@ impl Pretty for Val {
 
 // pretty-printing
 
+impl Icit {
+    fn bind(self, x: Doc, parens: bool) -> Doc {
+        match self {
+            Impl => "{" + x + "}",
+            Expl if parens => "(" + x + ")",
+            Expl => x,
+        }
+    }
+}
+
 impl Pretty for Term {
     fn pretty(&self, db: &DB) -> Doc {
         match self {
@@ -676,20 +746,20 @@ impl Pretty for Term {
             Term::Var(n, _i) => Doc::start(db.get(*n)), // + &*format!("{}", _i.0),
             Term::Def(d) => db.idefs.get(*d).name().pretty(db),
             Term::Meta(m) => m.pretty(db),
+            // TODO we probably want to show implicit and explicit application differently, but that requires threading icits through neutral spines...
             Term::App(f, x) => {
                 (f.pretty(db).nest(Prec::App) + " " + x.pretty(db).nest(Prec::Atom)).prec(Prec::App)
             }
-            Term::Fun(Lam, s, _, body) => {
-                (s.pretty(db) + " => " + body.pretty(db)).prec(Prec::Term)
+            Term::Fun(Lam, i, s, _, body) => {
+                (i.bind(s.pretty(db), false) + " => " + body.pretty(db)).prec(Prec::Term)
             }
-            Term::Fun(Pi, s, aty, body) if *s == db.name("_") => {
-                (aty.pretty(db).nest(Prec::App) + " -> " + body.pretty(db)).prec(Prec::Pi)
+            Term::Fun(Pi, i, s, aty, body) if *s == db.name("_") => {
+                (i.bind(aty.pretty(db).nest(Prec::App), false) + " -> " + body.pretty(db))
+                    .prec(Prec::Pi)
             }
-            Term::Fun(Pi, s, aty, body) => (Doc::start("(")
-                + &*db.get(*s)
-                + ": "
-                + aty.pretty(db).nest(Prec::Pi)
-                + ") -> "
+            Term::Fun(Pi, i, s, aty, body) => (i
+                .bind(s.pretty(db) + ": " + aty.pretty(db).nest(Prec::Pi), true)
+                + " -> "
                 + body.pretty(db))
             .prec(Prec::Pi),
             Term::Error => Doc::keyword("error"),

@@ -21,9 +21,9 @@ pub enum Pre {
     Type,
     Var(Name),
     Binder(SPre, SPre),
-    App(SPre, SPre),
-    Pi(Name, SPre, SPre),
-    Lam(S<PrePat>, SPre),
+    App(SPre, SPre, Icit),
+    Pi(Icit, Name, SPre, SPre),
+    Lam(Icit, S<PrePat>, SPre),
     Error,
 }
 pub type SPre = S<Box<Pre>>;
@@ -52,6 +52,7 @@ struct Parser {
     tokens: Vec<Tok>,
     starts: Vec<u32>,
     pos: usize,
+    pos_non_trivia: usize,
     errors: Vec<Error>,
     // once we emit a parse error on a given token, we don't emit errors for subsequent expect()s that fail on the same token
     this_tok_err: bool,
@@ -66,6 +67,7 @@ impl Parser {
             tokens: r.kind,
             starts: r.start,
             pos: 0,
+            pos_non_trivia: 0,
             errors: r
                 .errors
                 .into_iter()
@@ -86,6 +88,9 @@ impl Parser {
         let t = self.peek();
         if t != Tok::Eof {
             self.pos += 1;
+            if !t.is_trivia() {
+                self.pos_non_trivia = self.pos;
+            }
             self.this_tok_err = false;
         }
         t
@@ -120,6 +125,12 @@ impl Parser {
         *self
             .starts
             .get(self.pos)
+            .unwrap_or_else(|| self.starts.last().unwrap())
+    }
+    fn pos_right(&self) -> u32 {
+        *self
+            .starts
+            .get(self.pos_non_trivia)
             .unwrap_or_else(|| self.starts.last().unwrap())
     }
     fn tok_span(&self) -> Span {
@@ -171,7 +182,7 @@ impl Parser {
     fn spanned<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> S<T> {
         let start = self.pos();
         let r = f(self);
-        S(r, Span(start, self.pos()))
+        S(r, Span(start, self.pos_right()))
     }
 
     // reparsing
@@ -250,7 +261,19 @@ impl Parser {
         let mut last = start;
         while self.peek().starts_atom() && last != self.pos() {
             last = self.pos();
-            a = S(Box::new(Pre::App(a, self.atom())), Span(start, self.pos()));
+            if self.maybe(Tok::COpen) {
+                let term = self.term();
+                self.expect(Tok::CClose);
+                a = S(
+                    Box::new(Pre::App(a, term, Impl)),
+                    Span(start, self.pos_right()),
+                );
+            } else {
+                a = S(
+                    Box::new(Pre::App(a, self.atom(), Expl)),
+                    Span(start, self.pos_right()),
+                );
+            }
         }
         a
     }
@@ -259,24 +282,38 @@ impl Parser {
         let lhs = self.app();
         if self.maybe(Tok::Colon) {
             let rhs = self.fun();
-            S(Box::new(Pre::Binder(lhs, rhs)), Span(start, self.pos()))
+            S(
+                Box::new(Pre::Binder(lhs, rhs)),
+                Span(start, self.pos_right()),
+            )
         } else {
             lhs
         }
     }
     fn fun(&mut self) -> SPre {
         let start = self.pos();
+        let implicit = self.maybe(Tok::COpen);
         let lhs = self.binder();
+        if implicit {
+            self.expect(Tok::CClose);
+        }
+        let icit = if implicit { Impl } else { Expl };
         if self.maybe(Tok::Arrow) {
             // pi
             let rhs = self.fun();
             let (name, lhs) = self.reparse_pi_param(lhs);
-            S(Box::new(Pre::Pi(name, lhs, rhs)), Span(start, self.pos()))
+            S(
+                Box::new(Pre::Pi(icit, name, lhs, rhs)),
+                Span(start, self.pos_right()),
+            )
         } else if self.maybe(Tok::WideArrow) {
             // lambda
             let rhs = self.fun();
             let pat = S(self.reparse_pattern(&lhs), lhs.span());
-            S(Box::new(Pre::Lam(pat, rhs)), Span(start, self.pos()))
+            S(
+                Box::new(Pre::Lam(icit, pat, rhs)),
+                Span(start, self.pos_right()),
+            )
         } else {
             lhs
         }

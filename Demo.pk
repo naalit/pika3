@@ -3,8 +3,8 @@ def q : (a: Type) -> a -> a = _ => x => x
 
 # Church equality and naturals
 
-def Eq : (a : Type) -> a -> a -> Type = a => x => y => (P : a -> Type) -> P x -> P y
-def refl : (a : Type) -> (x : a) -> Eq a x x = a => x => P => px => px
+def Eq : {a : Type} -> a -> a -> Type = {a} => x => y => (P : a -> Type) -> P x -> P y
+def refl : {a : Type} -> {x : a} -> Eq x x = P => px => px
 
 def Nat : Type = (a : Type) -> (a -> a) -> a -> a
 def one : Nat = _ => f => x => f x
@@ -29,21 +29,27 @@ def m5kc = add m1k (mul m2k m2)
 def m6k = add m5k m1k
 def m6kb = add m5k m1k
 
-def c10 : Eq Nat m10 m10b = refl Nat m10
-def c100 : Eq Nat m100 m100b = refl Nat m100
+def c10 : Eq m10 m10b = refl
+def c100 : Eq m100 m100b = refl
 # these two stack overflow in debug mode, so they're commented out
-# def c5k : Eq Nat m5k m5kb = refl Nat m5k
-# def c6k : Eq Nat m6k m6kb = refl Nat m6k
+# def c5k : Eq m5k m5kb = refl
+# def c6k : Eq m6k m6kb = refl
  #def c5b : Eq[FNat, m5k, m5kc] = Eq.Refl
 
 # eta-expansion
-def e : (f : Type -> Type) -> Eq (Type -> Type) (x => f x) f = f => refl (Type -> Type) f
+def e : (f : Type -> Type) -> Eq f (x => f x) = f => refl
 
 # meta tests
-def c10b : Eq _ m10 m10b = refl _ _
+def c10b : Eq m10 m10b = refl
 def q1 : (a : _) -> (b : _) -> a -> b -> _ = _ => _ => x => y => x
 def q2 : (a : _) -> (b : _) -> a -> b -> _ = _ => _ => x => y => y
 
 # testing for meta scope errors
 # def a1 : _ = _
 # def a2 : (a : Type) -> a = a => a1
+
+# implicit parameters
+def i1 = {Type} -> {b: Type} -> b -> b
+def i2 : i1 -> Nat = f => f {Nat} {Nat} one
+def i3 : i1 -> Nat = f => f one # note that we can't find a solution for the first implicit parameter here! this will be an error at some point
+def i4 : {a : Type} -> a -> a = x => x
