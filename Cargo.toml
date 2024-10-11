@@ -12,5 +12,9 @@ lsp-server = "0.7.7"
 lsp-types = "0.95.1"
 serde = "1.0.210"
 serde_json = "1.0.128"
+smallvec = "1.13.2"
 tap = "1.0.1"
 yansi = "*"
+
+[profile.release]
+debug = true

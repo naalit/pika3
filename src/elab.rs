@@ -1,3 +1,5 @@
+use smallvec::SmallVec;
+
 use crate::common::*;
 
 // entry point (per-file elab query)
@@ -87,7 +89,7 @@ pub struct ModuleElabResult {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Idx(u32);
 impl Idx {
-    fn at(self, env: &Env) -> Val {
+    fn at(self, env: &Env) -> Arc<Val> {
         // [a, b] at 1 is a (vec[0]), at 0 is b (vec[1])
         if env.len() < self.0 as usize + 1 {
             panic!("idx {} at {}", self.0, env.len())
@@ -111,7 +113,7 @@ pub enum Term {
 pub struct Sym(Name, NonZeroU32);
 
 // It would be nice for this to be im::Vector, but that's slower in practice since it's like 5x the stack size...
-type Env = Vec<Val>;
+type Env = SmallVec<[Arc<Val>; 4]>;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum VHead {
@@ -121,7 +123,7 @@ pub enum VHead {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Val {
-    Neutral(VHead, Vec<Val>),
+    Neutral(VHead, SmallVec<[Arc<Val>; 3]>),
     Fun(Class, Name, Arc<Val>, Arc<Term>, Arc<Env>),
     Error,
     Type,
@@ -132,9 +134,9 @@ pub enum Val {
 impl Val {
     pub fn app(self, other: Val) -> Val {
         match self {
-            Val::Neutral(s, vec) => Val::Neutral(s, vec.tap_mut(|v| v.push(other))),
+            Val::Neutral(s, vec) => Val::Neutral(s, vec.tap_mut(|v| v.push(Arc::new(other)))),
             Val::Fun(_, _, _, body, mut env) => {
-                body.eval(&Arc::make_mut(&mut env).tap_mut(|v| v.push(other)))
+                body.eval(&Arc::make_mut(&mut env).tap_mut(|v| v.push(Arc::new(other))))
             }
             Val::Error => Val::Error,
             _ => unreachable!("illegal app to {:?}", self),
@@ -145,8 +147,8 @@ impl Val {
 impl Term {
     pub fn eval(&self, env: &Env) -> Val {
         match self {
-            Term::Var(_, idx) => idx.at(env),
-            Term::Def(d) => Val::Neutral(VHead::Def(*d), Vec::new()),
+            Term::Var(_, idx) => Arc::unwrap_or_clone(idx.at(env)),
+            Term::Def(d) => Val::Neutral(VHead::Def(*d), default()),
             Term::App(f, x) => f.eval(env).app(x.eval(env)),
             Term::Fun(c, s, aty, body) => Val::Fun(
                 *c,
@@ -201,7 +203,7 @@ impl QEnv {
         let sym = scxt.bind(s);
         let mut env = env.clone();
         let mut qenv = self.clone();
-        env.push(Val::Neutral(VHead::Sym(sym), Vec::new()));
+        env.push(Arc::new(Val::Neutral(VHead::Sym(sym), default())));
         qenv.scxt = scxt;
         qenv.lvls.insert(sym, qenv.lvls.len() as u32);
         (sym, SEnv { qenv, env })
@@ -258,12 +260,31 @@ impl Val {
 
 use crate::parser::{Pre, PrePat, SPre};
 
+enum MetaEntry {
+    Unsolved(Span),
+    Solved(Val),
+}
+// okay so there are three checks that smalltt does for metas right:
+// 1. scope check (w/ renaming): ensure that `?0 a b c` only depends on `a b c` and not other locals
+//    - I'm not sure how we want to do scope; it'd be nice to do something simpler than smalltt, but if there were a nice simple performant solution smalltt would've used it...
+// 2. occurs check: `?0` doesn't occur in its own solution
+//    - this is difficult if metas can occur in other definitions (including child definitions), because in theory we need to unfold...
+// 3. spine check: ????? uhhh checking that the spine is all locals ???
+// -> is there anything else??
+//
+// so what actually happens if we violate these (and don't catch it)?
+// 1 => we might try to unfold the solved meta in a context that doesn't have the appropriate locals available, which would be invalid
+// 2 => i think this might lead to contrived type safety violations with recursive meta solutions? as in you get like infinite terms (`?0 = (U32, ?0) = (U32, U32, ?0) = (U32, U32, ...)`)
+//      -> but we can already do `def P : Type = (U32, P)`, though the backend might not super love it... if it's `imm` and boxed you can construct a cycle that would work though
+// 3 =>
+
 #[derive(Clone)]
 struct Cxt {
     db: DB,
     def: Def,
     // levels, starting at 0
     bindings: im::HashMap<Name, (u32, Val)>,
+    // metas:
     env: SEnv,
     errors: Ref<Vec<Error>>,
 }
@@ -337,7 +358,18 @@ impl Val {
             Val::Neutral(VHead::Def(d), spine) => {
                 if let Some(elab) = db.elab.def_value(*d, db) {
                     if let Some(term) = elab.def.body.as_ref() {
-                        *self = spine.iter().fold(term.clone(), |acc, x| acc.app(x.clone()));
+                        match term {
+                            // fast path for neutrals (this makes like a 5-10% difference on Bench.pk)
+                            Val::Neutral(head, v) => {
+                                *self =
+                                    Val::Neutral(*head, v.iter().chain(&*spine).cloned().collect())
+                            }
+                            term => {
+                                *self = spine
+                                    .iter()
+                                    .fold(term.clone(), |acc, x| acc.app((**x).clone()))
+                            }
+                        }
                         self.whnf(db);
                     }
                 }
@@ -373,14 +405,14 @@ impl Val {
             (Val::Fun(c, n1, aty, _, _), Val::Fun(c2, _, aty2, _, _)) if c == c2 => {
                 let mut scxt2 = scxt;
                 let s = scxt2.bind(*n1);
-                let arg = Val::Neutral(VHead::Sym(s), Vec::new());
+                let arg = Val::Neutral(VHead::Sym(s), default());
                 aty.unify_(aty2, scxt, db, mode) && a.app(arg.clone()).unify(&b.app(arg), scxt2, db)
             }
             // eta-expand if there's a lambda on only one side
             (a @ Val::Fun(Lam, n, _, _, _), b) | (b, a @ Val::Fun(Lam, n, _, _, _)) => {
                 let mut scxt2 = scxt;
                 let s = scxt2.bind(*n);
-                let arg = Val::Neutral(VHead::Sym(s), Vec::new());
+                let arg = Val::Neutral(VHead::Sym(s), default());
                 a.clone()
                     .app(arg.clone())
                     .unify(&b.clone().app(arg), scxt2, db)
@@ -458,7 +490,7 @@ impl SPre {
                 }
                 let aty = aty2.quote(cxt.qenv());
                 let (sym, cxt) = cxt.bind(*n, (**aty2).clone());
-                let rty = ty.app(Val::Neutral(VHead::Sym(sym), Vec::new()));
+                let rty = ty.app(Val::Neutral(VHead::Sym(sym), default()));
                 let body = body.check(rty, &cxt);
                 Term::Fun(Lam, *n, Box::new(aty), Arc::new(body))
             }

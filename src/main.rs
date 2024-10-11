@@ -9,6 +9,11 @@ use std::io::Read;
 
 use crate::common::*;
 
+// Next up: Metas!
+// We're currently at 2.5k LOC (with the longest file being the lexer, lol)
+// I'd like to get to feature parity with smalltt and see how big we get (smalltt is 5.6k LOC I think? for reference)
+// and how our performance compares
+
 fn main() {
     let (input, input_s) = {
         let mut file = std::fs::File::open("Demo.pk").unwrap();
