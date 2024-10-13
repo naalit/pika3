@@ -53,6 +53,7 @@ struct Parser {
     starts: Vec<u32>,
     pos: usize,
     pos_non_trivia: usize,
+    in_indent: bool,
     errors: Vec<Error>,
     // once we emit a parse error on a given token, we don't emit errors for subsequent expect()s that fail on the same token
     this_tok_err: bool,
@@ -68,6 +69,7 @@ impl Parser {
             starts: r.start,
             pos: 0,
             pos_non_trivia: 0,
+            in_indent: false,
             errors: r
                 .errors
                 .into_iter()
@@ -96,8 +98,20 @@ impl Parser {
         t
     }
     fn skip_trivia(&mut self, skip_newline: bool) {
-        while self.peek().is_trivia() || (skip_newline && self.peek() == Tok::Newline) {
-            self.next_raw();
+        loop {
+            if self.peek().is_trivia()
+                || ((skip_newline || self.in_indent) && self.peek() == Tok::Newline)
+            {
+                self.next_raw();
+            } else if self.peek() == Tok::Indent && !self.in_indent {
+                self.in_indent = true;
+                self.next_raw();
+            } else if self.peek() == Tok::Dedent && self.in_indent {
+                self.in_indent = false;
+                self.next_raw();
+            } else {
+                break;
+            }
         }
     }
     fn next(&mut self) -> Tok {
@@ -356,7 +370,6 @@ impl Tok {
                 | Tok::Name
                 | Tok::COpen
                 | Tok::SOpen
-                | Tok::Indent
                 | Tok::DoKw
                 | Tok::IfKw
                 | Tok::ImmKw

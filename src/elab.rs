@@ -51,8 +51,8 @@ pub fn elab_def(def: Def, db: &DB) -> Option<DefElabResult> {
     } else {
         (None, Val::Error)
     };
-    body.as_mut().map(|x| x.zonk(&cxt));
-    let ty = ty.zonk(&cxt);
+    body.as_mut().map(|x| x.zonk(&cxt, false));
+    let ty = ty.zonk(&cxt, true);
 
     Some(DefElabResult {
         def: Arc::new(DefElab {
@@ -258,6 +258,11 @@ impl Val {
                 },
                 |acc, x| Term::App(Box::new(acc), Box::new(x.quote(env))),
             ),
+            // Fast path: if the environment is empty, we don't need to subst the term
+            // This is mostly useful for inlining metas in terms
+            Val::Fun(c, i, s, aty, body, inner_env) if inner_env.is_empty() => {
+                Term::Fun(*c, *i, *s, Box::new(aty.quote(env)), body.clone())
+            }
             Val::Fun(c, i, s, aty, body, inner_env) => Term::Fun(
                 *c,
                 *i,
@@ -272,33 +277,35 @@ impl Val {
 }
 
 impl Term {
-    fn zonk(&mut self, cxt: &Cxt) {
-        self.zonk_(cxt, &cxt.senv());
+    fn zonk(&mut self, cxt: &Cxt, beta_reduce: bool) {
+        self.zonk_(cxt, &cxt.senv(), beta_reduce);
     }
-    fn zonk_(&mut self, cxt: &Cxt, senv: &SEnv) -> bool {
+    fn zonk_(&mut self, cxt: &Cxt, senv: &SEnv, beta_reduce: bool) -> bool {
         match self {
-            Term::Meta(meta) => match cxt.meta_val(*meta) {
+            Term::Meta(meta) => match cxt.zonked_meta_val(*meta, beta_reduce) {
                 // Meta solutions are evaluated with an empty environment, so we can quote them with an empty environment
                 Some(t) => {
                     *self = t.quote(&default());
                     // inline further metas in the solution
-                    self.zonk_(cxt, senv);
+                    // self.zonk_(cxt, senv);
+                    // (should be unnecessary with pre-zonked meta solutions)
+                    // (however, that only holds as long as we don't zonk until the end of the definition)
                     return true;
                 }
                 None => (),
             },
             Term::App(term, term1) => {
                 // β-reduce meta spines by eval-quoting
-                let solved_meta = term.zonk_(cxt, senv);
-                term1.zonk_(cxt, senv);
-                if solved_meta {
+                let solved_meta = term.zonk_(cxt, senv, beta_reduce);
+                term1.zonk_(cxt, senv, beta_reduce);
+                if beta_reduce && solved_meta {
                     *self = self.eval(&senv.env).quote(&senv.qenv);
                     return true;
                 }
             }
             Term::Fun(_, _, n, aty, body) => {
-                aty.zonk_(cxt, senv);
-                Arc::make_mut(body).zonk_(cxt, &senv.qenv.bind(*n, &senv.env).1);
+                aty.zonk_(cxt, senv, beta_reduce);
+                Arc::make_mut(body).zonk_(cxt, &senv.qenv.bind(*n, &senv.env).1, beta_reduce);
             }
             Term::Var { .. } | Term::Def { .. } | Term::Error | Term::Type => (),
         }
@@ -307,10 +314,10 @@ impl Term {
 }
 
 impl Val {
-    fn zonk(&self, cxt: &Cxt) -> Val {
+    fn zonk(&self, cxt: &Cxt, beta_reduce: bool) -> Val {
         // We could do this without quote-eval'ing, but it'd need a bunch of Arc::make_mut()s
         self.quote(&cxt.qenv())
-            .tap_mut(|x| x.zonk(cxt))
+            .tap_mut(|x| x.zonk(cxt, beta_reduce))
             .eval(&cxt.env())
     }
 }
@@ -341,6 +348,7 @@ struct Cxt {
     // levels, starting at 0
     bindings: im::HashMap<Name, (u32, Val)>,
     metas: Ref<HashMap<Meta, MetaEntry>>,
+    zonked_metas: Ref<HashMap<(Meta, bool), Val>>,
     env: SEnv,
     errors: Ref<Vec<Error>>,
 }
@@ -353,6 +361,7 @@ impl Cxt {
             env: default(),
             errors: default(),
             metas: default(),
+            zonked_metas: default(),
         }
     }
     fn err(&self, err: impl Into<Doc>, span: Span) {
@@ -407,6 +416,17 @@ impl Cxt {
                 MetaEntry::Solved(arc) => Some(arc.clone()),
             })
         })
+    }
+    fn zonked_meta_val(&self, m: Meta, beta_reduce: bool) -> Option<Val> {
+        self.zonked_metas
+            .with(|x| x.get(&(m, beta_reduce)).cloned())
+            .or_else(|| {
+                let v = self.meta_val(m)?;
+                let v = v.zonk(self, beta_reduce);
+                self.zonked_metas
+                    .with_mut(|x| x.insert((m, beta_reduce), v.clone()));
+                Some(v)
+            })
     }
     fn solve_meta(&self, meta: Meta, spine: &Env, solution: Val, span: Span) {
         let qenv = QEnv {
@@ -602,7 +622,7 @@ impl SPre {
                 }
             },
             Pre::App(fs, x, i) => {
-                let (f, mut fty) = fs.infer(cxt, *i == Expl);
+                let (mut f, mut fty) = fs.infer(cxt, *i == Expl);
                 fty.whnf(cxt);
                 let aty = match &fty {
                     Val::Error => Val::Error,
@@ -616,12 +636,14 @@ impl SPre {
                             fs.span(),
                         );
                         // prevent .app() from panicking
+                        f = Term::Error;
                         fty = Val::Error;
                         Val::Error
                     }
                     _ => {
                         cxt.err("not a function type: " + fty.pretty_at(cxt), fs.span());
                         // prevent .app() from panicking
+                        f = Term::Error;
                         fty = Val::Error;
                         Val::Error
                     }
