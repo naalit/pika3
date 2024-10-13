@@ -225,22 +225,22 @@ struct SEnv {
 }
 
 impl Term {
-    fn subst(&self, env: &SEnv) -> Term {
-        match self {
-            Term::Var(_, idx) => idx.at(&env.env).quote(&env.qenv),
+    fn subst(&self, env: &SEnv) -> Result<Term, Sym> {
+        Ok(match self {
+            Term::Var(_, idx) => idx.at(&env.env).quote_(&env.qenv)?,
             Term::Def(d) => Term::Def(*d),
             Term::Meta(m) => Term::Meta(*m),
-            Term::App(f, x) => Term::App(Box::new(f.subst(env)), Box::new(x.subst(env))),
+            Term::App(f, x) => Term::App(Box::new(f.subst(env)?), Box::new(x.subst(env)?)),
             Term::Fun(c, i, s, aty, body) => Term::Fun(
                 *c,
                 *i,
                 *s,
-                Box::new(aty.subst(env)),
-                Arc::new(body.subst(&env.qenv.bind(*s, &env.env).1)),
+                Box::new(aty.subst(env)?),
+                Arc::new(body.subst(&env.qenv.bind(*s, &env.env).1)?),
             ),
             Term::Error => Term::Error,
             Term::Type => Term::Type,
-        }
+        })
     }
 }
 
@@ -251,24 +251,24 @@ impl Val {
     fn quote_(&self, env: &QEnv) -> Result<Term, Sym> {
         Ok(match self {
             Val::Neutral(s, spine) => spine.iter().fold(
-                match s {
+                Ok(match s {
                     VHead::Sym(s) => env.get(*s).ok_or(*s)?,
                     VHead::Def(d) => Term::Def(*d),
                     VHead::Meta(m) => Term::Meta(*m),
-                },
-                |acc, x| Term::App(Box::new(acc), Box::new(x.quote(env))),
-            ),
+                }),
+                |acc, x| Ok(Term::App(Box::new(acc?), Box::new(x.quote_(env)?))),
+            )?,
             // Fast path: if the environment is empty, we don't need to subst the term
             // This is mostly useful for inlining metas in terms
             Val::Fun(c, i, s, aty, body, inner_env) if inner_env.is_empty() => {
-                Term::Fun(*c, *i, *s, Box::new(aty.quote(env)), body.clone())
+                Term::Fun(*c, *i, *s, Box::new(aty.quote_(env)?), body.clone())
             }
             Val::Fun(c, i, s, aty, body, inner_env) => Term::Fun(
                 *c,
                 *i,
                 *s,
-                Box::new(aty.quote(env)),
-                Arc::new(body.subst(&env.bind(*s, inner_env).1)),
+                Box::new(aty.quote_(env)?),
+                Arc::new(body.subst(&env.bind(*s, inner_env).1)?),
             ),
             Val::Error => Term::Error,
             Val::Type => Term::Type,
@@ -324,7 +324,7 @@ impl Val {
 
 // elaboration
 
-use crate::parser::{Pre, PrePat, SPre};
+use crate::parser::{Pre, PrePat, PreStmt, SPre};
 
 enum MetaEntry {
     // The first field is the type; we'll need that eventually for typeclass resolution, but it doesn't matter right now
@@ -605,7 +605,70 @@ fn insert_metas(term: Term, mut ty: Val, cxt: &Cxt, span: Span) -> (Term, Val) {
     }
 }
 
+fn elab_block(block: &[PreStmt], last_: &SPre, ty: Option<Val>, cxt1: &Cxt) -> (Term, Val) {
+    let mut cxt = cxt1.clone();
+    let mut v = Vec::new();
+    for x in block {
+        let (n, t, x) = match x {
+            PreStmt::Expr(x) => {
+                let (x, xty) = x.infer(&cxt, true);
+                (cxt.db.name("_"), xty, x)
+            }
+            PreStmt::Let(pat, body) => {
+                let (n, aty) = simple_pat(pat, &cxt);
+                let (body, aty) =
+                    body.elab(aty.map(|t| t.check(Val::Type, &cxt).eval(&cxt.env())), &cxt);
+                (*n, aty, body)
+            }
+        };
+        let t2 = t.quote(&cxt.qenv());
+        cxt = cxt.bind(n, t).1;
+        v.push((n, t2, x));
+    }
+    let explicit_ty = ty.is_some();
+    let (last, mut lty) = last_.elab(ty, &cxt);
+    let term = v.into_iter().rfold(last, |acc, (n, t, x)| {
+        Term::App(
+            Box::new(Term::Fun(Lam, Expl, n, Box::new(t), Arc::new(acc))),
+            Box::new(x),
+        )
+    });
+    // We have to make sure the inferred type of the block return value doesn't depend on locals within the block
+    // That means we need to inline metas first so we don't get spurious scope errors
+    // Unfortunately, this means we basically can't quickly elaborate smalltt's pairTest - there's no way around inlining all the metas in the final type
+    // I'd love to find a way around this at some point but currently it seems pretty inevitable
+    // For now, I left `pairTest` in but changed it to return `x1` instead of `x30`. That way we don't have to inline all the metas and we stay fast
+    if !explicit_ty {
+        lty = lty
+            .zonk(&cxt, true)
+            .quote_(&cxt1.qenv())
+            .unwrap_or_else(|s| {
+                cxt.err(
+                    Doc::start("type of block return value depends on local `")
+                        + s.0.pretty(&cxt.db)
+                        + "`: "
+                        + lty.pretty(&cxt.db),
+                    last_.span(),
+                );
+                Term::Error
+            })
+            .eval(&cxt1.env());
+    }
+    (term, lty)
+}
+
 impl SPre {
+    // Helper to delegate to infer or check
+    fn elab(&self, ty: Option<Val>, cxt: &Cxt) -> (Term, Val) {
+        match ty {
+            Some(ty) => {
+                let s = self.check(ty.clone(), cxt);
+                (s, ty)
+            }
+            None => self.infer(cxt, true),
+        }
+    }
+
     fn infer(&self, cxt: &Cxt, should_insert_metas: bool) -> (Term, Val) {
         let (s, sty) = match &***self {
             Pre::Var(name) if cxt.db.name("_") == *name => {
@@ -663,11 +726,7 @@ impl SPre {
             }
             // If no type is given, assume monomorphic lambdas
             Pre::Lam(i, pat, body) => {
-                let (n, aty) = match &**pat {
-                    PrePat::Name(s) => (*s, None),
-                    PrePat::Binder(s, s1) => (*s, Some(s1.clone())),
-                    PrePat::Error => (S(cxt.db.name("_"), pat.span()), None),
-                };
+                let (n, aty) = simple_pat(pat, cxt);
                 let aty = match aty {
                     Some(aty) => aty.check(Val::Type, cxt).eval(&cxt.env()),
                     None => cxt.new_meta(Val::Type, pat.span()),
@@ -693,6 +752,7 @@ impl SPre {
                 cxt.err("binder not allowed in this context", self.span());
                 (Term::Error, Val::Error)
             }
+            Pre::Do(block, last) => elab_block(block, last, None, cxt),
             Pre::Type => (Term::Type, Val::Type),
             Pre::Error => (Term::Error, Val::Error),
         };
@@ -707,11 +767,7 @@ impl SPre {
         ty.whnf(cxt);
         match (&***self, &ty) {
             (Pre::Lam(i, pat, body), Val::Fun(Pi, i2, _, aty2, _, _)) if i == i2 => {
-                let (n, aty) = match &**pat {
-                    PrePat::Name(s) => (*s, None),
-                    PrePat::Binder(s, s1) => (*s, Some(s1.clone())),
-                    PrePat::Error => (S(cxt.db.name("_"), pat.span()), None),
-                };
+                let (n, aty) = simple_pat(pat, cxt);
                 if let Some(aty) = aty {
                     let aty = aty.check(Val::Type, cxt).eval(cxt.env());
                     if !aty.unify(&aty2, cxt.scxt(), cxt) {
@@ -740,6 +796,7 @@ impl SPre {
                 let body = self.check(rty, &cxt);
                 Term::Fun(Lam, Impl, n, Box::new(aty2), Arc::new(body))
             }
+            (Pre::Do(block, last), _) => elab_block(block, last, Some(ty), cxt).0,
 
             (_, _) => {
                 let (s, sty) = self.infer(cxt, !matches!(ty, Val::Fun(Pi, Impl, _, _, _, _)));
@@ -755,6 +812,14 @@ impl SPre {
                 s
             }
         }
+    }
+}
+
+fn simple_pat(pat: &S<PrePat>, cxt: &Cxt) -> (S<Interned<Arc<str>>>, Option<S<Box<Pre>>>) {
+    match &**pat {
+        PrePat::Name(s) => (*s, None),
+        PrePat::Binder(s, s1) => (*s, Some(s1.clone())),
+        PrePat::Error => (S(cxt.db.name("_"), pat.span()), None),
     }
 }
 

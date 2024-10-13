@@ -17,6 +17,11 @@ pub enum PrePat {
     Error,
 }
 #[derive(Debug, Clone)]
+pub enum PreStmt {
+    Expr(SPre),
+    Let(S<PrePat>, SPre),
+}
+#[derive(Debug, Clone)]
 pub enum Pre {
     Type,
     Var(Name),
@@ -24,6 +29,7 @@ pub enum Pre {
     App(SPre, SPre, Icit),
     Pi(Icit, Name, SPre, SPre),
     Lam(Icit, S<PrePat>, SPre),
+    Do(Vec<PreStmt>, SPre),
     Error,
 }
 pub type SPre = S<Box<Pre>>;
@@ -96,6 +102,11 @@ impl Parser {
             self.this_tok_err = false;
         }
         t
+    }
+    fn skip_trivia_(&mut self) {
+        while self.peek().is_trivia() {
+            self.next_raw();
+        }
     }
     fn skip_trivia(&mut self, skip_newline: bool) {
         loop {
@@ -261,6 +272,47 @@ impl Parser {
                     s.expect(Tok::PClose);
                     *t.0
                 }
+                Tok::DoKw => {
+                    s.next_raw();
+                    s.skip_trivia_();
+                    let in_indent = s.in_indent;
+                    s.in_indent = false;
+                    s.expect(Tok::Indent);
+                    let mut v = Vec::new();
+                    while !s.maybe(Tok::Dedent) {
+                        if s.maybe(Tok::LetKw) {
+                            let pat = s.spanned(|s| {
+                                let pat = s.binder();
+                                s.reparse_pattern(&pat)
+                            });
+                            s.expect(Tok::Equals);
+                            let body = s.term();
+                            v.push(PreStmt::Let(pat, body));
+                        } else {
+                            let body = s.term();
+                            v.push(PreStmt::Expr(body));
+                        }
+                        if !s.maybe(Tok::Newline) {
+                            s.expect(Tok::Dedent);
+                            break;
+                        }
+                    }
+                    s.in_indent = in_indent;
+                    let last = v
+                        .pop()
+                        .and_then(|x| match x {
+                            PreStmt::Expr(x) => Some(x),
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| {
+                            s.error(
+                                "expected an expression for the return value of this block",
+                                s.tok_span(),
+                            );
+                            s.spanned(|_| Box::new(Pre::Error))
+                        });
+                    Pre::Do(v, last)
+                }
                 _ => {
                     s.error("expected expression", s.tok_span());
                     Pre::Error
@@ -372,6 +424,7 @@ impl Tok {
                 | Tok::SOpen
                 | Tok::DoKw
                 | Tok::IfKw
+                | Tok::TypeTypeKw
                 | Tok::ImmKw
                 | Tok::MutKw
                 | Tok::OwnKw
