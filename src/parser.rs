@@ -28,6 +28,7 @@ pub enum Pre {
     Binder(SPre, SPre),
     App(SPre, SPre, Icit),
     Pi(Icit, Name, SPre, SPre),
+    Sigma(Icit, Option<Name>, SPre, SPre),
     Lam(Icit, S<PrePat>, SPre),
     Do(Vec<PreStmt>, SPre),
     Error,
@@ -212,11 +213,11 @@ impl Parser {
 
     // reparsing
 
-    fn reparse_pi_param(&mut self, param: SPre) -> (Name, SPre) {
+    fn reparse_pi_param(&mut self, param: SPre) -> (Option<Name>, SPre) {
         match &**param {
             Pre::Binder(lhs, rhs) => {
                 match &***lhs {
-                    Pre::Var(name) => (*name, rhs.clone()),
+                    Pre::Var(name) => (Some(*name), rhs.clone()),
                     _ => {
                         // TODO uhh wait we totally allow `(a: T, b: U) -> R`... maybe these should just be patterns too
                         // this is a weird situation. `(T, U)` is treated as a type, so it's not just a pattern here,
@@ -224,11 +225,11 @@ impl Parser {
                         // this may need special-case handling...
                         // TODO figure out if there's a way to avoid this
                         self.error("parameter binding in function type must be a simple name, not a pattern", lhs.span());
-                        (self.db.name("_"), rhs.clone())
+                        (None, rhs.clone())
                     }
                 }
             }
-            _ => (self.db.name("_"), param),
+            _ => (None, param),
         }
     }
     fn reparse_pattern(&mut self, param: &SPre) -> PrePat {
@@ -347,7 +348,7 @@ impl Parser {
         let start = self.pos();
         let lhs = self.app();
         if self.maybe(Tok::Colon) {
-            let rhs = self.fun();
+            let rhs = self.fun(false);
             S(
                 Box::new(Pre::Binder(lhs, rhs)),
                 Span(start, self.pos_right()),
@@ -356,28 +357,37 @@ impl Parser {
             lhs
         }
     }
-    fn fun(&mut self) -> SPre {
+    fn fun(&mut self, pair: bool) -> SPre {
         let start = self.pos();
         let implicit = self.maybe(Tok::COpen);
-        let lhs = self.binder();
+        let lhs = if pair { self.fun(false) } else { self.binder() };
         if implicit {
             self.expect(Tok::CClose);
         }
         let icit = if implicit { Impl } else { Expl };
         if self.maybe(Tok::Arrow) {
             // pi
-            let rhs = self.fun();
+            let rhs = self.fun(false);
             let (name, lhs) = self.reparse_pi_param(lhs);
+            let name = name.unwrap_or(self.db.name("_"));
             S(
                 Box::new(Pre::Pi(icit, name, lhs, rhs)),
                 Span(start, self.pos_right()),
             )
         } else if self.maybe(Tok::WideArrow) {
             // lambda
-            let rhs = self.fun();
+            let rhs = self.fun(true); // TODO do we allow `x => x, x`?
             let pat = S(self.reparse_pattern(&lhs), lhs.span());
             S(
                 Box::new(Pre::Lam(icit, pat, rhs)),
+                Span(start, self.pos_right()),
+            )
+        } else if pair && self.maybe(Tok::Comma) {
+            // sigma
+            let rhs = self.fun(true);
+            let (name, lhs) = self.reparse_pi_param(lhs);
+            S(
+                Box::new(Pre::Sigma(icit, name, lhs, rhs)),
                 Span(start, self.pos_right()),
             )
         } else {
@@ -385,7 +395,7 @@ impl Parser {
         }
     }
     fn term(&mut self) -> SPre {
-        self.fun()
+        self.fun(true)
     }
     fn def(&mut self) -> PreDef {
         self.expect(Tok::DefKw);

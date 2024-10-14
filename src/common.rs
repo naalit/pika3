@@ -19,6 +19,7 @@ pub use crate::{
 pub enum Class {
     Lam,
     Pi,
+    Sigma,
 }
 pub use Class::*;
 

@@ -110,6 +110,7 @@ pub enum Term {
     App(Box<Term>, Box<Term>),
     /// Argument type annotation
     Fun(Class, Icit, Name, Box<Term>, Arc<Term>),
+    Pair(Box<Term>, Box<Term>),
     Error,
     Type,
 }
@@ -131,6 +132,7 @@ pub enum VHead {
 pub enum Val {
     Neutral(VHead, SmallVec<[Arc<Val>; 3]>),
     Fun(Class, Icit, Name, Arc<Val>, Arc<Term>, Arc<Env>),
+    Pair(Arc<Val>, Arc<Val>),
     Error,
     Type,
 }
@@ -165,6 +167,7 @@ impl Term {
                 body.clone(),
                 Arc::new(env.clone()),
             ),
+            Term::Pair(a, b) => Val::Pair(Arc::new(a.eval(env)), Arc::new(b.eval(env))),
             Term::Error => Val::Error,
             Term::Type => Val::Type,
         }
@@ -238,6 +241,7 @@ impl Term {
                 Box::new(aty.subst(env)?),
                 Arc::new(body.subst(&env.qenv.bind(*s, &env.env).1)?),
             ),
+            Term::Pair(a, b) => Term::Pair(Box::new(a.subst(env)?), Box::new(b.subst(env)?)),
             Term::Error => Term::Error,
             Term::Type => Term::Type,
         })
@@ -270,6 +274,7 @@ impl Val {
                 Box::new(aty.quote_(env)?),
                 Arc::new(body.subst(&env.bind(*s, inner_env).1)?),
             ),
+            Val::Pair(a, b) => Term::Pair(Box::new(a.quote_(env)?), Box::new(b.quote_(env)?)),
             Val::Error => Term::Error,
             Val::Type => Term::Type,
         })
@@ -306,6 +311,10 @@ impl Term {
             Term::Fun(_, _, n, aty, body) => {
                 aty.zonk_(cxt, senv, beta_reduce);
                 Arc::make_mut(body).zonk_(cxt, &senv.qenv.bind(*n, &senv.env).1, beta_reduce);
+            }
+            Term::Pair(a, b) => {
+                a.zonk_(cxt, senv, beta_reduce);
+                b.zonk_(cxt, senv, beta_reduce);
             }
             Term::Var { .. } | Term::Def { .. } | Term::Error | Term::Type => (),
         }
@@ -724,6 +733,15 @@ impl SPre {
                     Val::Type,
                 )
             }
+            Pre::Sigma(i, Some(n), aty, body) => {
+                let aty = aty.check(Val::Type, cxt);
+                let vaty = aty.eval(cxt.env());
+                let body = body.check(Val::Type, &cxt.bind(*n, vaty).1);
+                (
+                    Term::Fun(Sigma, *i, *n, Box::new(aty), Arc::new(body)),
+                    Val::Type,
+                )
+            }
             // If no type is given, assume monomorphic lambdas
             Pre::Lam(i, pat, body) => {
                 let (n, aty) = simple_pat(pat, cxt);
@@ -744,6 +762,23 @@ impl SPre {
                         *n,
                         Arc::new(aty),
                         Arc::new(rty),
+                        Arc::new(cxt.env().clone()),
+                    ),
+                )
+            }
+            // Similarly assume non-dependent pair
+            Pre::Sigma(i, None, a, b) => {
+                let (a, aty) = a.infer(cxt, true);
+                let (b, bty) = b.infer(cxt, true);
+                let bty = bty.quote(&cxt.qenv().bind(cxt.db.name("_"), cxt.env()).1.qenv);
+                (
+                    Term::Pair(Box::new(a), Box::new(b)),
+                    Val::Fun(
+                        Sigma,
+                        *i,
+                        cxt.db.name("_"),
+                        Arc::new(aty),
+                        Arc::new(bty),
                         Arc::new(cxt.env().clone()),
                     ),
                 )
@@ -786,6 +821,21 @@ impl SPre {
                 let body = body.check(rty, &cxt);
                 Term::Fun(Lam, *i, *n, Box::new(aty), Arc::new(body))
             }
+            // when checking pair against type, assume sigma
+            (Pre::Sigma(i, None, aty, body), Val::Type) => {
+                let n = cxt.db.name("_");
+                let aty = aty.check(Val::Type, cxt);
+                let vaty = aty.eval(cxt.env());
+                let body = body.check(Val::Type, &cxt.bind(n, vaty).1);
+                Term::Fun(Sigma, *i, n, Box::new(aty), Arc::new(body))
+            }
+            (Pre::Sigma(i, None, a, b), Val::Fun(Sigma, i2, _, aty, _, _)) if i == i2 => {
+                let a = a.check((**aty).clone(), cxt);
+                let va = a.eval(&cxt.env());
+                let rty = ty.app(va);
+                let b = b.check(rty, cxt);
+                Term::Pair(Box::new(a), Box::new(b))
+            }
             // insert lambda when checking (non-implicit lambda) against implicit function type
             (_, Val::Fun(Pi, Impl, n, aty, _, _)) => {
                 let aty2 = aty.quote(cxt.qenv());
@@ -795,6 +845,16 @@ impl SPre {
                 let rty = ty.app(Val::Neutral(VHead::Sym(sym), default()));
                 let body = self.check(rty, &cxt);
                 Term::Fun(Lam, Impl, n, Box::new(aty2), Arc::new(body))
+            }
+            // and similar for implicit sigma
+            (_, Val::Fun(Sigma, Impl, _, aty, _, _)) => {
+                let a = cxt
+                    .new_meta((**aty).clone(), self.span())
+                    .quote(&cxt.qenv());
+                let va = a.eval(&cxt.env());
+                let rty = ty.app(va);
+                let b = self.check(rty, &cxt);
+                Term::Pair(Box::new(a), Box::new(b))
             }
             (Pre::Do(block, last), _) => elab_block(block, last, Some(ty), cxt).0,
 
@@ -841,7 +901,7 @@ impl Pretty for Val {
 // pretty-printing
 
 impl Icit {
-    fn bind(self, x: Doc, parens: bool) -> Doc {
+    fn pretty_bind(self, x: Doc, parens: bool) -> Doc {
         match self {
             Impl => "{" + x + "}",
             Expl if parens => "(" + x + ")",
@@ -862,17 +922,27 @@ impl Pretty for Term {
                 (f.pretty(db).nest(Prec::App) + " " + x.pretty(db).nest(Prec::Atom)).prec(Prec::App)
             }
             Term::Fun(Lam, i, s, _, body) => {
-                (i.bind(s.pretty(db), false) + " => " + body.pretty(db)).prec(Prec::Term)
+                (i.pretty_bind(s.pretty(db), false) + " => " + body.pretty(db)).prec(Prec::Term)
             }
             Term::Fun(Pi, i, s, aty, body) if *s == db.name("_") => {
-                (i.bind(aty.pretty(db).nest(Prec::App), false) + " -> " + body.pretty(db))
+                (i.pretty_bind(aty.pretty(db).nest(Prec::App), false) + " -> " + body.pretty(db))
                     .prec(Prec::Pi)
             }
             Term::Fun(Pi, i, s, aty, body) => (i
-                .bind(s.pretty(db) + ": " + aty.pretty(db).nest(Prec::Pi), true)
+                .pretty_bind(s.pretty(db) + ": " + aty.pretty(db).nest(Prec::Pi), true)
                 + " -> "
                 + body.pretty(db))
             .prec(Prec::Pi),
+            Term::Fun(Sigma, i, s, aty, body) if *s == db.name("_") => {
+                (i.pretty_bind(aty.pretty(db).nest(Prec::Pi), false) + ", " + body.pretty(db))
+                    .prec(Prec::Pair)
+            }
+            Term::Fun(Sigma, i, s, aty, body) => (i
+                .pretty_bind(s.pretty(db) + ": " + aty.pretty(db).nest(Prec::Pi), false)
+                + ", "
+                + body.pretty(db))
+            .prec(Prec::Pair),
+            Term::Pair(a, b) => a.pretty(db).nest(Prec::Pi) + ", " + b.pretty(db).nest(Prec::Pair),
             Term::Error => Doc::keyword("error"),
             Term::Type => Doc::start("Type"),
         }
