@@ -9,23 +9,21 @@ use std::io::Read;
 
 use crate::common::*;
 
-// Next up: Metas!
-// We're currently at 2.5k LOC (with the longest file being the lexer, lol)
-// I'd like to get to feature parity with smalltt and see how big we get (smalltt is 5.6k LOC I think? for reference)
-// and how our performance compares
-
 fn main() {
+    let mod_s = "Demo";
     let (input, input_s) = {
-        let mut file = std::fs::File::open("Demo.pk").unwrap();
+        let mut file = std::fs::File::open(&format!("{mod_s}.pk")).unwrap();
         let mut input = String::new();
         file.read_to_string(&mut input).unwrap();
         (input.rope(), input)
     };
     let mut db = DB::default();
     let file = db.ifiles.intern(&FileLoc::File(
-        std::path::Path::new("Demo.pk").canonicalize().unwrap(),
+        std::path::Path::new(&format!("{mod_s}.pk"))
+            .canonicalize()
+            .unwrap(),
     ));
-    let mdef = db.init_crate(db.name("Demo"), file);
+    let mdef = db.init_crate(db.name(mod_s), file);
     db.set_file_source(file, input.clone(), Some(input_s.into()));
 
     let module = elab::elab_module(file, mdef, &db);

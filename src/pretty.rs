@@ -51,7 +51,7 @@ enum DocEntry {
 pub struct Doc {
     data: VecDeque<DocEntry>,
     indent: usize,
-    prec: Prec,
+    pub prec: Prec,
 }
 impl<T: std::fmt::Display + ?Sized> From<&T> for Doc {
     fn from(x: &T) -> Self {

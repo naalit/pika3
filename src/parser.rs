@@ -10,16 +10,19 @@ pub struct PreDef {
     pub ty: Option<SPre>,
     pub value: Option<SPre>,
 }
+pub type SPrePat = S<Box<PrePat>>;
+
 #[derive(Debug, Clone)]
 pub enum PrePat {
     Name(SName),
     Binder(SName, SPre),
+    Pair(Icit, SPrePat, SPrePat),
     Error,
 }
 #[derive(Debug, Clone)]
 pub enum PreStmt {
     Expr(SPre),
-    Let(S<PrePat>, SPre),
+    Let(SPrePat, SPre),
 }
 #[derive(Debug, Clone)]
 pub enum Pre {
@@ -28,8 +31,8 @@ pub enum Pre {
     Binder(SPre, SPre),
     App(SPre, SPre, Icit),
     Pi(Icit, Name, SPre, SPre),
-    Sigma(Icit, Option<Name>, SPre, SPre),
-    Lam(Icit, S<PrePat>, SPre),
+    Sigma(Icit, Option<SName>, SPre, Option<SName>, SPre),
+    Lam(Icit, SPrePat, SPre),
     Do(Vec<PreStmt>, SPre),
     Error,
 }
@@ -213,11 +216,11 @@ impl Parser {
 
     // reparsing
 
-    fn reparse_pi_param(&mut self, param: SPre) -> (Option<Name>, SPre) {
+    fn reparse_pi_param(&mut self, param: SPre) -> (Option<SName>, SPre) {
         match &**param {
             Pre::Binder(lhs, rhs) => {
                 match &***lhs {
-                    Pre::Var(name) => (Some(*name), rhs.clone()),
+                    Pre::Var(name) => (Some(S(*name, lhs.span())), rhs.clone()),
                     _ => {
                         // TODO uhh wait we totally allow `(a: T, b: U) -> R`... maybe these should just be patterns too
                         // this is a weird situation. `(T, U)` is treated as a type, so it's not just a pattern here,
@@ -243,6 +246,17 @@ impl Parser {
                 }
             },
             Pre::Var(name) => PrePat::Name(S(*name, param.span())),
+            Pre::Sigma(i, n1, a, n2, b) => {
+                let a = match n1 {
+                    Some(n) => S(Box::new(PrePat::Binder(*n, a.clone())), a.span()),
+                    None => S(Box::new(self.reparse_pattern(a)), a.span()),
+                };
+                let b = match n2 {
+                    Some(n) => S(Box::new(PrePat::Binder(*n, b.clone())), b.span()),
+                    None => S(Box::new(self.reparse_pattern(b)), b.span()),
+                };
+                PrePat::Pair(*i, a, b)
+            }
             _ => {
                 self.error("invalid pattern", param.span());
                 PrePat::Error
@@ -284,7 +298,7 @@ impl Parser {
                         if s.maybe(Tok::LetKw) {
                             let pat = s.spanned(|s| {
                                 let pat = s.binder();
-                                s.reparse_pattern(&pat)
+                                Box::new(s.reparse_pattern(&pat))
                             });
                             s.expect(Tok::Equals);
                             let body = s.term();
@@ -360,7 +374,13 @@ impl Parser {
     fn fun(&mut self, pair: bool) -> SPre {
         let start = self.pos();
         let implicit = self.maybe(Tok::COpen);
-        let lhs = if pair { self.fun(false) } else { self.binder() };
+        let lhs = if implicit {
+            self.term()
+        } else if pair {
+            self.fun(false)
+        } else {
+            self.binder()
+        };
         if implicit {
             self.expect(Tok::CClose);
         }
@@ -369,7 +389,7 @@ impl Parser {
             // pi
             let rhs = self.fun(false);
             let (name, lhs) = self.reparse_pi_param(lhs);
-            let name = name.unwrap_or(self.db.name("_"));
+            let name = name.map(|x| *x).unwrap_or(self.db.name("_"));
             S(
                 Box::new(Pre::Pi(icit, name, lhs, rhs)),
                 Span(start, self.pos_right()),
@@ -377,7 +397,7 @@ impl Parser {
         } else if self.maybe(Tok::WideArrow) {
             // lambda
             let rhs = self.fun(true); // TODO do we allow `x => x, x`?
-            let pat = S(self.reparse_pattern(&lhs), lhs.span());
+            let pat = S(Box::new(self.reparse_pattern(&lhs)), lhs.span());
             S(
                 Box::new(Pre::Lam(icit, pat, rhs)),
                 Span(start, self.pos_right()),
@@ -386,8 +406,9 @@ impl Parser {
             // sigma
             let rhs = self.fun(true);
             let (name, lhs) = self.reparse_pi_param(lhs);
+            let (name2, rhs) = self.reparse_pi_param(rhs);
             S(
-                Box::new(Pre::Sigma(icit, name, lhs, rhs)),
+                Box::new(Pre::Sigma(icit, name, lhs, name2, rhs)),
                 Span(start, self.pos_right()),
             )
         } else {
@@ -411,8 +432,13 @@ impl Parser {
         let mut v = Vec::new();
         let mut last = self.pos();
         while self.peek() != Tok::Eof {
+            let n_errs = self.errors.len();
             v.push(self.spanned(Self::def));
-            self.reset_to(Tok::Newline);
+            if self.errors.len() > n_errs {
+                self.reset_to(Tok::Newline);
+            } else if self.peek() != Tok::Eof {
+                self.expect(Tok::Newline);
+            }
             if last == self.pos() {
                 self.error("expected end of file", self.tok_span());
                 break;

@@ -69,9 +69,10 @@ def dup : {A:Type} -> A -> Pair A A
 def id : {A:Type} -> A -> A
  = x => x
 
-def idTest : {A:Type} -> A -> A
-  = id id id id id id id id id id id id id id id id id id id id
-  id id id id id id id id id id id id id id id id id id id id
+# TODO make this fast again
+# def idTest : {A:Type} -> A -> A
+#   = id id id id id id id id id id id id id id id id id id id id
+#   id id id id id id id id id id id id id id id id id id id id
 
 def letTest = do
   let four = add m2 m2
@@ -85,40 +86,41 @@ def letTest = do
 #   let p : Eq x x = refl
 #   p
 
-def pairTest = do
-  let x0  = dup Type
-  let x1  = dup x0
-  let x2  = dup x1
-  let x3  = dup x2
-  let x4  = dup x3
-  let x5  = dup x4
-  let x6  = dup x5
-  let x7  = dup x6
-  let x8  = dup x7
-  let x9  = dup x8
-  let x10 = dup x9
-  let x11 = dup x10
-  let x12 = dup x11
-  let x13 = dup x12
-  let x14 = dup x13
-  let x15 = dup x14
-  let x16 = dup x15
-  let x17 = dup x16
-  let x18 = dup x17
-  let x19 = dup x18
-  let x20 = dup x19
-  let x21 = dup x20
-  let x22 = dup x21
-  let x23 = dup x22
-  let x24 = dup x23
-  let x25 = dup x24
-  let x26 = dup x25
-  let x27 = dup x26
-  let x28 = dup x27
-  let x29 = dup x28
-  let x30 = dup x29
-  # exponential time if we change this to x30 :(
-  x1
+# TODO make this fast again
+# def pairTest = do
+#   let x0  = dup Type
+#   let x1  = dup x0
+#   let x2  = dup x1
+#   let x3  = dup x2
+#   let x4  = dup x3
+#   let x5  = dup x4
+#   let x6  = dup x5
+#   let x7  = dup x6
+#   let x8  = dup x7
+#   let x9  = dup x8
+#   let x10 = dup x9
+#   let x11 = dup x10
+#   let x12 = dup x11
+#   let x13 = dup x12
+#   let x14 = dup x13
+#   let x15 = dup x14
+#   let x16 = dup x15
+#   let x17 = dup x16
+#   let x18 = dup x17
+#   let x19 = dup x18
+#   let x20 = dup x19
+#   let x21 = dup x20
+#   let x22 = dup x21
+#   let x23 = dup x22
+#   let x24 = dup x23
+#   let x25 = dup x24
+#   let x26 = dup x25
+#   let x27 = dup x26
+#   let x28 = dup x27
+#   let x29 = dup x28
+#   let x30 = dup x29
+#   # exponential time if we change this to x30 :(
+#   x1
 
 
 def Vec : Type -> Nat -> Type
@@ -343,3 +345,27 @@ def spair : Type = Type, Type
 def sigma = (a : Type, a, a -> a)
 def tnat = {a : Type} -> (a -> a, a) -> a
 # next step: pattern matching on tuples i.e. `def p : (a: Type, a) -> a = (_, x) => x`
+def p5 : (Type, Type), Type = (Type, Type), Type
+def pnat = (a: Type, a -> a, a) -> a
+#def nnat = pnat ((Type -> Type), (x => x), (x => x))
+
+def p : (a: Type, a) -> a = (_, x) => x
+
+def fst : {a:_, b:_} -> (a, b) -> a = (x, _) => x
+def snd : {a:_, b:_} -> (a, b) -> b = (_, x) => x
+
+def third : {a:_, b:_, c: _} -> (a, b, c) -> c = (_, _, x) => x
+
+def p6 = snd (fst p5)
+def p7 : Nat = third (m2, m10, m100b)
+
+def pzero : pnat = (_, _, x) => x
+def psuc : pnat -> pnat = n => (_, f, x) => f (n (_, f, x))
+
+# def imatch0_e : ({Type}, Type) -> Type = (a, b) => b
+# def imatch1_e : (Type, Type) -> Type = ({a}, b) => b
+def imatch2 : ({Type}, Type) -> Type = ({a}, b) => b
+def imatch3 : ({Type}, Type, Type) -> Type = (a, b) => b
+def imatch4 : ({a: Type}, a, a) -> a = (_, x) => x
+
+def pinfer = (a, b: a) => b

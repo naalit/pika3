@@ -70,6 +70,9 @@ use crate::{
 pub struct Interned<T>(u32, PhantomData<T>);
 impl<T: Clone> Copy for Interned<T> {}
 impl<T> Interned<T> {
+    pub fn empty() -> Interned<T> {
+        Interned(0, PhantomData)
+    }
     pub fn num(self) -> u32 {
         self.0
     }

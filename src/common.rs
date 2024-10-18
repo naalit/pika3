@@ -19,7 +19,8 @@ pub use crate::{
 pub enum Class {
     Lam,
     Pi,
-    Sigma,
+    /// Sigmas, unlike other closures, can have a name assigned to the second value (the closure body)
+    Sigma(Name),
 }
 pub use Class::*;
 
@@ -237,30 +238,34 @@ fn byte_to_line(rope: &Rope, byte: usize) -> (usize, usize, Rope) {
 }
 
 /// Uses byte positions
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AbsSpan(pub File, pub std::ops::Range<u32>);
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct AbsSpan(pub File, pub Span);
 impl AbsSpan {
-    pub fn add(&self, other: Span) -> Self {
+    pub fn span(self) -> Span {
+        self.1
+    }
+
+    pub fn add(self, other: Span) -> Self {
         AbsSpan(
             self.0.clone(),
-            self.1.start + other.0..self.1.start + other.0,
+            Span(self.1 .0 + other.0, self.1 .0 + other.0),
         )
     }
 
     pub fn chars(self, db: &DB) -> CharSpan {
         let text = db.file_rope(self.0);
-        let start = byte_to_char(&text, self.1.start as usize) as u32;
-        let end = byte_to_char(&text, self.1.end as usize) as u32;
+        let start = byte_to_char(&text, self.1 .0 as usize) as u32;
+        let end = byte_to_char(&text, self.1 .1 as usize) as u32;
         CharSpan(self.0, start..end)
     }
 
-    pub fn lsp_range(&self, db: &DB) -> lsp_types::Range {
+    pub fn lsp_range(self, db: &DB) -> lsp_types::Range {
         let text = db.file_rope(self.0);
 
-        let (line0_idx, line0_byte, line0_text) = byte_to_line(&text, self.1.start as usize);
-        let (line1_idx, line1_byte, line1_text) = byte_to_line(&text, self.1.end as usize);
-        let start_char = byte_to_char(&line0_text, self.1.start as usize - line0_byte);
-        let end_char = byte_to_char(&line1_text, self.1.end as usize - line1_byte);
+        let (line0_idx, line0_byte, line0_text) = byte_to_line(&text, self.1 .0 as usize);
+        let (line1_idx, line1_byte, line1_text) = byte_to_line(&text, self.1 .1 as usize);
+        let start_char = byte_to_char(&line0_text, self.1 .0 as usize - line0_byte);
+        let end_char = byte_to_char(&line1_text, self.1 .1 as usize - line1_byte);
 
         lsp_types::Range {
             start: lsp_types::Position {
@@ -276,7 +281,7 @@ impl AbsSpan {
 }
 impl Span {
     pub fn abs(self, file: File) -> AbsSpan {
-        AbsSpan(file, self.0..self.1)
+        AbsSpan(file, Span(self.0, self.1))
     }
 }
 
@@ -363,13 +368,18 @@ impl Error {
         }
     }
 
+    pub fn with_label(mut self, m: impl Into<Doc>) -> Error {
+        self.primary.message = m.into();
+        self
+    }
+
     pub fn write_cli(self, file: File, cache: &mut FileCache) {
         let primary_span = self.primary.span.abs(file);
         let mut r = ariadne::Report::build(
             self.severity.ariadne(),
             primary_span.0,
             // TODO wait should this be post converting to CharSpan?
-            primary_span.1.start as usize,
+            primary_span.1 .0 as usize,
         )
         .with_message(self.message.to_string(true))
         // The primary label appears first since it's the most important
