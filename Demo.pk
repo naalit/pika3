@@ -361,11 +361,31 @@ def p7 : Nat = third (m2, m10, m100b)
 
 def pzero : pnat = (_, _, x) => x
 def psuc : pnat -> pnat = n => (_, f, x) => f (n (_, f, x))
+def padd : (pnat, pnat) -> pnat = (m, n) => (_, f, x) => m (_, f, n (_, f, x))
+def pmul : (pnat, pnat) -> pnat = (m, n) => (_, f, x) => m (_, (x => n (_, f, x)), x)
+def pm1 = psuc pzero
+def pm2 = padd (pm1, pm1)
+def pm5 = padd (pm1, pmul (pm2, pm2))
+def pm10 = pmul (pm2, pm5)
+def pm100 = pmul (pm10, pm10)
+def pm100b = pmul (pm2, pmul (pm2, pmul (pm5, pm5)))
+def cpm100 : Eq pm100 pm100b = refl
 
 # def imatch0_e : ({Type}, Type) -> Type = (a, b) => b
 # def imatch1_e : (Type, Type) -> Type = ({a}, b) => b
 def imatch2 : ({Type}, Type) -> Type = ({a}, b) => b
 def imatch3 : ({Type}, Type, Type) -> Type = (a, b) => b
 def imatch4 : ({a: Type}, a, a) -> a = (_, x) => x
+def imatch5 : ({a: Type}, a) -> a = x => x
+def imatch6 : (Type, {a: Type}, a) -> a = (_, x) => x
+def icoerce : {a: Type} -> a -> ({a: Type}, a) = x => x
+def it2 = do
+  let {a}, _ = icoerce psuc
+  a
+def it3 : ({a: Type}, a) = do
+  let {_}, b = icoerce psuc
+  b
+# def pm1b : it2 = pm1
+
 
 def pinfer = (a, b: a) => b

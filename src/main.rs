@@ -29,10 +29,13 @@ fn main() {
     let module = elab::elab_module(file, mdef, &db);
     let mut cache = FileCache::new(db.clone());
     for i in &module.module.defs {
-        (Doc::keyword("val ") + i.name.pretty(&db) + " : " + i.ty.pretty(&db))
-            // + " = "
-            // + i.body.as_ref().map_or("".into(), |x| x.pretty(&db)))
-            .emit_stderr();
+        (Doc::keyword("val ")
+            + i.name.pretty(&db)
+            + " : "
+            + i.ty.pretty(&db)
+            + " = "
+            + i.body.as_ref().map_or("".into(), |x| x.pretty(&db)))
+        .emit_stderr();
     }
     for i in module.errors {
         i.write_cli(file, &mut cache);

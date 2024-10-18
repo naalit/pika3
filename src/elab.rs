@@ -458,7 +458,11 @@ impl VElim {
 
             (x, Val::Neutral(s, vec)) => Val::Neutral(s, vec.tap_mut(|v| v.push(x))),
             (_, Val::Error) => Val::Error,
-            (s, v) => panic!("illegal elimination {:?}\non {:?}", s, v),
+            (s, v) => {
+                // TODO how do we get the error out of here?
+                eprintln!("illegal elimination {:?}\non {:?}", s, v);
+                Val::Error
+            }
         }
     }
     fn quote_(&self, env: &QEnv) -> Result<TElim, Sym> {
@@ -628,11 +632,14 @@ fn split_ty(
             Some((
                 _,
                 _,
-                CPat {
-                    label: PCons::Pair(_),
-                    vars,
-                    span,
-                },
+                IPat::CPat(
+                    _,
+                    CPat {
+                        label: PCons::Pair(_),
+                        vars,
+                        span,
+                    },
+                ),
             )) => {
                 // solve metas with more metas
                 let n = vars[0].clone().ensure_named(&cxt.db).name().unwrap();
@@ -657,7 +664,7 @@ fn split_ty(
                     Arc::new(tb),
                     Arc::new(cxt.env().clone()),
                 );
-                if cxt.solve_meta(*m, spine, t, *span) {
+                if cxt.solve_meta(*m, spine, t, Some(*span)) {
                     split_ty(var, &ty, rows, names, cxt)
                 } else {
                     None
@@ -716,7 +723,7 @@ impl SPrePat {
 
 #[derive(Clone)]
 struct PRow {
-    cols: Vec<(Sym, Arc<Val>, CPat)>,
+    cols: Vec<(Sym, Arc<Val>, IPat)>,
     assignments: Vec<(Name, Sym, Arc<Val>)>,
     body: u32,
 }
@@ -724,51 +731,75 @@ impl PRow {
     fn remove_column(
         self: &PRow,
         var: Sym,
-        label: PCons,
+        label: Option<PCons>,
         vars: &[(Sym, Arc<Val>)],
         cxt: &Cxt,
     ) -> Option<Self> {
-        if let Some((i, (_, _, pat))) = self
+        if let Some((i, (_, _, _))) = self
             .cols
             .iter()
             .enumerate()
             .find(|(_, (s, _, _))| *s == var)
         {
-            if pat.label == label {
-                // remove the column and apply its patterns elsewhere
-                let mut s = self.clone();
-                let (_, _, pat) = s.cols.remove(i);
-                let mut j = i;
-                assert_eq!(pat.vars.len(), vars.len());
-                for (p, (v, t)) in pat.vars.into_iter().zip(vars) {
-                    match p {
-                        IPat::Var(n, None) => s.assignments.push((n, *v, t.clone())),
-                        IPat::Var(n, Some(paty)) => {
-                            let aty = paty.check(Val::Type, cxt).eval(cxt.env());
-                            if !aty.unify(t, cxt.scxt(), cxt) {
-                                cxt.err(
-                                    Doc::start("mismatched types: pattern has type ")
-                                        + aty.pretty(&cxt.db)
-                                        + " but needs to match value of type "
-                                        + t.pretty(&cxt.db),
-                                    paty.span(),
-                                );
-                            }
-                            s.assignments.push((n, *v, t.clone()))
-                        }
-                        IPat::CPat(n, p) => {
-                            if let Some(n) = n {
-                                s.assignments.push((n, *v, t.clone()));
-                            }
+            // remove the column and apply its patterns elsewhere
+            let mut s = self.clone();
+            let (_, t, pat) = s.cols.remove(i);
+            match pat {
+                IPat::Var(n, None) => {
+                    eprintln!(
+                        "assigning {} ({}) : {}",
+                        n.pretty(&cxt.db),
+                        var.0.pretty(&cxt.db),
+                        t.pretty(&cxt.db)
+                    );
+                    s.assignments.push((n, var, t.clone()));
+
+                    Some(s)
+                }
+                IPat::Var(n, Some(paty)) => {
+                    eprintln!(
+                        "assigning {} ({}) : {}",
+                        n.pretty(&cxt.db),
+                        var.0.pretty(&cxt.db),
+                        t.pretty(&cxt.db)
+                    );
+                    let aty = paty.check(Val::Type, cxt).eval(cxt.env());
+                    if !aty.unify(&t, cxt.scxt(), cxt) {
+                        cxt.err(
+                            Doc::start("mismatched types: pattern has type ")
+                                + aty.pretty(&cxt.db)
+                                + " but needs to match value of type "
+                                + t.pretty(&cxt.db),
+                            paty.span(),
+                        );
+                    }
+                    s.assignments.push((n, var, t.clone()));
+
+                    Some(s)
+                }
+                IPat::CPat(n, pat) => {
+                    if let Some(n) = n {
+                        eprintln!(
+                            "assigning {} ({}) : {}",
+                            n.pretty(&cxt.db),
+                            var.0.pretty(&cxt.db),
+                            t.pretty(&cxt.db)
+                        );
+                        s.assignments.push((n, var, t.clone()));
+                    }
+                    if label == Some(pat.label) {
+                        let mut j = i;
+                        assert_eq!(pat.vars.len(), vars.len());
+                        for (p, (v, t)) in pat.vars.into_iter().zip(vars) {
                             // these need to be in the right order for GADT/sigma reasons
                             s.cols.insert(j, (*v, t.clone(), p));
                             j += 1;
                         }
+                        Some(s)
+                    } else {
+                        None
                     }
                 }
-                Some(s)
-            } else {
-                None
             }
         } else {
             // this pattern doesn't care about this variable
@@ -829,15 +860,17 @@ impl PTree {
 struct PBody {
     reached: bool,
     solved_locals: Vec<(Sym, Arc<Val>)>,
-    vars: Vec<(Sym, Arc<Val>)>,
+    vars: Vec<(Name, Sym, Arc<Val>)>,
 }
 struct PCxt {
     bodies: Vec<PBody>,
     span: Span,
+    var: Sym,
     has_error: bool,
 }
 fn compile_rows(rows: &[PRow], pcxt: &mut PCxt, cxt: &Cxt) -> PTree {
     if rows.is_empty() {
+        eprintln!("non-exhaustive");
         if !pcxt.has_error {
             pcxt.has_error = true;
             // TODO reconstruct missing cases
@@ -845,6 +878,7 @@ fn compile_rows(rows: &[PRow], pcxt: &mut PCxt, cxt: &Cxt) -> PTree {
         }
         PTree::Error
     } else if rows.first().unwrap().cols.is_empty() {
+        eprintln!("body");
         let row = rows.first().unwrap();
         if pcxt.bodies[row.body as usize].reached {
             // check for matching bindings
@@ -853,7 +887,7 @@ fn compile_rows(rows: &[PRow], pcxt: &mut PCxt, cxt: &Cxt) -> PTree {
                     .vars
                     .iter()
                     .zip(&row.assignments)
-                    .all(|((n1, t1), (n2, _, t2))| n1.0 == *n2 && t1.unify(t2, cxt.scxt(), cxt))
+                    .all(|((n1, _, t1), (n2, _, t2))| *n1 == *n2 && t1.unify(t2, cxt.scxt(), cxt))
             {
                 panic!("mismatched bindings for body {}", row.body)
             }
@@ -864,16 +898,23 @@ fn compile_rows(rows: &[PRow], pcxt: &mut PCxt, cxt: &Cxt) -> PTree {
                 vars: row
                     .assignments
                     .iter()
-                    .map(|(_, s, t)| {
-                        (*s, {
+                    .map(|(n, s, t)| {
+                        (*n, *s, {
                             // Needed to account for locals solved during pattern compilation
                             let mut t2 = (**t).clone();
                             t2.whnf(cxt);
+                            eprint!(
+                                "{} ({}): {}; ",
+                                n.pretty(&cxt.db),
+                                s.0.pretty(&cxt.db),
+                                t2.pretty(&cxt.db)
+                            );
                             Arc::new(t2)
                         })
                     })
                     .collect(),
             };
+            eprintln!();
         }
         PTree::Body(
             row.body,
@@ -881,27 +922,41 @@ fn compile_rows(rows: &[PRow], pcxt: &mut PCxt, cxt: &Cxt) -> PTree {
             cxt.clone(),
         )
     } else {
-        let (var, ty, cpat) = rows.first().unwrap().cols.first().unwrap();
+        let (var, ty, _) = rows.first().unwrap().cols.first().unwrap();
         let tvar = Val::Neutral(VHead::Sym(*var), default()).quote(&cxt.qenv());
         let mut cxt = cxt.clone();
         let nempty = cxt.db.name("_");
-        let names = cpat.vars.iter().map(|n| {
-            match n {
-                IPat::Var(n, _) => Some(*n),
-                IPat::CPat(n, _) => *n,
-            }
-            .filter(|n| *n != nempty)
-        });
+        let names = rows
+            .iter()
+            .flat_map(|r| &r.cols)
+            .filter(|(s, _, _)| s == var)
+            .filter_map(|(_, _, p)| match p {
+                IPat::CPat(_, cpat) => Some(cpat),
+                _ => None,
+            })
+            .next()
+            .iter()
+            .flat_map(|x| &x.vars)
+            .map(|n| {
+                match n {
+                    IPat::Var(n, _) => Some(*n),
+                    IPat::CPat(n, _) => *n,
+                }
+                .filter(|n| *n != nempty)
+            })
+            .collect::<Vec<_>>();
 
-        if let Some(ctors) = split_ty(*var, ty, rows, names, &mut cxt) {
+        if let Some(ctors) = split_ty(*var, ty, rows, names.into_iter(), &mut cxt) {
+            eprintln!("splitting succeeded: {}", ty.pretty(&cxt.db));
             if ctors.len() == 1
                 && ctors[0].label == PCons::Pair(Impl)
                 && !rows.iter().any(|row| {
-                    row.cols
-                        .iter()
-                        .any(|(s, _, p)| s == var && p.label == PCons::Pair(Impl))
+                    row.cols.iter().any(|(s, _, p)| {
+                        s == var && matches!(p, IPat::CPat(_, p) if p.label == PCons::Pair(Impl))
+                    })
                 })
             {
+                eprintln!("(implicit pair)");
                 // Auto-unwrap implicit pairs if we don't match on them explicitly
                 // We do need to add the implicit argument to the assignments for each row
                 let mut rows = rows.to_vec();
@@ -929,7 +984,9 @@ fn compile_rows(rows: &[PRow], pcxt: &mut PCxt, cxt: &Cxt) -> PTree {
 
             let mut v = Vec::new();
             for row in rows {
-                if let Some((_, _, cpat)) = row.cols.iter().find(|(s, _, _)| s == var) {
+                if let Some((_, _, IPat::CPat(_, cpat))) =
+                    row.cols.iter().find(|(s, _, _)| s == var)
+                {
                     if !ctors.iter().any(|x| x.label == cpat.label) {
                         cxt.err("invalid pattern for type " + ty.pretty(&cxt.db), cpat.span);
                         pcxt.has_error = true;
@@ -939,7 +996,9 @@ fn compile_rows(rows: &[PRow], pcxt: &mut PCxt, cxt: &Cxt) -> PTree {
             for ctor in ctors {
                 let mut vrows = Vec::new();
                 for row in rows {
-                    if let Some(row) = row.remove_column(*var, ctor.label, &ctor.var_tys, &cxt) {
+                    if let Some(row) =
+                        row.remove_column(*var, Some(ctor.label), &ctor.var_tys, &cxt)
+                    {
                         vrows.push(row);
                     }
                 }
@@ -948,14 +1007,22 @@ fn compile_rows(rows: &[PRow], pcxt: &mut PCxt, cxt: &Cxt) -> PTree {
             }
             PTree::Match(tvar, v, None)
         } else {
+            eprintln!("splitting failed: {}", ty.pretty(&cxt.db));
             for row in rows {
-                if let Some((_, _, cpat)) = row.cols.iter().find(|(s, _, _)| s == var) {
+                if let Some((_, _, IPat::CPat(_, cpat))) =
+                    row.cols.iter().find(|(s, _, _)| s == var)
+                {
                     cxt.err("invalid pattern for type " + ty.pretty(&cxt.db), cpat.span);
                     pcxt.has_error = true;
                 }
             }
-            assert!(pcxt.has_error);
-            PTree::Error
+            let mut vrows = Vec::new();
+            for row in rows {
+                if let Some(row) = row.remove_column(*var, None, &[], &cxt) {
+                    vrows.push(row);
+                }
+            }
+            compile_rows(&vrows, pcxt, &cxt)
         }
     }
 }
@@ -971,13 +1038,27 @@ struct PMatch {
 impl PMatch {
     fn bind(&self, body: u32, cxt: &Cxt) -> Cxt {
         let mut cxt = cxt.clone();
-        for (sym, ty) in &self.pcxt.bodies[body as usize].vars {
-            cxt.bind_raw(*sym, (**ty).clone());
+        let nvar = Term::Var(self.pcxt.var.0, Idx(0)).eval(cxt.env());
+        let nsym = match &nvar {
+            Val::Neutral(VHead::Sym(s), _) => *s,
+            v => {
+                eprintln!("internal warning: nvar is {}", v.pretty(&cxt.db));
+                self.pcxt.var
+            }
+        };
+        for (name, sym, ty) in &self.pcxt.bodies[body as usize].vars {
+            if *sym == self.pcxt.var {
+                cxt.bind_val(*name, nvar.clone(), (**ty).clone());
+                cxt.bind_(cxt.db.inaccessible(*name), (**ty).clone());
+            } else {
+                cxt.bind_raw(*name, *sym, (**ty).clone());
+            }
         }
         for (sym, val) in &self.pcxt.bodies[body as usize].solved_locals {
+            let sym = if *sym == self.pcxt.var { nsym } else { *sym };
             // Make sure the solutions of any solved locals are actually in scope
-            if cxt.can_solve(*sym) && val.quote_(cxt.qenv()).is_ok() {
-                cxt.solve_local(*sym, val.clone());
+            if cxt.can_solve(sym) && val.quote_(cxt.qenv()).is_ok() {
+                cxt.solve_local(sym, val.clone());
             }
         }
         cxt
@@ -1009,17 +1090,17 @@ impl PMatch {
             let mut env = self.cxt.qenv().clone();
             let mut envs: Vec<_> = vars
                 .iter()
-                .map(|(n, _)| {
+                .map(|(_, s, _)| {
                     let env2 = env.clone();
-                    env.bind_raw(*n);
+                    env.bind_raw(*s);
                     env2
                 })
                 .collect();
-            let body = vars.iter().rfold(body.clone(), |acc, (v, ty)| {
+            let body = vars.iter().rfold(body.clone(), |acc, (n, _, ty)| {
                 Term::Fun(
                     Lam,
                     Expl,
-                    v.0,
+                    *n,
                     Box::new(ty.quote(&envs.pop().unwrap())),
                     Arc::new(acc),
                 )
@@ -1052,6 +1133,7 @@ impl PMatch {
                     vars: default(),
                 })
                 .collect(),
+            var,
             span: branches[0].span(),
             has_error: false,
         };
@@ -1070,59 +1152,43 @@ impl PMatch {
             .iter()
             .enumerate()
             .map(|(i, p)| {
-                let ipat = p.ipat(&cxt.db);
+                let mut ipat = p.ipat(&cxt.db);
                 // TODO this can be merged with the code in `remove_column()`
-                let (cols, assignments) = match ipat {
+                match &mut ipat {
                     IPat::Var(n, None) => {
                         if name.is_none() {
-                            name = Some(n);
+                            name = Some(*n);
                         }
                         if ty.is_none() {
                             ty = Some(ocxt.new_meta(Val::Type, Span(0, 0)));
                         }
-                        (vec![], vec![(n, var, Arc::new(ty.clone().unwrap()))])
                     }
                     IPat::Var(n, Some(paty)) => {
                         if name.is_none() {
-                            name = Some(n);
+                            name = Some(*n);
                         }
-                        let aty = paty.check(Val::Type, &cxt).eval(cxt.env());
-                        if let Some(t) = ty.as_ref() {
-                            if !aty.unify(t, cxt.scxt(), &cxt) {
-                                cxt.err(
-                                    Doc::start("mismatched types: pattern has type ")
-                                        + aty.pretty(&cxt.db)
-                                        + " but needs to match value of type "
-                                        + t.pretty(&cxt.db),
-                                    paty.span(),
-                                );
-                            }
-                        } else {
+                        if ty.is_none() {
+                            let aty = paty.check(Val::Type, &cxt).eval(cxt.env());
                             ty = Some(aty.clone());
                         }
-                        (vec![], vec![(n, var, Arc::new(aty))])
                     }
-                    IPat::CPat(n, p) => {
+                    IPat::CPat(n, _) => {
+                        if name.is_none() {
+                            name = *n;
+                        }
                         if ty.is_none() {
                             ty = Some(ocxt.new_meta(Val::Type, Span(0, 0)));
                         }
-                        (
-                            vec![(var, Arc::new(ty.clone().unwrap()), p)],
-                            if let Some(n) = n {
-                                vec![(n, var, Arc::new(ty.clone().unwrap()))]
-                            } else {
-                                vec![]
-                            },
-                        )
                     }
                 };
                 PRow {
-                    cols,
-                    assignments,
+                    cols: vec![(var, Arc::new(ty.clone().unwrap()), ipat)],
+                    assignments: default(),
                     body: i as u32,
                 }
             })
             .collect();
+        eprintln!("match type {}", ty.as_ref().unwrap().pretty(&cxt.db));
 
         let tree = compile_rows(&rows, &mut pcxt, &cxt);
 
@@ -1188,8 +1254,14 @@ impl Cxt {
             zonked_metas: default(),
         }
     }
-    fn err(&self, err: impl Into<Doc>, span: Span) {
-        self.errors.push(Error::simple(err, span));
+    fn err(&self, err: impl Into<Doc>, span: impl Into<Option<Span>>) {
+        match span.into() {
+            Some(span) => self.errors.push(Error::simple(err, span)),
+            None => self.errors.push(
+                Error::simple(err, self.errors.span.span())
+                    .with_label("while elaborating this definition"),
+            ),
+        }
     }
     fn size(&self) -> u32 {
         self.env.env.len() as u32
@@ -1253,10 +1325,10 @@ impl Cxt {
     fn bind_val(&mut self, n: Name, v: Val, ty: Val) {
         self.bindings.insert(n, (v, ty));
     }
-    fn bind_raw(&mut self, sym: Sym, ty: Val) -> Sym {
+    fn bind_raw(&mut self, name: Name, sym: Sym, ty: Val) -> Sym {
         self.env.qenv.bind_raw(sym);
         self.bindings
-            .insert(sym.0, (Val::Neutral(VHead::Sym(sym), default()), ty));
+            .insert(name, (Val::Neutral(VHead::Sym(sym), default()), ty));
         self.env
             .env
             .push(Arc::new(Val::Neutral(VHead::Sym(sym), default())));
@@ -1347,7 +1419,7 @@ impl Cxt {
                 Some(v)
             })
     }
-    fn solve_meta(&self, meta: Meta, spine: &Spine, solution: Val, span: Span) -> bool {
+    fn solve_meta(&self, meta: Meta, spine: &Spine, solution: Val, span: Option<Span>) -> bool {
         if spine.iter().any(|x| !matches!(x, VElim::App(_, _))) {
             self.err(
                 "cannot solve meta with non-app in spine: "
@@ -1574,7 +1646,7 @@ impl Val {
                         && spine.iter().all(|x| matches!(x, VElim::App(_, _)))
                         && cxt.meta_val(*m).is_none() =>
                 {
-                    cxt.solve_meta(*m, spine, b.clone(), Span(0, 0));
+                    cxt.solve_meta(*m, spine, b.clone(), None);
                     true
                 }
                 (Val::Neutral(_, _), _) | (_, Val::Neutral(_, _)) if mode == UnfoldState::Maybe => {
@@ -1640,10 +1712,15 @@ fn elab_block(block: &[PreStmt], last_: &SPre, ty: Option<Val>, cxt1: &Cxt) -> (
                 let (x, xty) = x.infer(&cxt, true);
                 (cxt.db.name("_"), xty, None, x)
             }
-            PreStmt::Let(pat, body) => {
+            PreStmt::Let(pat, body) if matches!(&***pat, PrePat::Binder(_, _)) => {
                 let pat = PMatch::new(None, &[pat.clone()], &cxt);
                 let aty = pat.ty.clone();
                 let body = body.check(aty.clone(), &cxt);
+                (pat.name, aty, Some(pat), body)
+            }
+            PreStmt::Let(pat, body) => {
+                let (body, aty) = body.infer(&cxt, true);
+                let pat = PMatch::new(Some(aty.clone()), &[pat.clone()], &cxt);
                 (pat.name, aty, Some(pat), body)
             }
         };
@@ -1856,6 +1933,8 @@ impl SPre {
                 let b = b.check(rty, cxt);
                 Term::Pair(Box::new(a), Box::new(b))
             }
+            (Pre::Do(block, last), _) => elab_block(block, last, Some(ty), cxt).0,
+
             // insert lambda when checking (non-implicit lambda) against implicit function type
             (_, Val::Fun(Pi, Impl, n, aty, _, _)) => {
                 let aty2 = aty.quote(cxt.qenv());
@@ -1876,7 +1955,6 @@ impl SPre {
                 let b = self.check(rty, &cxt);
                 Term::Pair(Box::new(a), Box::new(b))
             }
-            (Pre::Do(block, last), _) => elab_block(block, last, Some(ty), cxt).0,
 
             (_, _) => {
                 let (s, sty) = self.infer(cxt, !matches!(ty, Val::Fun(Pi, Impl, _, _, _, _)));
@@ -1937,7 +2015,7 @@ impl Pretty for Term {
     fn pretty(&self, db: &DB) -> Doc {
         match self {
             // TODO how do we get types of local variables for e.g. semantic highlights or hover?
-            Term::Var(n, _i) => Doc::start(db.get(*n)), // + &*format!("@{}", _i.0),
+            Term::Var(n, _i) => Doc::start(db.get(*n)) + &*format!("@{}", _i.0),
             Term::Def(d) => db.idefs.get(*d).name().pretty(db),
             Term::Meta(m) => m.pretty(db),
             // TODO we probably want to show implicit and explicit application differently, but that requires threading icits through neutral spines...

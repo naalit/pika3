@@ -297,7 +297,7 @@ impl Parser {
                     while !s.maybe(Tok::Dedent) {
                         if s.maybe(Tok::LetKw) {
                             let pat = s.spanned(|s| {
-                                let pat = s.binder();
+                                let pat = s.fun(true);
                                 Box::new(s.reparse_pattern(&pat))
                             });
                             s.expect(Tok::Equals);
