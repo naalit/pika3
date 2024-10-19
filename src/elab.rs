@@ -604,11 +604,12 @@ fn split_ty(
     ty.whnf(cxt);
     match &ty {
         Val::Fun(Sigma(n2), i, n1, aty, _, _) => {
-            let n1 = names.next().flatten().unwrap_or(cxt.db.inaccessible(*n1));
-            let n2 = names.next().flatten().unwrap_or(cxt.db.inaccessible(*n2));
-            let s1 = cxt.bind_(n1, (**aty).clone());
+            // TODO better system for names accessible in types in patterns
+            // let n1 = names.next().flatten().unwrap_or(cxt.db.inaccessible(*n1));
+            // let n2 = names.next().flatten().unwrap_or(cxt.db.inaccessible(*n2));
+            let s1 = cxt.bind_(*n1, (**aty).clone());
             let bty = ty.clone().app(Val::Neutral(VHead::Sym(s1), default()));
-            let s2 = cxt.bind_(n2, bty.clone());
+            let s2 = cxt.bind_(*n2, bty.clone());
             // now, we know this is reversible, so we can tell the compiler that
             if cxt.can_solve(var) {
                 cxt.solve_local(
@@ -746,23 +747,11 @@ impl PRow {
             let (_, t, pat) = s.cols.remove(i);
             match pat {
                 IPat::Var(n, None) => {
-                    eprintln!(
-                        "assigning {} ({}) : {}",
-                        n.pretty(&cxt.db),
-                        var.0.pretty(&cxt.db),
-                        t.pretty(&cxt.db)
-                    );
                     s.assignments.push((n, var, t.clone()));
 
                     Some(s)
                 }
                 IPat::Var(n, Some(paty)) => {
-                    eprintln!(
-                        "assigning {} ({}) : {}",
-                        n.pretty(&cxt.db),
-                        var.0.pretty(&cxt.db),
-                        t.pretty(&cxt.db)
-                    );
                     let aty = paty.check(Val::Type, cxt).eval(cxt.env());
                     if !aty.unify(&t, cxt.scxt(), cxt) {
                         cxt.err(
@@ -779,12 +768,6 @@ impl PRow {
                 }
                 IPat::CPat(n, pat) => {
                     if let Some(n) = n {
-                        eprintln!(
-                            "assigning {} ({}) : {}",
-                            n.pretty(&cxt.db),
-                            var.0.pretty(&cxt.db),
-                            t.pretty(&cxt.db)
-                        );
                         s.assignments.push((n, var, t.clone()));
                     }
                     if label == Some(pat.label) {
@@ -870,7 +853,6 @@ struct PCxt {
 }
 fn compile_rows(rows: &[PRow], pcxt: &mut PCxt, cxt: &Cxt) -> PTree {
     if rows.is_empty() {
-        eprintln!("non-exhaustive");
         if !pcxt.has_error {
             pcxt.has_error = true;
             // TODO reconstruct missing cases
@@ -878,7 +860,6 @@ fn compile_rows(rows: &[PRow], pcxt: &mut PCxt, cxt: &Cxt) -> PTree {
         }
         PTree::Error
     } else if rows.first().unwrap().cols.is_empty() {
-        eprintln!("body");
         let row = rows.first().unwrap();
         if pcxt.bodies[row.body as usize].reached {
             // check for matching bindings
@@ -903,18 +884,11 @@ fn compile_rows(rows: &[PRow], pcxt: &mut PCxt, cxt: &Cxt) -> PTree {
                             // Needed to account for locals solved during pattern compilation
                             let mut t2 = (**t).clone();
                             t2.whnf(cxt);
-                            eprint!(
-                                "{} ({}): {}; ",
-                                n.pretty(&cxt.db),
-                                s.0.pretty(&cxt.db),
-                                t2.pretty(&cxt.db)
-                            );
                             Arc::new(t2)
                         })
                     })
                     .collect(),
             };
-            eprintln!();
         }
         PTree::Body(
             row.body,
@@ -947,7 +921,6 @@ fn compile_rows(rows: &[PRow], pcxt: &mut PCxt, cxt: &Cxt) -> PTree {
             .collect::<Vec<_>>();
 
         if let Some(ctors) = split_ty(*var, ty, rows, names.into_iter(), &mut cxt) {
-            eprintln!("splitting succeeded: {}", ty.pretty(&cxt.db));
             if ctors.len() == 1
                 && ctors[0].label == PCons::Pair(Impl)
                 && !rows.iter().any(|row| {
@@ -956,7 +929,6 @@ fn compile_rows(rows: &[PRow], pcxt: &mut PCxt, cxt: &Cxt) -> PTree {
                     })
                 })
             {
-                eprintln!("(implicit pair)");
                 // Auto-unwrap implicit pairs if we don't match on them explicitly
                 // We do need to add the implicit argument to the assignments for each row
                 let mut rows = rows.to_vec();
@@ -964,7 +936,10 @@ fn compile_rows(rows: &[PRow], pcxt: &mut PCxt, cxt: &Cxt) -> PTree {
                 let iname = cxt.db.inaccessible(isym.0);
                 let (vsym, vty) = ctors[0].var_tys[1].clone();
                 let vname = cxt.db.inaccessible(vsym.0);
+                // Because we're not calling remove_column(), they can't bind the sym we split on either, so we'll need to do that
+                let rname = cxt.db.inaccessible(var.0);
                 for row in &mut rows {
+                    row.assignments.push((rname, *var, ty.clone()));
                     row.assignments.push((iname, isym, ity.clone()));
                     row.assignments.push((vname, vsym, vty.clone()));
                     row.cols.iter_mut().for_each(|(s, t, _)| {
@@ -1007,7 +982,6 @@ fn compile_rows(rows: &[PRow], pcxt: &mut PCxt, cxt: &Cxt) -> PTree {
             }
             PTree::Match(tvar, v, None)
         } else {
-            eprintln!("splitting failed: {}", ty.pretty(&cxt.db));
             for row in rows {
                 if let Some((_, _, IPat::CPat(_, cpat))) =
                     row.cols.iter().find(|(s, _, _)| s == var)
@@ -1188,7 +1162,6 @@ impl PMatch {
                 }
             })
             .collect();
-        eprintln!("match type {}", ty.as_ref().unwrap().pretty(&cxt.db));
 
         let tree = compile_rows(&rows, &mut pcxt, &cxt);
 
@@ -2015,7 +1988,7 @@ impl Pretty for Term {
     fn pretty(&self, db: &DB) -> Doc {
         match self {
             // TODO how do we get types of local variables for e.g. semantic highlights or hover?
-            Term::Var(n, _i) => Doc::start(db.get(*n)) + &*format!("@{}", _i.0),
+            Term::Var(n, _i) => Doc::start(db.get(*n)), // + &*format!("@{}", _i.0),
             Term::Def(d) => db.idefs.get(*d).name().pretty(db),
             Term::Meta(m) => m.pretty(db),
             // TODO we probably want to show implicit and explicit application differently, but that requires threading icits through neutral spines...
