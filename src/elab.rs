@@ -550,6 +550,15 @@ impl TElim {
 
 // PATTERN MATCHING STUFF
 
+fn ty_pat_bind_needed(pre_ty: &SPre, cxt: &Cxt) -> bool {
+    match &***pre_ty {
+        Pre::Sigma(_, n1, _, n2, rest) => {
+            n1.is_some() || n2.is_some() || ty_pat_bind_needed(rest, cxt)
+        }
+        _ => false,
+    }
+}
+
 fn pat_bind_type(
     pre_ty: &SPre,
     val: Val,
@@ -557,6 +566,9 @@ fn pat_bind_type(
     cxt: &Cxt,
     body: impl FnOnce(&Cxt) -> Term,
 ) -> Term {
+    if !ty_pat_bind_needed(pre_ty, cxt) {
+        return body(cxt);
+    }
     match (&***pre_ty, ty) {
         (Pre::Sigma(i, n1, _, n2, rest), Val::Fun(Sigma(_), i2, _, aty, _, _)) if i == i2 => {
             let n1 = n1.map(|x| *x).unwrap_or(cxt.db.name("_"));
@@ -681,6 +693,21 @@ fn split_ty(
 enum IPat {
     Var(Name, Option<Arc<SPre>>),
     CPat(Option<Name>, CPat),
+}
+impl IPat {
+    fn needs_split(&self, db: &DB) -> bool {
+        match self {
+            IPat::CPat(_, cpat) => {
+                for i in &cpat.vars {
+                    if i.needs_split(db) || i.name().map_or(false, |n| n != db.name("_")) {
+                        return true;
+                    }
+                }
+                false
+            }
+            _ => false,
+        }
+    }
 }
 #[derive(Clone)]
 struct CPat {
@@ -920,84 +947,91 @@ fn compile_rows(rows: &[PRow], pcxt: &mut PCxt, cxt: &Cxt) -> PTree {
             })
             .collect::<Vec<_>>();
 
-        if let Some(ctors) = split_ty(*var, ty, rows, names.into_iter(), &mut cxt) {
-            if ctors.len() == 1
-                && ctors[0].label == PCons::Pair(Impl)
-                && !rows.iter().any(|row| {
-                    row.cols.iter().any(|(s, _, p)| {
-                        s == var && matches!(p, IPat::CPat(_, p) if p.label == PCons::Pair(Impl))
+        if rows
+            .iter()
+            .flat_map(|r| &r.cols)
+            .any(|(s, _, p)| s == var && p.needs_split(&cxt.db))
+            || matches!(&**ty, Val::Fun(Sigma(_), Impl, _, _, _, _))
+        {
+            eprintln!("split licensed ({})", ty.pretty(&cxt.db));
+            if let Some(ctors) = split_ty(*var, ty, rows, names.into_iter(), &mut cxt) {
+                if ctors.len() == 1
+                    && ctors[0].label == PCons::Pair(Impl)
+                    && !rows.iter().any(|row| {
+                        row.cols.iter().any(|(s, _, p)| {
+                            s == var
+                                && matches!(p, IPat::CPat(_, p) if p.label == PCons::Pair(Impl))
+                        })
                     })
-                })
-            {
-                // Auto-unwrap implicit pairs if we don't match on them explicitly
-                // We do need to add the implicit argument to the assignments for each row
-                let mut rows = rows.to_vec();
-                let (isym, ity) = ctors[0].var_tys[0].clone();
-                let iname = cxt.db.inaccessible(isym.0);
-                let (vsym, vty) = ctors[0].var_tys[1].clone();
-                let vname = cxt.db.inaccessible(vsym.0);
-                // Because we're not calling remove_column(), they can't bind the sym we split on either, so we'll need to do that
-                let rname = cxt.db.inaccessible(var.0);
-                for row in &mut rows {
-                    row.assignments.push((rname, *var, ty.clone()));
-                    row.assignments.push((iname, isym, ity.clone()));
-                    row.assignments.push((vname, vsym, vty.clone()));
-                    row.cols.iter_mut().for_each(|(s, t, _)| {
-                        if s == var {
-                            *s = vsym;
-                            *t = vty.clone();
-                        }
-                    });
+                {
+                    // Auto-unwrap implicit pairs if we don't match on them explicitly
+                    // We do need to add the implicit argument to the assignments for each row
+                    let mut rows = rows.to_vec();
+                    let (isym, ity) = ctors[0].var_tys[0].clone();
+                    let iname = cxt.db.inaccessible(isym.0);
+                    let (vsym, vty) = ctors[0].var_tys[1].clone();
+                    let vname = cxt.db.inaccessible(vsym.0);
+                    // Because we're not calling remove_column(), they can't bind the sym we split on either, so we'll need to do that
+                    let rname = cxt.db.inaccessible(var.0);
+                    for row in &mut rows {
+                        row.assignments.push((rname, *var, ty.clone()));
+                        row.assignments.push((iname, isym, ity.clone()));
+                        row.assignments.push((vname, vsym, vty.clone()));
+                        row.cols.iter_mut().for_each(|(s, t, _)| {
+                            if s == var {
+                                *s = vsym;
+                                *t = vty.clone();
+                            }
+                        });
+                    }
+                    let t = compile_rows(&rows, pcxt, &cxt);
+                    return PTree::Match(
+                        tvar,
+                        vec![(ctors[0].label, ctors[0].var_tys.clone(), t)],
+                        None,
+                    );
                 }
-                let t = compile_rows(&rows, pcxt, &cxt);
-                return PTree::Match(
-                    tvar,
-                    vec![(ctors[0].label, ctors[0].var_tys.clone(), t)],
-                    None,
-                );
-            }
 
-            let mut v = Vec::new();
-            for row in rows {
-                if let Some((_, _, IPat::CPat(_, cpat))) =
-                    row.cols.iter().find(|(s, _, _)| s == var)
-                {
-                    if !ctors.iter().any(|x| x.label == cpat.label) {
-                        cxt.err("invalid pattern for type " + ty.pretty(&cxt.db), cpat.span);
-                        pcxt.has_error = true;
-                    }
-                }
-            }
-            for ctor in ctors {
-                let mut vrows = Vec::new();
+                let mut v = Vec::new();
                 for row in rows {
-                    if let Some(row) =
-                        row.remove_column(*var, Some(ctor.label), &ctor.var_tys, &cxt)
+                    if let Some((_, _, IPat::CPat(_, cpat))) =
+                        row.cols.iter().find(|(s, _, _)| s == var)
                     {
-                        vrows.push(row);
+                        if !ctors.iter().any(|x| x.label == cpat.label) {
+                            cxt.err("invalid pattern for type " + ty.pretty(&cxt.db), cpat.span);
+                            pcxt.has_error = true;
+                        }
                     }
                 }
-                let t = compile_rows(&vrows, pcxt, &cxt);
-                v.push((ctor.label, ctor.var_tys, t));
-            }
-            PTree::Match(tvar, v, None)
-        } else {
-            for row in rows {
-                if let Some((_, _, IPat::CPat(_, cpat))) =
-                    row.cols.iter().find(|(s, _, _)| s == var)
-                {
-                    cxt.err("invalid pattern for type " + ty.pretty(&cxt.db), cpat.span);
-                    pcxt.has_error = true;
+                for ctor in ctors {
+                    let mut vrows = Vec::new();
+                    for row in rows {
+                        if let Some(row) =
+                            row.remove_column(*var, Some(ctor.label), &ctor.var_tys, &cxt)
+                        {
+                            vrows.push(row);
+                        }
+                    }
+                    let t = compile_rows(&vrows, pcxt, &cxt);
+                    v.push((ctor.label, ctor.var_tys, t));
                 }
+                return PTree::Match(tvar, v, None);
             }
-            let mut vrows = Vec::new();
-            for row in rows {
-                if let Some(row) = row.remove_column(*var, None, &[], &cxt) {
-                    vrows.push(row);
-                }
-            }
-            compile_rows(&vrows, pcxt, &cxt)
         }
+
+        for row in rows {
+            if let Some((_, _, IPat::CPat(_, cpat))) = row.cols.iter().find(|(s, _, _)| s == var) {
+                cxt.err("invalid pattern for type " + ty.pretty(&cxt.db), cpat.span);
+                pcxt.has_error = true;
+            }
+        }
+        let mut vrows = Vec::new();
+        for row in rows {
+            if let Some(row) = row.remove_column(*var, None, &[], &cxt) {
+                vrows.push(row);
+            }
+        }
+        compile_rows(&vrows, pcxt, &cxt)
     }
 }
 
