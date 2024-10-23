@@ -910,6 +910,7 @@ fn compile_rows(rows: &[PRow], pcxt: &mut PCxt, cxt: &Cxt) -> PTree {
                     .map(|(n, s, t)| {
                         (*n, *s, {
                             // Needed to account for locals solved during pattern compilation
+                            // TODO but those locals can be in the spine ??? do we even need this?
                             let mut t2 = (**t).clone();
                             t2.whnf(cxt);
                             Arc::new(t2)
@@ -920,7 +921,11 @@ fn compile_rows(rows: &[PRow], pcxt: &mut PCxt, cxt: &Cxt) -> PTree {
         }
         PTree::Body(
             row.body,
-            row.assignments.iter().map(|(_, s, _)| *s).collect(),
+            row.assignments
+                .iter()
+                .filter(|(_, s, _)| *s != pcxt.var)
+                .map(|(_, s, _)| *s)
+                .collect(),
             cxt.clone(),
         )
     } else {
@@ -954,7 +959,6 @@ fn compile_rows(rows: &[PRow], pcxt: &mut PCxt, cxt: &Cxt) -> PTree {
             .any(|(s, _, p)| s == var && p.needs_split(&cxt.db))
             || matches!(&**ty, Val::Fun(Sigma(_), Impl, _, _, _, _))
         {
-            eprintln!("split licensed ({})", ty.pretty(&cxt.db));
             if let Some(ctors) = split_ty(*var, ty, rows, names.into_iter(), &mut cxt) {
                 if ctors.len() == 1
                     && ctors[0].label == PCons::Pair(Impl)
@@ -1058,7 +1062,6 @@ impl PMatch {
         for (name, sym, ty) in &self.pcxt.bodies[body as usize].vars {
             if *sym == self.pcxt.var {
                 cxt.bind_val(*name, nvar.clone(), ty.clone());
-                cxt.bind_(cxt.db.inaccessible(*name), ty.clone());
             } else {
                 cxt.bind_raw(*name, *sym, ty.clone());
             }
@@ -1076,17 +1079,8 @@ impl PMatch {
     fn compile(&self, bodies: &[Term]) -> Term {
         assert_eq!(bodies.len(), self.pcxt.bodies.len());
         if let PTree::Body(0, v, _) = &self.tree {
-            assert_eq!(v.len(), 1);
-            return Term::App(
-                Box::new(Term::Fun(
-                    Lam,
-                    Expl,
-                    self.name,
-                    Box::new(Term::Type),
-                    Arc::new(bodies[0].clone()),
-                )),
-                TElim::App(Expl, Box::new(Term::Var(self.name, Idx(0)))),
-            );
+            assert_eq!(v.len(), 0);
+            return bodies[0].clone();
         }
         let mut term = self.tree.apply(
             &self
