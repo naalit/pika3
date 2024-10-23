@@ -1598,6 +1598,7 @@ impl Val {
                                 }
                             }
                             let mut env = (*env).clone();
+                            let s = Val::Neutral(*h, spine);
                             for (i, n) in v.iter().enumerate() {
                                 env.push(Arc::new(
                                     VElim::Match(
@@ -1612,7 +1613,7 @@ impl Val {
                                         None,
                                         Arc::new(env.clone()),
                                     )
-                                    .elim(self.clone()),
+                                    .elim(s.clone()),
                                 ));
                             }
                             Some(t.eval(&env).and_whnf(cxt))
