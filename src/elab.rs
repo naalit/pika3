@@ -63,33 +63,33 @@ pub fn elab_def(def: Def, db: &DB) -> Option<DefElabResult> {
     let ty = ty.zonk(&cxt, true);
 
     Some(DefElabResult {
-        def: Arc::new(DefElab {
+        def: DefElab {
             name: pre.name,
-            ty,
-            body: body.map(|x| x.eval(&cxt.env())),
-        }),
-        errors: cxt.errors.errors.take(),
+            ty: Arc::new(ty),
+            body: body.map(|x| Arc::new(x.eval(&cxt.env()))),
+        },
+        errors: cxt.errors.errors.take().into_iter().collect(),
     })
 }
 
 // types
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct DefElab {
     pub name: SName,
-    pub ty: Val,
-    pub body: Option<Val>,
+    pub ty: Arc<Val>,
+    pub body: Option<Arc<Val>>,
 }
 
 #[derive(Debug)]
 pub struct Module {
-    pub defs: Vec<Arc<DefElab>>,
+    pub defs: Vec<DefElab>,
 }
 
 #[derive(Clone, Debug)]
 pub struct DefElabResult {
-    pub def: Arc<DefElab>,
-    pub errors: Vec<Error>,
+    pub def: DefElab,
+    pub errors: Arc<[Error]>,
 }
 
 #[derive(Clone, Debug)]
@@ -136,7 +136,7 @@ pub struct Sym(Name, NonZeroU32);
 // It would be nice for this to be im::Vector, but that's slower in practice since it's like 5x the stack size...
 type Env = SmallVec<[Arc<Val>; 3]>;
 
-type Spine = SmallVec<[VElim; 3]>;
+type Spine = Vec<VElim>;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum VHead {
@@ -169,7 +169,7 @@ impl Val {
 
 impl Term {
     pub fn eval(&self, env: &Env) -> Val {
-        match self {
+        with_stack(|| match self {
             Term::Var(_, idx) => Arc::unwrap_or_clone(idx.at(env)),
             Term::Def(d) => Val::Neutral(VHead::Def(*d), default()),
             Term::Meta(m) => Val::Neutral(VHead::Meta(*m), default()),
@@ -185,7 +185,7 @@ impl Term {
             Term::Pair(a, b) => Val::Pair(Arc::new(a.eval(env)), Arc::new(b.eval(env))),
             Term::Error => Val::Error,
             Term::Type => Val::Type,
-        }
+        })
     }
 }
 
@@ -428,13 +428,13 @@ impl Val {
 // eliminations
 
 #[derive(Debug, Clone, PartialEq)]
-enum TElim {
+pub enum TElim {
     // (branches, fallback)
     Match(Vec<(PCons, Vec<Name>, Arc<Term>)>, Option<Arc<Term>>),
     App(Icit, Box<Term>),
 }
 #[derive(Debug, Clone, PartialEq)]
-enum VElim {
+pub enum VElim {
     Match(
         Vec<(PCons, Vec<Name>, Arc<Term>)>,
         Option<Arc<Term>>,
@@ -572,7 +572,7 @@ fn pat_bind_type(
     match (&***pre_ty, ty) {
         (Pre::Sigma(i, n1, _, n2, rest), Val::Fun(Sigma(_), i2, _, aty, _, _)) if i == i2 => {
             let n1 = n1.map(|x| *x).unwrap_or(cxt.db.name("_"));
-            let (s1, cxt2) = cxt.bind(n1, (**aty).clone());
+            let (s1, cxt2) = cxt.bind(n1, aty.clone());
             let bty = ty.clone().app(Val::Neutral(VHead::Sym(s1), default()));
             let n2 = n2.map(|x| *x).unwrap_or(cxt2.db.name("_"));
             let (s2, cxt2) = cxt2.bind(n2, bty.clone());
@@ -594,7 +594,7 @@ fn pat_bind_type(
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]
-enum PCons {
+pub enum PCons {
     Pair(Icit),
     // Cons(Name),
     // ... literals ...
@@ -619,7 +619,7 @@ fn split_ty(
             // TODO better system for names accessible in types in patterns
             // let n1 = names.next().flatten().unwrap_or(cxt.db.inaccessible(*n1));
             // let n2 = names.next().flatten().unwrap_or(cxt.db.inaccessible(*n2));
-            let s1 = cxt.bind_(*n1, (**aty).clone());
+            let s1 = cxt.bind_(*n1, aty.clone());
             let bty = ty.clone().app(Val::Neutral(VHead::Sym(s1), default()));
             let s2 = cxt.bind_(*n2, bty.clone());
             // now, we know this is reversible, so we can tell the compiler that
@@ -657,7 +657,8 @@ fn split_ty(
                 // solve metas with more metas
                 let n = vars[0].clone().ensure_named(&cxt.db).name().unwrap();
                 let n2 = vars[1].clone().ensure_named(&cxt.db).name().unwrap();
-                let ta = cxt.new_meta_with_spine(Val::Type, Span(0, 0), spine.iter().cloned());
+                let ta =
+                    Arc::new(cxt.new_meta_with_spine(Val::Type, Span(0, 0), spine.iter().cloned()));
                 let (s, cxt2) = cxt.bind(n, ta.clone());
                 let tb = cxt2
                     .new_meta_with_spine(
@@ -673,7 +674,7 @@ fn split_ty(
                     Sigma(n2),
                     Expl,
                     n,
-                    Arc::new(ta),
+                    ta,
                     Arc::new(tb),
                     Arc::new(cxt.env().clone()),
                 );
@@ -1056,10 +1057,10 @@ impl PMatch {
         };
         for (name, sym, ty) in &self.pcxt.bodies[body as usize].vars {
             if *sym == self.pcxt.var {
-                cxt.bind_val(*name, nvar.clone(), (**ty).clone());
-                cxt.bind_(cxt.db.inaccessible(*name), (**ty).clone());
+                cxt.bind_val(*name, nvar.clone(), ty.clone());
+                cxt.bind_(cxt.db.inaccessible(*name), ty.clone());
             } else {
-                cxt.bind_raw(*name, *sym, (**ty).clone());
+                cxt.bind_raw(*name, *sym, ty.clone());
             }
         }
         for (sym, val) in &self.pcxt.bodies[body as usize].solved_locals {
@@ -1221,7 +1222,7 @@ enum MetaEntry {
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct Meta(Def, u32);
+pub struct Meta(Def, u32);
 impl Pretty for Meta {
     fn pretty(&self, _db: &DB) -> Doc {
         "?" + Doc::start(self.0.num()) + "." + Doc::start(self.1)
@@ -1232,7 +1233,7 @@ impl Pretty for Meta {
 struct Cxt {
     db: DB,
     def: Def,
-    bindings: im::HashMap<Name, (Val, Val)>,
+    bindings: im::HashMap<Name, (Val, Arc<Val>)>,
     metas: Ref<HashMap<Meta, MetaEntry>>,
     zonked_metas: Ref<HashMap<(Meta, bool), Val>>,
     env: SEnv,
@@ -1273,7 +1274,7 @@ impl Cxt {
     fn size(&self) -> u32 {
         self.env.env.len() as u32
     }
-    fn lookup(&self, n: Name) -> Option<(Term, Val)> {
+    fn lookup(&self, n: Name) -> Option<(Term, Arc<Val>)> {
         // first try locals
         self.bindings
             .get(&n)
@@ -1289,7 +1290,7 @@ impl Cxt {
             .or_else(|| {
                 self.db
                     .lookup_def_name(self.def, n)
-                    .map(|(d, t)| (Term::Def(d), t))
+                    .map(|(d, t)| (Term::Def(d), t.clone()))
             })
     }
     fn solved_locals(&self) -> Vec<(Sym, Arc<Val>)> {
@@ -1329,27 +1330,26 @@ impl Cxt {
             panic!("call can_solve first")
         }
     }
-    fn bind_val(&mut self, n: Name, v: Val, ty: Val) {
-        self.bindings.insert(n, (v, ty));
+    fn bind_val(&mut self, n: Name, v: Val, ty: impl Into<Arc<Val>>) {
+        self.bindings.insert(n, (v, ty.into()));
     }
-    fn bind_raw(&mut self, name: Name, sym: Sym, ty: Val) -> Sym {
+    fn bind_raw(&mut self, name: Name, sym: Sym, ty: impl Into<Arc<Val>>) -> Sym {
         self.env.qenv.bind_raw(sym);
         self.bindings
-            .insert(name, (Val::Neutral(VHead::Sym(sym), default()), ty));
+            .insert(name, (Val::Neutral(VHead::Sym(sym), default()), ty.into()));
         self.env
             .env
             .push(Arc::new(Val::Neutral(VHead::Sym(sym), default())));
         sym
     }
-    // TODO make types Arc<Val>s
-    fn bind_(&mut self, n: Name, ty: Val) -> Sym {
+    fn bind_(&mut self, n: Name, ty: impl Into<Arc<Val>>) -> Sym {
         let (sym, env) = self.env.qenv.bind(n, &self.env.env);
         self.bindings
-            .insert(n, (Val::Neutral(VHead::Sym(sym), default()), ty));
+            .insert(n, (Val::Neutral(VHead::Sym(sym), default()), ty.into()));
         self.env = env;
         sym
     }
-    fn bind(&self, n: Name, ty: Val) -> (Sym, Cxt) {
+    fn bind(&self, n: Name, ty: impl Into<Arc<Val>>) -> (Sym, Cxt) {
         let mut s = self.clone();
         let sym = s.bind_(n, ty);
         (sym, s)
@@ -1542,99 +1542,113 @@ impl VElim {
     }
 }
 impl Val {
-    fn whnf(&mut self, cxt: &Cxt) {
+    fn cow_whnf<'a>(s: Cow<'a, Val>, cxt: &Cxt) -> Cow<'a, Val> {
+        match s.maybe_whnf(cxt) {
+            Some(s) => Owned(s),
+            None => s,
+        }
+    }
+    fn as_whnf(&self, cxt: &Cxt) -> Cow<Val> {
+        match self.maybe_whnf(cxt) {
+            Some(s) => Owned(s),
+            None => Borrowed(self),
+        }
+    }
+    fn and_whnf(self, cxt: &Cxt) -> Val {
+        match self.maybe_whnf(cxt) {
+            Some(s) => s,
+            None => self,
+        }
+    }
+    fn maybe_whnf(&self, cxt: &Cxt) -> Option<Val> {
         match self {
-            Val::Neutral(VHead::Sym(s), spine) => {
-                if let Some(val) = cxt.local_val(*s) {
-                    *self = spine
-                        .iter()
-                        .fold((*val).clone(), |acc, x| x.clone().elim(acc));
-                    self.whnf(cxt);
-                }
-            }
-            Val::Neutral(VHead::Def(d), spine) => {
-                if let Some(elab) = cxt.db.elab.def_value(*d, &cxt.db) {
-                    if let Some(val) = elab.def.body.as_ref() {
-                        match val {
+            Val::Neutral(h, spine) => {
+                if let Some(val) = match h {
+                    VHead::Def(d) => {
+                        if let Some(elab) = cxt.db.elab.def_value(*d, &cxt.db) {
+                            elab.def.body.clone()
+                        } else {
+                            None
+                        }
+                    }
+                    VHead::Sym(s) => cxt.local_val(*s),
+                    VHead::Meta(m) => cxt.meta_val(*m),
+                } {
+                    Some(
+                        match &*val {
                             // fast path for neutrals (this makes like a 5-10% difference on Bench.pk)
                             Val::Neutral(head, v) => {
-                                *self =
-                                    Val::Neutral(*head, v.iter().chain(&*spine).cloned().collect())
+                                Val::Neutral(*head, v.iter().chain(&*spine).cloned().collect())
                             }
-                            term => {
-                                *self = spine
-                                    .iter()
-                                    .fold(term.clone(), |acc, x| x.clone().elim(acc))
-                            }
+                            term => spine
+                                .iter()
+                                .fold(term.clone(), |acc, x| x.clone().elim(acc)),
                         }
-                        self.whnf(cxt);
-                    }
-                }
-            }
-            Val::Neutral(VHead::Meta(m), spine) => {
-                if let Some(val) = cxt.meta_val(*m) {
-                    *self = spine
-                        .iter()
-                        .fold((*val).clone(), |acc, x| x.clone().elim(acc));
-                    self.whnf(cxt);
-                }
-            }
-            _ => (),
-        }
-        match self {
-            // For a single-branch match, go down a level and reabstract each variable behind the same match
-            // TODO: can we put this in elim()?
-            Val::Neutral(_, sp) | Val::Neutral(_, sp)
-                if sp
+                        .and_whnf(cxt),
+                    )
+                } else if spine
                     .last()
                     .iter()
-                    .any(|x| matches!(x, VElim::Match(v, None, _) if v.len() == 1)) =>
-            {
-                match sp.pop() {
-                    Some(VElim::Match(v2, None, env)) if v2.len() == 1 => {
-                        let (l, v, t) = &v2[0];
-                        // Avoid infinite recursion - abort if we're already just returning one of the matched variables
-                        if let Term::Var(_, i) = &**t {
-                            if (i.0 as usize) < v.len() {
-                                sp.push(VElim::Match(v2, None, env));
-                                return;
+                    .any(|x| matches!(x, VElim::Match(v, None, _) if v.len() == 1))
+                {
+                    // For a single-branch match, go down a level and reabstract each variable behind the same match
+                    // TODO: can we put this in elim()? also this technically benefits from an owned self
+                    let mut spine = spine.clone();
+                    match spine.pop() {
+                        Some(VElim::Match(v2, None, env)) if v2.len() == 1 => {
+                            let (l, v, t) = &v2[0];
+                            // Avoid infinite recursion - abort if we're already just returning one of the matched variables
+                            if let Term::Var(_, i) = &**t {
+                                if (i.0 as usize) < v.len() {
+                                    return None;
+                                }
                             }
+                            let mut env = (*env).clone();
+                            for (i, n) in v.iter().enumerate() {
+                                env.push(Arc::new(
+                                    VElim::Match(
+                                        vec![(
+                                            *l,
+                                            v.clone(),
+                                            Arc::new(Term::Var(
+                                                *n,
+                                                Idx(v.len() as u32 - 1 - i as u32),
+                                            )),
+                                        )],
+                                        None,
+                                        Arc::new(env.clone()),
+                                    )
+                                    .elim(self.clone()),
+                                ));
+                            }
+                            Some(t.eval(&env).and_whnf(cxt))
                         }
-                        let mut env = (*env).clone();
-                        for (i, n) in v.iter().enumerate() {
-                            env.push(Arc::new(
-                                VElim::Match(
-                                    vec![(
-                                        *l,
-                                        v.clone(),
-                                        Arc::new(Term::Var(*n, Idx(v.len() as u32 - 1 - i as u32))),
-                                    )],
-                                    None,
-                                    Arc::new(env.clone()),
-                                )
-                                .elim(self.clone()),
-                            ));
-                        }
-                        *self = t.eval(&env);
-                        self.whnf(cxt);
+                        _ => unreachable!(),
                     }
-                    _ => unreachable!(),
+                } else {
+                    None
                 }
             }
-            _ => (),
+            _ => None,
         }
+    }
+    fn whnf(&mut self, cxt: &Cxt) {
+        if let Some(s) = self.maybe_whnf(cxt) {
+            *self = s;
+        }
+        return;
     }
     fn unify(&self, other: &Val, scxt: SymCxt, cxt: &Cxt) -> bool {
         self.unify_(other, scxt, cxt, UnfoldState::Maybe)
     }
     fn unify_(&self, other: &Val, mut scxt: SymCxt, cxt: &Cxt, mut mode: UnfoldState) -> bool {
-        let (mut a, mut b) = (self.clone(), other.clone());
+        let (mut a, mut b) = (Borrowed(self), Borrowed(other));
         loop {
             if mode == UnfoldState::Yes {
-                a.whnf(cxt);
-                b.whnf(cxt);
+                a = Val::cow_whnf(a, cxt);
+                b = Val::cow_whnf(b, cxt);
             }
-            break match (&a, &b) {
+            break match (&*a, &*b) {
                 (Val::Error, _) | (_, Val::Error) => true,
                 (Val::Type, Val::Type) => true,
                 (Val::Neutral(s, sp), Val::Neutral(s2, sp2))
@@ -1669,8 +1683,8 @@ impl Val {
                     if !aty.unify_(aty2, scxt, cxt, mode) {
                         false
                     } else {
-                        a = a.app(arg.clone());
-                        b = b.app(arg);
+                        a = Owned(a.into_owned().app(arg.clone()));
+                        b = Owned(b.into_owned().app(arg));
                         scxt = scxt2;
                         mode = UnfoldState::Maybe;
                         continue;
@@ -1682,8 +1696,8 @@ impl Val {
                     let mut scxt2 = scxt;
                     let s = scxt2.bind(*n);
                     let arg = Val::Neutral(VHead::Sym(s), default());
-                    a = a.app(arg.clone());
-                    b = b.app(arg);
+                    a = Owned(a.into_owned().app(arg.clone()));
+                    b = Owned(b.into_owned().app(arg));
                     scxt = scxt2;
                     continue;
                 }
@@ -1787,6 +1801,9 @@ impl SPre {
     }
 
     fn infer(&self, cxt: &Cxt, should_insert_metas: bool) -> (Term, Val) {
+        with_stack(|| self.infer_(cxt, should_insert_metas))
+    }
+    fn infer_(&self, cxt: &Cxt, should_insert_metas: bool) -> (Term, Val) {
         let (s, sty) = match &***self {
             Pre::Var(name) if cxt.db.name("_") == *name => {
                 // hole
@@ -1795,7 +1812,7 @@ impl SPre {
                 (m, mty)
             }
             Pre::Var(name) => match cxt.lookup(*name) {
-                Some((term, ty)) => (term, ty),
+                Some((term, ty)) => (term, Arc::unwrap_or_clone(ty)),
                 None => {
                     cxt.err("name not found: " + name.pretty(&cxt.db), self.span());
                     (Term::Error, Val::Error)
@@ -1917,7 +1934,7 @@ impl SPre {
                 let pat = PMatch::new(Some((**aty2).clone()), &[pat.clone()], cxt);
 
                 let aty = aty2.quote(cxt.qenv());
-                let (sym, cxt) = cxt.bind(pat.name, (**aty2).clone());
+                let (sym, cxt) = cxt.bind(pat.name, aty2.clone());
                 let va = Val::Neutral(VHead::Sym(sym), default());
                 let rty = ty.clone().app(va.clone());
                 let cxt = pat.bind(0, &cxt);
@@ -1947,7 +1964,7 @@ impl SPre {
                 let aty2 = aty.quote(cxt.qenv());
                 // don't let them access the name in the term (shadowing existing names would be unintuitive)
                 let n = cxt.db.inaccessible(*n);
-                let (sym, cxt) = cxt.bind(n, (**aty).clone());
+                let (sym, cxt) = cxt.bind(n, aty.clone());
                 let rty = ty.app(Val::Neutral(VHead::Sym(sym), default()));
                 let body = self.check(rty, &cxt);
                 Term::Fun(Lam, Impl, n, Box::new(aty2), Arc::new(body))

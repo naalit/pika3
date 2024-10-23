@@ -1,4 +1,5 @@
 use lsp_types::Url;
+pub use std::borrow::Cow::{self, Borrowed, Owned};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::{fmt::Display, sync::RwLock};
@@ -14,6 +15,15 @@ pub use crate::{
     pretty::{Doc, Prec, Pretty},
     query::Interned,
 };
+
+#[inline]
+pub fn with_stack<A>(c: impl FnOnce() -> A) -> A {
+    if cfg!(feature = "segmented-stack") {
+        stacker::maybe_grow(32 * 1024, 10 * 1024 * 1024, || c())
+    } else {
+        c()
+    }
+}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Class {
@@ -81,9 +91,11 @@ impl<A: PartialEq> PartialEq for Ref<A> {
     }
 }
 impl<A> Ref<A> {
+    #[inline]
     pub fn with<R>(&self, f: impl FnOnce(&A) -> R) -> R {
         f(&*self.0.read().unwrap())
     }
+    #[inline]
     pub fn with_mut<R>(&self, f: impl FnOnce(&mut A) -> R) -> R {
         f(&mut *self.0.write().unwrap())
     }

@@ -184,7 +184,7 @@ impl DB {
         self.idefs.intern(&DefLoc::Crate(name))
     }
 
-    pub fn lookup_def_name(&self, at: Def, name: Name) -> Option<(Def, Val)> {
+    pub fn lookup_def_name(&self, at: Def, name: Name) -> Option<(Def, Arc<Val>)> {
         let mut at = at;
         loop {
             let def = self.idefs.intern(&DefLoc::Child(at, name));
@@ -394,7 +394,7 @@ impl ElabCache {
         self.cache.with(|c| c.get(&key).map(|e| e.result.clone()))
     }
 
-    pub fn def_type(&self, key: Def, db: &DB) -> Option<Val> {
+    pub fn def_type(&self, key: Def, db: &DB) -> Option<Arc<Val>> {
         self.current_deps
             .with_mut(|a| a.insert(Query::DefType(key)));
         self.maybe_recompute(key.clone(), db);

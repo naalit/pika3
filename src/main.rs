@@ -10,7 +10,7 @@ use std::io::Read;
 use crate::common::*;
 
 fn main() {
-    let mod_s = "Demo";
+    let mod_s = "Bench";
     let (input, input_s) = {
         let mut file = std::fs::File::open(&format!("{mod_s}.pk")).unwrap();
         let mut input = String::new();
