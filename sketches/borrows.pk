@@ -1,0 +1,212 @@
+# Borrow annotations mostly seem good, but we have a problem:
+# EXISTENTIAL BORROWS.
+type Imm a = ('a: Borrow, 'a a)
+# It's not enough to require the borrow to be invalid when we use it, because we can encapsulate the whole thing in a module so the outside can't see the borrow at all, and the constructor
+def mkImm : 'a a -> Imm a
+# looks like it's copying or something
+
+# I'm tempted to instead use borrow annotations similar to transience - instead of a parameter, you just annotate the whole type, like
+def makes_imm : 'a a -> 'a Imm a
+# but we could still have them as parameters for parametricity reasons?
+def iter : 'a &Vec a -> 'a Iter ('a &a)
+def next : &mut Iter a -> a
+# or
+def iter : 'a &Vec a -> 'a VecIter ('a, &a)
+type VecIter ('a, a) = ...
+# this does actually seem promising
+# so in `'a t`, 'a represents any borrows contained inside the type
+# so a stack-allocated closure would be simply `'_ (a -> b)` - the environment can contain borrows, and we don't let those borrows escape
+# for now we'll err on the side of theoretical simplicity for annotations - we'll always give borrow annotations, and we'll use imm/mut for actual borrows
+# so
+def iter : 'a imm Vec a -> 'a Iter ('a imm a)
+def next : '_ mut Iter a -> Option a
+def map : ('a Iter a, 'f (a -> b)) -> 'a 'f Iter b
+def collect : '_ Iter a -> Vec a
+# though it seems like more accurate would be
+def collect : '_ Iter ('a a) -> 'a Vec ('a a)
+# or sth similar
+# which feels not super elegant... especially since i was thinking that '_ is an annotation specifically on type constructors?
+# similarly we'd need
+def next : '_ mut Iter ('a a) -> 'a Option ('a a)
+# so in practice we would probably have
+type Iter ('a, a)
+def next : '_ mut Iter ('a, a) -> 'a Option a
+# where the dependency would ofc percolate down through the option, since it's not `'a Option ('_ a)` (that would override it)
+# but this feels like it defeats the point of reifying these as types in the first place?
+# so clunky
+# yeah if we have this anyway then pry what we want is to put dependency annotations on parameters, return types, and fields of structs
+# no matter what we'll need syntax sugar so `('a a, 'b b)` turns into `'a 'b ('a a, 'b b)`; the former is illegal under the rules above, to forbid existential borrows (fields can narrow but not broaden dependencies)
+# but i'd really like to be able to write something more like
+def next : '_ mut Iter a -> Option a
+# instead of
+def next : '_ mut Iter ('a, a) -> 'a Option a
+# and similarly
+Some : 'a a -> 'a Option a
+# feels not super great...
+
+# alternative: the result depends on the "internal" borrows, but not the mutable borrow of the iterator itself
+def next : '_ mut 'a Iter a -> 'a Option a
+# so then
+def iter : 'a imm Vec a -> 'a Iter a
+# should be fine
+# however, it can be too conservative - easier to see with
+def collect : 'a Iter a -> 'a Vec a
+def map : ('a Iter a, 'f (a -> b)) -> 'a 'f Iter b
+# here, the original 'a dependency on the vec can be removed by a map call, but it's still in the iterator since it's lazy
+# and in that case we want to be able to build a vector without it
+# yeah the type that most "says the right thing" is just
+def collect : '_ Iter ('a, a) -> 'a Vec a
+# and/or (unclear whether this is even allowed or what the difference would be:)
+def collect : '_ Iter ('a a) -> 'a Vec a
+# and/or (probably equivalent:)
+def collect : '_ Iter ('a a) -> 'a Vec ('a a)
+# in the first case, the type of map is kind of weird:
+def map : ('i Iter ('a, a), 'f ('a a -> 'b b)) -> 'a 'f Iter ('b, b)
+# here both 'a and 'b have to be bound by the map function, not the closure passed to it
+# so like if the closure is 'a a -> 'a b for any 'a, we have to instantiate the borrow argument before passing the closure to map
+# with the `Iter ('a a)` case this is basically all implicit in
+def map : ('a Iter a, 'f (a -> b)) -> 'a 'f Iter b
+# but since b is quantified by the map function, the closure can't have a dependent type, and we still need to instantiate borrow arguments
+# so the question is:
+#
+# Q1: Does it make sense for borrow annotations to be a type constructor, or an annotation on parameters/return types/fields?
+#
+#   (also it's unclear whether unifying `Iter ('a a)` and `Iter U32` would even work? but probably it would)
+
+# option Γ: `a : Type {'a}`, and automatic universal quantification automatically makes a corresponding `'a` for every `a : Type`
+type Iter ('s, 'a, a: Type{'a}) : Type {'s 'a} = ...
+def next : mut Iter ('s, 'a, a) -> Option ('a, a)
+# with suitable syntax sugar:
+type Iter a = ... # : {'s:_} -> {'a:_} -> Type 'a -> Type ('s 'a)
+def iter : imm{'v} Vec {'a} a -> Iter {'a 'v, 'a 'v} (imm{'v} a)
+def next : mut Iter a -> Option a # Option : {'a:_} -> Type 'a -> Type 'a; here 'a can be solved by unification!
+def collect : Iter a -> Vec a # once again, Vec : Type 'a -> Type 'a, so we can solve the borrow by unification
+def map : (Iter {'i} a, a -{'f}> b) -> Iter {'i 'f, _} b # hmmmmmmmmmmmmm... so we do need to annotate the borrow of the closure environment, and here b: Type 'b universally quantified and then unified into _
+# clearly at least the syntax is not usable
+# but this does at least feel like a novel idea?
+# i think i've explored the landscape of "things that look like capabilities" a lot more thoroughly than the landscape of "things that look like lifetimes"
+# and this idea feels a lot more theoretically sound than most others - as long as we make sure we give type constructors the right types, everything should be sound
+# (e.g. `(,) : (a : Type 'a) -> (imm a -> Type 'b) -> Type ('a 'b)`)
+type Iter {'s} a : Type 's = struct # doesn't actually need to be Type ('s 'a), we don't actually store any a's (and the closure handles its own dependencies)
+  next : () mut 's -> a
+type Vec a : Type 'a = struct # this does contain a's, so it needs 'a
+  buf : [MaybeUninit a] # MaybeUninit : Type 'a -> Type 'a; [_] : Type 'a -> Type 'a
+  len : U64 # U64 : Type '() # ('static; i was originally thinking '_, but that just looks like an anonymous borrow, not a concrete static borrow. probably `Type` means `Type '()`)
+# `imm{'a} a` can be `&'a a`; the biggest issue i think is the syntax of function types. -{'a}> is *not* reasonable, and we still have own->/mut->/imm->
+# mostly we'll want to distinguish `-{'_}>` (i.e. a non-escaping stack-allocated closure) from escaping function types
+# i like `'a ->`, but then `Type 'a ->` is ambiguous; `-> 'a` should be unambiguous though.
+# and then, question: do we need the imm->/mut-> distinction? bc if not we can do ->, and ~> for own->
+# the main difference from a type safety perspective is that mut-> isn't reentrant (it can recurse itself, but *we* can't call it while it's being called) and mut-> can't be shared btwn threads (bc then we could call it more than once at a time)
+# basically, mut-> is a ref to an owned value that we keep taking and putting back
+# but this *isn't* tied to its borrow - we can have a `mut '() a`, or an owned mutable local variable, etc
+# which makes it kind of hard to enforce non-reentrancy? (marking it not-thread-safe is easy)
+def problems1 (f : (() -> ()) -> ()) = f (f (() => ()))
+def problems2 () = do
+  mut x = Data.new
+  problems1 do f =>
+    mut p = x # consuming x
+    f () # calling f
+    x = p # and then putting it back
+# that code needs to produce a compile error. where and why?
+# notably, if f can capture nonlinear effect handlers from problems1 (or even linear ones, if problems1 is able to return something containing the effect continuation?)
+# then this problem happens already even without reentrancy considerations
+# so maybe we need mut's to be valid over calls to unknown functions in general
+# (or rather - any functions defined in a smaller scope than the mut is from. i think. so this would be why top-level functions are ok)
+# (and that also deals nicely with effect handlers - we can raise an exception, but only if the mut is inside the try block, i.e. if the handler (function) outlives the mut)
+# (but we dont have lifetimes and "outlives" isnt really a defined term for us ?? so idk how to implement this in the theory)
+type Iter {'s} a : Type 's = struct
+  next : () -> 's a
+# it is weird, though, that we could call `iter.next ()` with immutable access to the iterator ???
+# I was thinking this let us do this:
+type Ref a = struct # not thread-safe
+  modify : (a -> (a, b)) -> b
+# but that's not actually true, `modify` can't invalidate the stored `a` over the call to the passed closure
+# what we *can* do is
+type Ref a = struct # not thread-safe
+  swap : a -> a
+# and then `Ref (Option a)` is actually kind of useful (and is memory-safe!), essentially a `Cell`
+
+# some more attempts to get around the rules:
+type Query (a, r) of
+  Get : Query (a, &a) # existential borrow, but that doesn't matter bc we dont have anything of that type
+  Swap a : Query (a, a)
+type Ref a = struct
+  query : Query (a, r) -> r
+# now we can't actually construct a return value for `query Get`, because it would need to be `&'e` for `'e` existentially quantified within `Get`
+# so we need to do
+type Query ('x, a, r) of
+  Get : Query ('x, a, &'x a)
+  Swap a : Query ('(), a, a)
+type Ref a = struct
+  query : Query ('x, a, r) -> r
+# once again, we can't implement `query Get`, because it needs to be able to return a borrow on the internal `a` with the specific borrow we give it, but every borrowing creates a new borrow
+# so all it can do is return a `&'() a`, and to do that it needs to get rid of the owned `a` which semantically gets moved at the end of the function body
+# and `query : Query ('s, a, r) ->'s r` wouldn't work, because a closure can't access its own environment borrow
+# this is actually looking reasonably sound ??
+# and ofc `() -> ()` is Send but not Sync, or whatever - all we need to do is make sure it can't be called twice at the same time
+# so we could put it in a mutex, for example, and then that would be Sync
+# a read-write lock doesn't work, though, bc we can call it with immutable access
+# so ig we just can't implement a rwlock ????
+# or well it would require `Sync (&a)`
+# which is true for most types but not `->`
+# okay yeah the rust RwLock requires `T: Sync`. which does actually mean what I was thinking of by `Sync (&a)`
+# and mutex doesn't require Sync. yeah awesome this totally works then
+# so `->` is Send but not Sync! `~>` is Sync, but only because `&~>` is useless
+# we maybe do want a special `&->` or something for the sort of truly-immutable functions, like thin function pointers (with no global mutable state ofc), that *are* Sync.
+# but maybe that type should literally mean bare function pointer? bc we need it to not capture anything mutably + not capture anything non-Sync + not capture any effect handlers + ...
+# there are exceptions ofc, both ways - you can capture an I32 and still be Sync, and you can use LLVM trampoline intrinsics to create a non-Sync bare function pointer that captures mutable state (though that is pry "unsafe")
+
+# So I'm honestly reasonably satisfied with this as a coherent and expressive (*more* expressive than lifetimes, since we can determine whether borrow parameters affect the type!) theoretical formulation of ownership and borrowing.
+# It is a little bit complicated to use, but it's probably not completely unusable. Unclear whether it's more or less usable than lifetimes, but probably more
+# It could be implemented as the actual system for Pika to use, or it could serve as the new "ground truth" theoretical foundation in which to formulate other systems, since it's
+#  more theoretically coherent than lifetimes and than all my previous formulations of borrow annotations (such as the "ground truth" system currently in lifetimes.md, which breaks down with existential borrows)
+
+
+
+
+## Ok so before actually implementing this in pika3, i want to (timeboxed, ideally, with fallback to system-Γ) play with Γ-based capabilities or transience systems
+# to see if i can find a good equilibrium
+
+# System Γ-1:  (we'll call Γ Γ-0 if we need to)
+# - capabilities
+# - `type ref` gives a type one borrow parameter
+# - types also get a borrow parameter for each type parameter they have; either that always applies to the type or we figure it out based on the implementation like Rust does for lifetime variance
+# - capabilities: `own`,`imm`,`mut`, the latter two automatically introduce borrows. probably default to `own`
+# - `&` on function parameters means "nothing from here escapes" basically. probably defaults to `imm`
+# - behavior/quantification of borrows appearing in types (`imm`/`mut`, `type ref`, type with a parameter that is one of these):
+#   - in a function parameter type: we add a function parameter
+#   - in a function return type: conjuction of all borrows introduced by non-`&` parameters
+#   - in a `type ref`: the type's one borrow parameter (`'self`?)
+# - unclear what to do about borrows that can be solved via unification? does that override this stuff?
+# - we probably want to desugar this to Γ-0 anyway
+type Vec a = ...
+type ref Iter a = ... # `{'s:_} -> {'a:_} -> (a : Type 'a) -> Type ('s 'a)`; or maybe Type 's, unclear. maybe it's 's and if 'a is inside then that information comes from the constructor?
+def get : (imm Vec a, U32) -> imm a
+def push : (&mut Vec a, a) -> () # note that & doesn't actually matter since we always discard the return value
+def pop : &mut Vec a -> Option a # here the & does matter, but we need unification for the borrow parameter of Option since the vector is under & so the normal rules don't bind it to anything
+def iter : imm Vec a -> Iter (imm a) # `imm 'v (Vec 'a a) -> Iter ('v 'a) ('v 'a) (imm ('v 'a) a)`
+def next : &mut Iter a -> a # note, the return type has no borrow parameters! so the borrow created by the `&mut` (which could also have just been `mut`) is not bound to anything.
+                            # it might not be stable under substitution (in fact, it definitely isn't), but if we first desugar to Γ-0 and then do the substitution it works fine! i think.
+def map : (Iter a, a -> b) -> Iter b # `(Iter 's 'a a, a -> 'f b) -> Iter ('s 'f) 'b b`; needs unification; possibly ('s 'f 'b)
+def collect : Iter a -> Vec a # `Iter 's 'a a -> Vec 'a a`, solved by unification
+# this seems pretty great, *if* we can get borrow unification playing nice with capabilities; does basically require desugaring to Γ-0
+# which, if we're desugaring to Γ-0 anyway, might as well let the user use full borrow annotations if they want? though that might be too much complexity?
+# at least '() is probably useful? e.g. for putting `imm` inside a non-`type ref`
+# this can mostly just be the default borrow annotation inference if you don't put anything, the only extra things we added are `&` and `type ref`
+# ah, but `'_` could replace & without adding anything extra - and maybe `type Iter '_ a = ...` or something? I'm kind of liking keeping `type ref` and then letting you use the `'self` borrow inside it
+def pop : '_ mut Vec a -> Option a # ?? of course this doesn't actually need any annotations, since unification can solve the only borrow parameter in the return type
+
+# what if i just. implement Γ-0 right now. it's a git repo we can always go back
+# okay well i think i should maybe implement automatic universal quantification for type variables first, since i'll want that system in place for borrows
+# then there are a few parts:
+# a) when checking against a type with capabilities, we need to notice if the term is a variable so that we can auto-borrow it - not unlike `PlaceOrExpr` from pika2
+# b) put borrows in Type - most places we check against `Val::Type`, we'll now need to make a meta for the borrow, which will then be subject to automatic universal quantification if it doesn't get solved to a value (how to implement that ???)
+# c) when using Type 'a (where?), check to make sure 'a is still valid
+#   --> issue here: we need to make sure that we don't incorrectly assume something is still valid if we can't evaluate the borrow enough to figure out which borrow it is.
+#   --> e.g. `if x then a else b` where `a : Type 'a`, `b : Type 'b`, the return type needs to be `Type ('a 'b)` instead of `Type (if x then 'a else 'b)`. though it might just be illegal and you need to do that coercion explicitly
+# d) ?
+
+# -> for (c), and sort of for universal quantification where we need to know if we're inside a function type, i wonder if we want a special function for checking against Type, which doesn't come in with a borrow known ahead of time
+#    and it would probably have a wrapper function or two for e.g. automatically universally quantifying if we don't know the borrow
+
+# note: `imm : ('a : _) -> Type 'b -> Type ('a 'b)

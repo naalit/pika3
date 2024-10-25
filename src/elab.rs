@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::AtomicU32;
 
 use smallvec::SmallVec;
 use tap::Pipe;
@@ -98,43 +99,37 @@ pub struct ModuleElabResult {
     pub errors: Vec<Error>,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Idx(u32);
-impl Idx {
-    fn idx(self, env: &Env) -> Option<usize> {
-        // [a, b] at 1 is a (vec[0]), at 0 is b (vec[1])
-        if env.len() < self.0 as usize + 1 {
-            None
-        } else {
-            Some(env.len() - self.0 as usize - 1)
-        }
-    }
-    fn at(self, env: &Env) -> Arc<Val> {
-        if env.len() < self.0 as usize + 1 {
-            panic!("idx {} at {}", self.0, env.len())
-        }
-        env[env.len() - self.0 as usize - 1].clone()
-    }
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub enum Term {
-    Var(Name, Idx),
+    Var(Sym),
     Def(Def),
     Meta(Meta),
     App(Box<Term>, TElim),
     /// Argument type annotation
-    Fun(Class, Icit, Name, Box<Term>, Arc<Term>),
+    Fun(Class, Icit, Sym, Box<Term>, Arc<Term>),
     Pair(Box<Term>, Box<Term>),
     Error,
     Type,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Sym(Name, NonZeroU32);
+pub struct Sym(Name, u32);
 
 // It would be nice for this to be im::Vector, but that's slower in practice since it's like 5x the stack size...
-type Env = SmallVec<[Arc<Val>; 3]>;
+#[derive(Clone, Debug, PartialEq, Educe)]
+#[educe(Deref, Default)]
+struct Env(im::HashMap<Sym, Arc<Val>>);
+impl Env {
+    fn bind(&self, s: Sym, scxt: &SymCxt) -> (Sym, Env) {
+        let s2 = scxt.bind(s.0);
+        (
+            s2,
+            Env(self.0.clone().tap_mut(|v| {
+                v.insert(s, Arc::new(Val::sym(s2)));
+            })),
+        )
+    }
+}
 
 type Spine = Vec<VElim>;
 
@@ -148,7 +143,7 @@ pub enum VHead {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Val {
     Neutral(VHead, Spine),
-    Fun(Class, Icit, Name, Arc<Val>, Arc<Term>, Arc<Env>),
+    Fun(Class, Icit, Sym, Arc<Val>, Arc<Term>, Arc<Env>),
     Pair(Arc<Val>, Arc<Val>),
     Error,
     Type,
@@ -170,7 +165,7 @@ impl Val {
 impl Term {
     pub fn eval(&self, env: &Env) -> Val {
         with_stack(|| match self {
-            Term::Var(_, idx) => Arc::unwrap_or_clone(idx.at(env)),
+            Term::Var(s) => env.get(s).map(|x| (**x).clone()).unwrap_or(Val::sym(*s)),
             Term::Def(d) => Val::Neutral(VHead::Def(*d), default()),
             Term::Meta(m) => Val::Neutral(VHead::Meta(*m), default()),
             Term::App(f, x) => x.eval(env).elim(f.eval(env)),
@@ -189,18 +184,12 @@ impl Term {
     }
 }
 
-#[derive(Copy, Clone)]
-struct SymCxt(NonZeroU32);
-impl Default for SymCxt {
-    fn default() -> Self {
-        Self(1.try_into().unwrap())
-    }
-}
+#[derive(Clone, Default)]
+struct SymCxt(Arc<AtomicU32>);
 impl SymCxt {
-    fn bind(&mut self, s: Name) -> Sym {
-        let s = Sym(s, self.0);
-        self.0 = self.0.checked_add(1).unwrap();
-        s
+    fn bind(&self, s: Name) -> Sym {
+        let n = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Sym(s, n)
     }
 }
 
@@ -234,91 +223,136 @@ impl Errors {
     }
 }
 
+// #[derive(Clone, Default)]
+// struct QEnv {
+//     lvls: im::HashMap<Sym, u32>,
+//     size: u32,
+//     scxt: SymCxt,
+//     partial_cxt: bool,
+//     errors: Errors,
+// }
+// impl QEnv {
+//     fn cvt(&self, sym: Sym) -> Option<Idx> {
+//         // i don't *think* this is an off-by-one error...
+//         if let Some(l) = self.lvls.get(&sym) {
+//             Some(Idx(self.size as u32 - l - 1))
+//         } else {
+//             if self.partial_cxt {
+//                 Some(Idx(555))
+//             } else {
+//                 None
+//             }
+//         }
+//     }
+
+//     fn get(&self, sym: Sym) -> Option<Term> {
+//         let n = self.name(sym);
+//         self.cvt(sym).map(|i| Term::Var(n, i)) // (n,) >> Term.Var  # easier and nicer than haskell!
+//     }
+
+//     fn name(&self, sym: Sym) -> Interned<Arc<str>> {
+//         sym.0
+//         // (sym.0 != self.errors.db.name("_"))
+//         //     .then_some(sym.0)
+//         //     .unwrap_or_else(|| {
+//         //         self.errors
+//         //             .db
+//         //             .name(&format!("{}{}", self.errors.db.get(sym.0), sym.1.get()))
+//         //     })
+//     }
+
+//     fn bind_raw(&mut self, s: Sym) {
+//         self.lvls.insert(s, self.size);
+//         self.size += 1;
+//     }
+
+//     fn bind_(&mut self, s: Name) {
+//         let sym = self.scxt.bind(s);
+//         self.lvls.insert(sym, self.size);
+//         self.size += 1;
+//     }
+
+//     fn bind(&self, s: Name, env: &Env) -> (Sym, SEnv) {
+//         let mut scxt = self.scxt;
+//         let sym = scxt.bind(s);
+//         let mut env = env.clone();
+//         let mut qenv = self.clone();
+//         env.push(Arc::new(Val::Neutral(VHead::Sym(sym), default())));
+//         qenv.scxt = scxt;
+//         qenv.lvls.insert(sym, self.size);
+//         qenv.size += 1;
+//         (sym, SEnv { qenv, env })
+//     }
+// }
+
 #[derive(Clone, Default)]
 struct QEnv {
-    lvls: im::HashMap<Sym, u32>,
-    size: u32,
     scxt: SymCxt,
     partial_cxt: bool,
     errors: Errors,
 }
 impl QEnv {
-    fn cvt(&self, sym: Sym) -> Option<Idx> {
-        // i don't *think* this is an off-by-one error...
-        if let Some(l) = self.lvls.get(&sym) {
-            Some(Idx(self.size as u32 - l - 1))
-        } else {
-            if self.partial_cxt {
-                Some(Idx(555))
-            } else {
-                None
-            }
+    fn senv(&self, env: &Env) -> SEnv {
+        SEnv {
+            scxt: self.scxt.clone(),
+            partial_cxt: self.partial_cxt,
+            errors: self.errors.clone(),
+            env: env.clone(),
         }
-    }
-
-    fn get(&self, sym: Sym) -> Option<Term> {
-        let n = self.name(sym);
-        self.cvt(sym).map(|i| Term::Var(n, i)) // (n,) >> Term.Var  # easier and nicer than haskell!
-    }
-
-    fn name(&self, sym: Sym) -> Interned<Arc<str>> {
-        sym.0
-        // (sym.0 != self.errors.db.name("_"))
-        //     .then_some(sym.0)
-        //     .unwrap_or_else(|| {
-        //         self.errors
-        //             .db
-        //             .name(&format!("{}{}", self.errors.db.get(sym.0), sym.1.get()))
-        //     })
-    }
-
-    fn bind_raw(&mut self, s: Sym) {
-        self.lvls.insert(s, self.size);
-        self.size += 1;
-    }
-
-    fn bind_(&mut self, s: Name) {
-        let sym = self.scxt.bind(s);
-        self.lvls.insert(sym, self.size);
-        self.size += 1;
-    }
-
-    fn bind(&self, s: Name, env: &Env) -> (Sym, SEnv) {
-        let mut scxt = self.scxt;
-        let sym = scxt.bind(s);
-        let mut env = env.clone();
-        let mut qenv = self.clone();
-        env.push(Arc::new(Val::Neutral(VHead::Sym(sym), default())));
-        qenv.scxt = scxt;
-        qenv.lvls.insert(sym, self.size);
-        qenv.size += 1;
-        (sym, SEnv { qenv, env })
     }
 }
 
 #[derive(Clone, Default)]
 struct SEnv {
-    qenv: QEnv,
+    scxt: SymCxt,
+    partial_cxt: bool,
+    errors: Errors,
     env: Env,
+}
+impl SEnv {
+    fn bind(&self, s: Sym) -> (Sym, SEnv) {
+        let (s2, env) = self.env.bind(s, &self.scxt);
+        (
+            s2,
+            SEnv {
+                env,
+                ..self.clone()
+            },
+        )
+    }
+    fn qenv(&self) -> QEnv {
+        QEnv {
+            scxt: self.scxt.clone(),
+            errors: self.errors.clone(),
+            partial_cxt: self.partial_cxt,
+        }
+    }
+    fn get(&self, s: Sym) -> Result<Val, Sym> {
+        self.env
+            .get(&s)
+            .map(|v| (**v).clone())
+            .or_else(|| self.partial_cxt.then(|| Val::sym(s)))
+            .ok_or(s)
+    }
 }
 
 impl Term {
     fn subst(&self, env: &SEnv) -> Result<Term, Sym> {
         Ok(match self {
-            Term::Var(n, idx) if env.qenv.partial_cxt && idx.0 as usize >= env.env.len() => {
-                Term::Var(*n, *idx)
-            }
-            Term::Var(_, idx) => idx.at(&env.env).quote_(&env.qenv)?,
+            Term::Var(s) => env.get(*s)?.quote_(&env.qenv())?,
             Term::Def(d) => Term::Def(*d),
             Term::Meta(m) => Term::Meta(*m),
             Term::App(f, x) => Term::App(Box::new(f.subst(env)?), x.subst(env)?),
-            Term::Fun(c, i, s, aty, body) => Term::Fun(
-                *c,
-                *i,
-                *s,
-                Box::new(aty.subst(env)?),
-                Arc::new(body.subst(&env.qenv.bind(*s, &env.env).1)?),
-            ),
+            Term::Fun(c, i, s, aty, body) => {
+                let (s, env2) = env.bind(*s);
+                Term::Fun(
+                    *c,
+                    *i,
+                    s,
+                    Box::new(aty.subst(env)?),
+                    Arc::new(body.subst(&env2)?),
+                )
+            }
             Term::Pair(a, b) => Term::Pair(Box::new(a.subst(env)?), Box::new(b.subst(env)?)),
             Term::Error => Term::Error,
             Term::Type => Term::Type,
@@ -347,7 +381,7 @@ impl Val {
         Ok(match self {
             Val::Neutral(s, spine) => spine.iter().fold(
                 Ok(match s {
-                    VHead::Sym(s) => env.get(*s).ok_or(*s)?,
+                    VHead::Sym(s) => Term::Var(*s),
                     VHead::Def(d) => Term::Def(*d),
                     VHead::Meta(m) => Term::Meta(*m),
                 }),
@@ -359,11 +393,11 @@ impl Val {
                 Term::Fun(*c, *i, *s, Box::new(aty.quote_(env)?), body.clone())
             }
             Val::Fun(c, i, s, aty, body, inner_env) => {
-                let (sym, qenv) = env.bind(*s, inner_env);
+                let (sym, qenv) = env.senv(inner_env).bind(*s);
                 Term::Fun(
                     *c,
                     *i,
-                    env.name(sym),
+                    sym,
                     Box::new(aty.quote_(env)?),
                     Arc::new(body.subst(&qenv)?),
                 )
@@ -377,9 +411,9 @@ impl Val {
 
 impl Term {
     fn zonk(&mut self, cxt: &Cxt, beta_reduce: bool) {
-        self.zonk_(cxt, &cxt.senv(), beta_reduce);
+        self.zonk_(cxt, &cxt.qenv(), beta_reduce);
     }
-    fn zonk_(&mut self, cxt: &Cxt, senv: &SEnv, beta_reduce: bool) -> bool {
+    fn zonk_(&mut self, cxt: &Cxt, qenv: &QEnv, beta_reduce: bool) -> bool {
         match self {
             Term::Meta(meta) => match cxt.zonked_meta_val(*meta, beta_reduce) {
                 // Meta solutions are evaluated with an empty environment, so we can quote them with an empty environment
@@ -395,20 +429,21 @@ impl Term {
             },
             Term::App(term, term1) => {
                 // β-reduce meta spines by eval-quoting
-                let solved_meta = term.zonk_(cxt, senv, beta_reduce);
-                term1.zonk_(cxt, senv, beta_reduce);
+                let solved_meta = term.zonk_(cxt, qenv, beta_reduce);
+                term1.zonk_(cxt, qenv, beta_reduce);
                 if beta_reduce && solved_meta {
-                    *self = self.eval(&senv.env).quote(&senv.qenv);
+                    // we should be able to eval in an empty environment since we dont need to rename
+                    *self = self.eval(&default()).quote(&qenv);
                     return true;
                 }
             }
             Term::Fun(_, _, n, aty, body) => {
-                aty.zonk_(cxt, senv, beta_reduce);
-                Arc::make_mut(body).zonk_(cxt, &senv.qenv.bind(*n, &senv.env).1, beta_reduce);
+                aty.zonk_(cxt, qenv, beta_reduce);
+                Arc::make_mut(body).zonk_(cxt, &qenv, beta_reduce);
             }
             Term::Pair(a, b) => {
-                a.zonk_(cxt, senv, beta_reduce);
-                b.zonk_(cxt, senv, beta_reduce);
+                a.zonk_(cxt, qenv, beta_reduce);
+                b.zonk_(cxt, qenv, beta_reduce);
             }
             Term::Var { .. } | Term::Def { .. } | Term::Error | Term::Type => (),
         }
@@ -436,7 +471,7 @@ pub enum TElim {
 #[derive(Debug, Clone, PartialEq)]
 pub enum VElim {
     Match(
-        Vec<(PCons, Vec<Name>, Arc<Term>)>,
+        Vec<(PCons, Vec<Sym>, Arc<Term>)>,
         Option<Arc<Term>>,
         Arc<Env>,
     ),
@@ -445,15 +480,21 @@ pub enum VElim {
 impl VElim {
     fn elim(self, v: Val) -> Val {
         match (self, v) {
-            (VElim::App(_, x), Val::Fun(_, _, _, _, body, mut env)) => {
-                body.eval(&Arc::make_mut(&mut env).tap_mut(|v| v.push(x)))
+            (VElim::App(_, x), Val::Fun(_, _, s, _, body, mut env)) => {
+                body.eval(&Arc::make_mut(&mut env).tap_mut(|v| {
+                    v.insert(s, x);
+                }))
             }
 
             (VElim::Match(v, _, mut env), Val::Pair(va, vb))
                 if matches!(v.first(), Some((PCons::Pair(_), _, _))) =>
             {
+                let (s1, s2) = match v.first() {
+                    Some((PCons::Pair(_), v, _)) => (v[0], v[1]),
+                    _ => unreachable!(),
+                };
                 v[0].2
-                    .eval(&Arc::make_mut(&mut env).tap_mut(|v| v.extend([va, vb])))
+                    .eval(&Arc::make_mut(&mut env).tap_mut(|v| v.extend([(s1, va), (s2, vb)])))
             }
 
             (x, Val::Neutral(s, vec)) => Val::Neutral(s, vec.tap_mut(|v| v.push(x))),
@@ -525,7 +566,7 @@ impl TElim {
             TElim::App(i, x) => VElim::App(*i, Arc::new(x.eval(env))),
         }
     }
-    fn zonk_(&mut self, cxt: &Cxt, senv: &SEnv, beta_reduce: bool) -> bool {
+    fn zonk_(&mut self, cxt: &Cxt, qenv: &QEnv, beta_reduce: bool) -> bool {
         match self {
             TElim::Match(v, fallback) => {
                 for (_, vars, t) in v {
@@ -1231,6 +1272,7 @@ struct Cxt {
     metas: Ref<HashMap<Meta, MetaEntry>>,
     zonked_metas: Ref<HashMap<(Meta, bool), Val>>,
     env: SEnv,
+    uquant_stack: Ref<Vec<HashMap<Name, Arc<Val>>>>,
     errors: Errors,
 }
 impl Cxt {
@@ -1253,6 +1295,7 @@ impl Cxt {
             errors: env.qenv.errors.clone(),
             env,
             metas: default(),
+            uquant_stack: default(),
             zonked_metas: default(),
         }
     }
@@ -1267,6 +1310,12 @@ impl Cxt {
     }
     fn size(&self) -> u32 {
         self.env.env.len() as u32
+    }
+    fn push_uquant(&self) {
+        self.uquant_stack.with_mut(|v| v.push(default()));
+    }
+    fn pop_uquant(&self) -> Option<HashMap<Name, Arc<Val>>> {
+        self.uquant_stack.with_mut(|v| v.pop())
     }
     fn lookup(&self, n: Name) -> Option<(Term, Arc<Val>)> {
         // first try locals
@@ -1286,6 +1335,9 @@ impl Cxt {
                     .lookup_def_name(self.def, n)
                     .map(|(d, t)| (Term::Def(d), t.clone()))
             })
+        // .or_else(|| self.uquant_stack.with_mut(|v| v.last_mut().map(|v| v.get(&n).cloned().unwrap_or_else(|| {
+        //     v.insert(n, Arc::new(self.new_meta(Val::Type, self.errors.span)))
+        // }))))
     }
     fn solved_locals(&self) -> Vec<(Sym, Arc<Val>)> {
         self.env
@@ -1351,14 +1403,14 @@ impl Cxt {
     fn env(&self) -> &Env {
         &self.env.env
     }
-    fn qenv(&self) -> &QEnv {
-        &self.env.qenv
+    fn qenv(&self) -> QEnv {
+        self.env.qenv()
     }
     fn senv(&self) -> &SEnv {
         &self.env
     }
-    fn scxt(&self) -> SymCxt {
-        self.env.qenv.scxt
+    fn scxt(&self) -> &SymCxt {
+        &self.env.scxt
     }
 
     fn new_meta(&self, ty: Val, span: Span) -> Val {

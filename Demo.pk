@@ -389,3 +389,5 @@ def it3 : ({a: Type}, a) = do
 
 def pinfer = (a, b: a) => b
 def p_nomatch : (Type, Type) -> (Type, Type) = x => x
+
+def universal : a -> a = x => x
