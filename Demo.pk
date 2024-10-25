@@ -33,10 +33,6 @@ def m6kb = add m5k m1k
 
 def c10 : Eq m10 m10b = refl
 def c100 : Eq m100 m100b = refl
-# these two stack overflow in debug mode, so they're commented out
-# def c5k : Eq m5k m5kb = refl
-# def c6k : Eq m6k m6kb = refl
- #def c5b : Eq[FNat, m5k, m5kc] = Eq.Refl
 
 # eta-expansion
 def e : (f : Type -> Type) -> Eq (x => f x) f = f => refl
@@ -69,11 +65,6 @@ def dup : {A:Type} -> A -> Pair A A
 def id : {A:Type} -> A -> A
  = x => x
 
-# TODO make this fast again
-# def idTest : {A:Type} -> A -> A
-#   = id id id id id id id id id id id id id id id id id id id id
-#   id id id id id id id id id id id id id id id id id id id id
-
 def letTest = do
   let four = add m2 m2
   let five : Nat = suc four
@@ -85,43 +76,6 @@ def letTest = do
 #   let x : Type = Type
 #   let p : Eq x x = refl
 #   p
-
-# TODO make this fast again
-# def pairTest = do
-#   let x0  = dup Type
-#   let x1  = dup x0
-#   let x2  = dup x1
-#   let x3  = dup x2
-#   let x4  = dup x3
-#   let x5  = dup x4
-#   let x6  = dup x5
-#   let x7  = dup x6
-#   let x8  = dup x7
-#   let x9  = dup x8
-#   let x10 = dup x9
-#   let x11 = dup x10
-#   let x12 = dup x11
-#   let x13 = dup x12
-#   let x14 = dup x13
-#   let x15 = dup x14
-#   let x16 = dup x15
-#   let x17 = dup x16
-#   let x18 = dup x17
-#   let x19 = dup x18
-#   let x20 = dup x19
-#   let x21 = dup x20
-#   let x22 = dup x21
-#   let x23 = dup x22
-#   let x24 = dup x23
-#   let x25 = dup x24
-#   let x26 = dup x25
-#   let x27 = dup x26
-#   let x28 = dup x27
-#   let x29 = dup x28
-#   let x30 = dup x29
-#   # exponential time if we change this to x30 :(
-#   x1
-
 
 def Vec : Type -> Nat -> Type
  = A => n => (V : Nat -> Type) -> ({n:_} -> A -> V n -> V (suc n)) -> V zero -> V n
@@ -138,204 +92,6 @@ def vecTest
   =
   (cons U (cons U (cons U (cons U (cons U (cons U (cons U
   (cons U (cons U (cons U (cons U (cons U nil))))))))))))
-
-# def vecTest
-#   =
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-#   (cons U (cons U (cons U (cons U (cons U (cons U
-
-#   nil
-
-#   ))))))))))))))))))))))))))))))
-#   ))))))))))))))))))))))))))))))
-#   ))))))))))))))))))))))))))))))
-#   ))))))))))))))))))))))))))))))
-#   ))))))))))))))))))))))))))))))
-#   ))))))))))))))))))))))))))))))
-#   ))))))))))))))))))))))))))))))
-#   ))))))))))))))))))))))))))))))
-#   ))))))))))))))))))))))))))))))
-#   ))))))))))))))))))))))))))))))
-#   ))))))))))))))))))))))))))))))
-#   ))))))))))))))))))))))))))))))
-#   ))))))))))))))))))))))))))))))
-#   ))))))))))))))))))))))))))))))
-#   ))))))))))))))))))))))))))))))
-#   ))))))))))))))))))))))))))))))
-#   ))))))))))))))))))))))))))))))
-#   ))))))))))))))))))))))))))))))
-#   ))))))))))))))))))))))))))))))
-#   ))))))))))))))))))))))))))))))
-#   ))))))))))))))))))))))))))))))
-#   ))))))))))))))))))))))))))))))
-#   ))))))))))))))))))))))))))))))
-#   ))))))))))))))))))))))))))))))
-#   ))))))))))))))))))))))))))))))
-#   ))))))))))))))))))))))))))))))
-#   ))))))))))))))))))))))))))))))
-#   ))))))))))))))))))))))))))))))
-#   ))))))))))))))))))))))))))))))
-#   ))))))))))))))))))))))))))))))
-#   ))))))))))))))))))))))))))))))
-#   ))))))))))))))))))))))))))))))
 
 
 def pair : (a: Type, a) = (Type -> Type, x => x)
