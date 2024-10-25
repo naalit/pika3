@@ -366,7 +366,7 @@ impl Term {
                     return true;
                 }
             }
-            Term::Fun(_, _, n, aty, body) => {
+            Term::Fun(_, _, _, aty, body) => {
                 aty.zonk_(cxt, qenv, beta_reduce);
                 Arc::make_mut(body).zonk_(cxt, &qenv, beta_reduce);
             }
@@ -1152,7 +1152,7 @@ struct Cxt {
     metas: Ref<HashMap<Meta, MetaEntry>>,
     zonked_metas: Ref<HashMap<(Meta, bool), Val>>,
     env: SEnv,
-    uquant_stack: Ref<Vec<HashMap<Name, Arc<Val>>>>,
+    uquant_stack: Ref<Vec<HashMap<Sym, Arc<Val>>>>,
     errors: Errors,
 }
 impl Cxt {
@@ -1191,7 +1191,7 @@ impl Cxt {
     fn push_uquant(&self) {
         self.uquant_stack.with_mut(|v| v.push(default()));
     }
-    fn pop_uquant(&self) -> Option<HashMap<Name, Arc<Val>>> {
+    fn pop_uquant(&self) -> Option<HashMap<Sym, Arc<Val>>> {
         self.uquant_stack.with_mut(|v| v.pop())
     }
     fn lookup(&self, n: Name) -> Option<(Term, Arc<Val>)> {
@@ -1204,9 +1204,30 @@ impl Cxt {
                     .lookup_def_name(self.def, n)
                     .map(|(d, t)| (Term::Def(d), t.clone()))
             })
-        // .or_else(|| self.uquant_stack.with_mut(|v| v.last_mut().map(|v| v.get(&n).cloned().unwrap_or_else(|| {
-        //     v.insert(n, Arc::new(self.new_meta(Val::Type, self.errors.span)))
-        // }))))
+            .or_else(|| {
+                let (sym, ty) = self
+                    .uquant_stack
+                    .with(|v| {
+                        v.iter()
+                            .rev()
+                            .flatten()
+                            .find(|(s, _)| s.0 == n)
+                            .map(|(s, v)| (*s, v.clone()))
+                    })
+                    .or_else(|| {
+                        self.uquant_stack.with_mut(|v| {
+                            v.last_mut().map(|v| {
+                                let s = self.scxt().bind(n);
+                                // TODO span for the name
+                                let ty =
+                                    Arc::new(self.new_meta(Val::Type, self.errors.span.span()));
+                                v.insert(s, ty.clone());
+                                (s, ty)
+                            })
+                        })
+                    })?;
+                Some((Term::Var(sym), ty))
+            })
     }
     fn solved_locals(&self) -> Vec<(Sym, Arc<Val>)> {
         self.env
@@ -1746,6 +1767,7 @@ impl SPre {
                 )
             }
             Pre::Pi(i, n, paty, body) => {
+                cxt.push_uquant();
                 let aty = paty.check(Val::Type, cxt);
                 let vaty = aty.eval(cxt.env());
                 let (s, cxt) = cxt.bind(*n, vaty.clone());
@@ -1756,8 +1778,14 @@ impl SPre {
                     &cxt,
                     |cxt| body.check(Val::Type, cxt),
                 );
+                let scope = cxt.pop_uquant().unwrap();
                 (
-                    Term::Fun(Pi, *i, s, Box::new(aty), Arc::new(body)),
+                    scope.into_iter().fold(
+                        Term::Fun(Pi, *i, s, Box::new(aty), Arc::new(body)),
+                        |acc, (s, ty)| {
+                            Term::Fun(Pi, Impl, s, Box::new(ty.quote(cxt.qenv())), Arc::new(acc))
+                        },
+                    ),
                     Val::Type,
                 )
             }
