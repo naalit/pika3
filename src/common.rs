@@ -2,8 +2,8 @@ use lsp_types::Url;
 pub use std::borrow::Cow::{self, Borrowed, Owned};
 use std::collections::HashMap;
 use std::path::PathBuf;
+pub use std::sync::Arc;
 use std::{fmt::Display, sync::RwLock};
-pub use std::{num::NonZeroU32, sync::Arc};
 use yansi::Color;
 
 pub use educe::Educe;

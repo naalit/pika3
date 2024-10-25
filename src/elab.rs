@@ -1,9 +1,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU32;
 
-use smallvec::SmallVec;
-use tap::Pipe;
-
 use crate::common::*;
 use crate::parser::{Pre, PrePat, PreStmt, SPre, SPrePat};
 
@@ -115,10 +112,10 @@ pub enum Term {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Sym(Name, u32);
 
-// It would be nice for this to be im::Vector, but that's slower in practice since it's like 5x the stack size...
+// It would be nice for this to be im::HashMap, but that's slower in practice unfortunately. maybe we can make a hybrid or something?
 #[derive(Clone, Debug, PartialEq, Educe)]
 #[educe(Deref, Default)]
-struct Env(im::HashMap<Sym, Arc<Val>>);
+pub struct Env(rustc_hash::FxHashMap<Sym, Arc<Val>>);
 impl Env {
     fn bind(&self, s: Sym, scxt: &SymCxt) -> (Sym, Env) {
         let s2 = scxt.bind(s.0);
@@ -1004,31 +1001,28 @@ struct PMatch {
     tree: PTree,
     body_syms: Vec<Sym>,
     pcxt: PCxt,
-    cxt: Cxt,
-    ty: Val,
-    name: Name,
+    ty: Arc<Val>,
 }
 impl PMatch {
-    fn bind(&self, body: u32, vsym: Sym, cxt: &Cxt) -> Cxt {
+    fn bind(&self, body: u32, cxt: &Cxt) -> Cxt {
         let mut cxt = cxt.clone();
         for (name, sym, ty) in &self.pcxt.bodies[body as usize].vars {
             if *sym == self.pcxt.var {
-                cxt.bind_val(*name, Val::sym(vsym), ty.clone());
+                cxt.bind_val(*name, Val::sym(*sym), ty.clone());
             } else {
                 cxt.bind_raw(*name, *sym, ty.clone());
             }
         }
         for (sym, val) in &self.pcxt.bodies[body as usize].solved_locals {
-            let sym = if *sym == self.pcxt.var { vsym } else { *sym };
             // Make sure the solutions of any solved locals are actually in scope
-            if cxt.can_solve(sym) && val.quote_(&cxt.qenv()).is_ok() {
-                cxt.solve_local(sym, val.clone());
+            if cxt.can_solve(*sym) && val.quote_(&cxt.qenv()).is_ok() {
+                cxt.solve_local(*sym, val.clone());
             }
         }
         cxt
     }
 
-    fn compile(&self, nsym: Sym, bodies: &[Term]) -> Term {
+    fn compile(&self, bodies: &[Term], cxt: &Cxt) -> Term {
         assert_eq!(bodies.len(), self.pcxt.bodies.len());
         if let PTree::Body(0, v, _) = &self.tree {
             assert_eq!(v.len(), 0);
@@ -1048,13 +1042,7 @@ impl PMatch {
             .rev()
         {
             let body = vars.iter().rfold(body.clone(), |acc, (_, s, ty)| {
-                Term::Fun(
-                    Lam,
-                    Expl,
-                    *s,
-                    Box::new(ty.quote(&self.cxt.qenv())),
-                    Arc::new(acc),
-                )
+                Term::Fun(Lam, Expl, *s, Box::new(ty.quote(cxt.qenv())), Arc::new(acc))
             });
             term = Term::App(
                 Box::new(Term::Fun(
@@ -1068,18 +1056,28 @@ impl PMatch {
                 TElim::App(Expl, Box::new(body.clone())),
             );
         }
-        // TODO better way to do this? also why doesn't subst() work???
-        term.eval(&Env(std::iter::once((
-            self.pcxt.var,
-            Arc::new(Val::sym(nsym)),
-        ))
-        .collect()))
-            .quote(self.cxt.qenv())
+        term
     }
 
-    fn new(ty: Option<Val>, branches: &[SPrePat], ocxt: &Cxt) -> PMatch {
-        let (var, cxt_v) = ocxt.bind(ocxt.db.name("_"), Val::Error);
-        let mut cxt = cxt_v.clone();
+    fn new(ty: Option<Val>, branches: &[SPrePat], ocxt: &mut Cxt) -> (Sym, PMatch) {
+        let (name, ty) = branches
+            .first()
+            .map(|p| match p.ipat(&ocxt.db) {
+                IPat::Var(n, None) => (n, ty.unwrap_or_else(|| ocxt.new_meta(Val::Type, p.span()))),
+                IPat::Var(n, Some(paty)) => (
+                    n,
+                    ty.unwrap_or_else(|| paty.check(Val::Type, &ocxt).eval(ocxt.env())),
+                ),
+                IPat::CPat(n, _) => (
+                    n.unwrap_or(ocxt.db.name("_")),
+                    ty.unwrap_or_else(|| ocxt.new_meta(Val::Type, p.span())),
+                ),
+            })
+            .unwrap();
+        let ty = Arc::new(ty);
+
+        let var = ocxt.bind_(name, ty.clone());
+        let mut cxt = ocxt.clone();
 
         let mut pcxt = PCxt {
             bodies: branches
@@ -1102,44 +1100,13 @@ impl PMatch {
             .map(|_| cxt.bind_(cxt.db.name("_"), Val::Error))
             .collect();
 
-        let mut ty = ty;
-        let mut name = None;
-
         let rows: Vec<_> = branches
             .iter()
             .enumerate()
             .map(|(i, p)| {
-                let mut ipat = p.ipat(&cxt.db);
-                // TODO this can be merged with the code in `remove_column()`
-                match &mut ipat {
-                    IPat::Var(n, None) => {
-                        if name.is_none() {
-                            name = Some(*n);
-                        }
-                        if ty.is_none() {
-                            ty = Some(ocxt.new_meta(Val::Type, Span(0, 0)));
-                        }
-                    }
-                    IPat::Var(n, Some(paty)) => {
-                        if name.is_none() {
-                            name = Some(*n);
-                        }
-                        if ty.is_none() {
-                            let aty = paty.check(Val::Type, &cxt).eval(cxt.env());
-                            ty = Some(aty.clone());
-                        }
-                    }
-                    IPat::CPat(n, _) => {
-                        if name.is_none() {
-                            name = *n;
-                        }
-                        if ty.is_none() {
-                            ty = Some(ocxt.new_meta(Val::Type, Span(0, 0)));
-                        }
-                    }
-                };
+                let ipat = p.ipat(&cxt.db);
                 PRow {
-                    cols: vec![(var, Arc::new(ty.clone().unwrap()), ipat)],
+                    cols: vec![(var, ty.clone(), ipat)],
                     assignments: default(),
                     body: i as u32,
                 }
@@ -1148,15 +1115,15 @@ impl PMatch {
 
         let tree = compile_rows(&rows, &mut pcxt, &cxt);
 
-        let name = name.unwrap_or_else(|| cxt.db.name("_"));
-        PMatch {
-            tree,
-            pcxt,
-            body_syms,
-            cxt: cxt_v,
-            ty: ty.unwrap(),
-            name,
-        }
+        (
+            var,
+            PMatch {
+                tree,
+                pcxt,
+                body_syms,
+                ty,
+            },
+        )
     }
 }
 
@@ -1221,9 +1188,6 @@ impl Cxt {
             ),
         }
     }
-    fn size(&self) -> u32 {
-        self.env.env.len() as u32
-    }
     fn push_uquant(&self) {
         self.uquant_stack.with_mut(|v| v.push(default()));
     }
@@ -1259,8 +1223,8 @@ impl Cxt {
             .any(|v| ***v == Val::Neutral(VHead::Sym(sym), default()))
     }
     fn local_val(&self, sym: Sym) -> Option<Arc<Val>> {
-        let val = self.env.env.get(&sym)?.clone();
-        (*val != Val::sym(sym)).then(|| val)
+        let val = self.env.env.get(&sym)?;
+        (**val != Val::sym(sym)).then(|| val.clone())
     }
     fn solve_local(&mut self, sym: Sym, val: Arc<Val>) {
         if self.can_solve(sym) {
@@ -1656,27 +1620,28 @@ fn elab_block(block: &[PreStmt], last_: &SPre, ty: Option<Val>, cxt1: &Cxt) -> (
     let mut cxt = cxt1.clone();
     let mut v = Vec::new();
     for x in block {
-        let (n, t, p, x) = match x {
+        let (vsym, t, p, x) = match x {
             PreStmt::Expr(x) => {
                 let (x, xty) = x.infer(&cxt, true);
-                (cxt.db.name("_"), xty, None, x)
+                let vsym = cxt.bind_(cxt.db.name("_"), xty.clone());
+                (vsym, xty, None, x)
             }
             PreStmt::Let(pat, body) if matches!(&***pat, PrePat::Binder(_, _)) => {
-                let pat = PMatch::new(None, &[pat.clone()], &cxt);
-                let aty = pat.ty.clone();
-                let body = body.check(aty.clone(), &cxt);
-                (pat.name, aty, Some(pat), body)
+                let cxt_start = cxt.clone();
+                let (sym, pat) = PMatch::new(None, &[pat.clone()], &mut cxt);
+                let aty = (*pat.ty).clone();
+                let body = body.check(aty.clone(), &cxt_start);
+                (sym, aty, Some(pat), body)
             }
             PreStmt::Let(pat, body) => {
                 let (body, aty) = body.infer(&cxt, true);
-                let pat = PMatch::new(Some(aty.clone()), &[pat.clone()], &cxt);
-                (pat.name, aty, Some(pat), body)
+                let (sym, pat) = PMatch::new(Some(aty.clone()), &[pat.clone()], &mut cxt);
+                (sym, aty, Some(pat), body)
             }
         };
         let t2 = t.quote(&cxt.qenv());
-        let vsym = cxt.bind_(n, t);
         if let Some(p) = &p {
-            cxt = p.bind(0, vsym, &cxt);
+            cxt = p.bind(0, &cxt);
         }
         v.push((vsym, t2, p, x));
     }
@@ -1684,7 +1649,7 @@ fn elab_block(block: &[PreStmt], last_: &SPre, ty: Option<Val>, cxt1: &Cxt) -> (
     let (last, mut lty) = last_.elab(ty, &cxt);
     let term = v.into_iter().rfold(last, |acc, (s, t, p, x)| {
         let acc = match p {
-            Some(p) => p.compile(s, &[acc]),
+            Some(p) => p.compile(&[acc], &cxt),
             None => acc,
         };
         Term::App(
@@ -1801,26 +1766,19 @@ impl SPre {
             }
             // If no type is given, assume monomorphic lambdas
             Pre::Lam(i, pat, body) => {
-                let pat = PMatch::new(None, &[pat.clone()], cxt);
+                let mut cxt2 = cxt.clone();
+                let (s, pat) = PMatch::new(None, &[pat.clone()], &mut cxt2);
                 let aty = pat.ty.clone();
                 let aty2 = aty.quote(cxt.qenv());
 
-                let (s, cxt2) = cxt.bind(pat.name, aty.clone());
-                let cxt3 = pat.bind(0, s, &cxt2);
+                let cxt3 = pat.bind(0, &cxt2);
                 let (body, rty) = body.infer(&cxt3, true);
                 let rty = rty.quote(&cxt3.qenv());
-                let body = pat.compile(s, &[body]);
-                let rty = pat.compile(s, &[rty]);
+                let body = pat.compile(&[body], &cxt2);
+                let rty = pat.compile(&[rty], &cxt2);
                 (
                     Term::Fun(Lam, *i, s, Box::new(aty2), Arc::new(body)),
-                    Val::Fun(
-                        Pi,
-                        *i,
-                        s,
-                        Arc::new(aty),
-                        Arc::new(rty),
-                        Arc::new(cxt.env().clone()),
-                    ),
+                    Val::Fun(Pi, *i, s, aty, Arc::new(rty), Arc::new(cxt.env().clone())),
                 )
             }
             // Similarly assume non-dependent pair
@@ -1861,14 +1819,14 @@ impl SPre {
         ty.whnf(cxt);
         match (&***self, &ty) {
             (Pre::Lam(i, pat, body), Val::Fun(Pi, i2, _, aty2, _, _)) if i == i2 => {
-                let pat = PMatch::new(Some((**aty2).clone()), &[pat.clone()], cxt);
-
+                let mut cxt = cxt.clone();
+                let (sym, pat) = PMatch::new(Some((**aty2).clone()), &[pat.clone()], &mut cxt);
                 let aty = aty2.quote(cxt.qenv());
-                let (sym, cxt) = cxt.bind(pat.name, aty2.clone());
+
                 let va = Val::Neutral(VHead::Sym(sym), default());
                 let rty = ty.clone().app(va.clone());
-                let cxt = pat.bind(0, sym, &cxt);
-                let body = pat.compile(sym, &[body.check(rty, &cxt)]);
+                let cxt = pat.bind(0, &cxt);
+                let body = pat.compile(&[body.check(rty, &cxt)], &cxt);
                 Term::Fun(Lam, *i, sym, Box::new(aty), Arc::new(body))
             }
             // when checking pair against type, assume sigma
