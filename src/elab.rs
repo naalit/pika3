@@ -1720,7 +1720,7 @@ impl SPre {
     fn infer(&self, cxt: &Cxt, should_insert_metas: bool) -> (Term, Val) {
         with_stack(|| self.infer_(cxt, should_insert_metas))
     }
-    fn infer_(&self, cxt: &Cxt, should_insert_metas: bool) -> (Term, Val) {
+    fn infer_(&self, cxt: &Cxt, mut should_insert_metas: bool) -> (Term, Val) {
         let (s, sty) = match &***self {
             Pre::Var(name) if cxt.db.name("_") == *name => {
                 // hole
@@ -1800,6 +1800,10 @@ impl SPre {
             }
             // If no type is given, assume monomorphic lambdas
             Pre::Lam(i, pat, body) => {
+                let q = !cxt.has_uquant();
+                if q {
+                    cxt.push_uquant();
+                }
                 let mut cxt2 = cxt.clone();
                 let (s, pat) = PMatch::new(None, &[pat.clone()], &mut cxt2);
                 let aty = pat.ty.clone();
@@ -1810,9 +1814,33 @@ impl SPre {
                 let rty = rty.quote(&cxt3.qenv());
                 let body = pat.compile(&[body], &cxt2);
                 let rty = pat.compile(&[rty], &cxt2);
+                let scope = q.then(|| cxt.pop_uquant().unwrap());
+                eprintln!("{:?}", scope);
                 (
-                    Term::Fun(Lam, *i, s, Box::new(aty2), Arc::new(body)),
-                    Val::Fun(Pi, *i, s, aty, Arc::new(rty), Arc::new(cxt.env().clone())),
+                    scope.iter().flatten().fold(
+                        Term::Fun(Lam, *i, s, Box::new(aty2.clone()), Arc::new(body)),
+                        |acc, (s, ty)| {
+                            // Don't introduce a redex, the user clearly intended to make a polymorphic lambda
+                            should_insert_metas = false;
+                            Term::Fun(Lam, Impl, *s, Box::new(ty.quote(cxt.qenv())), Arc::new(acc))
+                        },
+                    ),
+                    scope
+                        .into_iter()
+                        .flatten()
+                        .fold(
+                            Term::Fun(Pi, *i, s, Box::new(aty2), Arc::new(rty)),
+                            |acc, (s, ty)| {
+                                Term::Fun(
+                                    Pi,
+                                    Impl,
+                                    s,
+                                    Box::new(ty.quote(cxt.qenv())),
+                                    Arc::new(acc),
+                                )
+                            },
+                        )
+                        .eval(cxt.env()),
                 )
             }
             // Similarly assume non-dependent pair
