@@ -1188,6 +1188,9 @@ impl Cxt {
             ),
         }
     }
+    fn has_uquant(&self) -> bool {
+        self.uquant_stack.with(|v| !v.is_empty())
+    }
     fn push_uquant(&self) {
         self.uquant_stack.with_mut(|v| v.push(default()));
     }
@@ -1767,7 +1770,10 @@ impl SPre {
                 )
             }
             Pre::Pi(i, n, paty, body) => {
-                cxt.push_uquant();
+                let q = !cxt.has_uquant();
+                if q {
+                    cxt.push_uquant();
+                }
                 let aty = paty.check(Val::Type, cxt);
                 let vaty = aty.eval(cxt.env());
                 let (s, cxt) = cxt.bind(*n, vaty.clone());
@@ -1778,9 +1784,9 @@ impl SPre {
                     &cxt,
                     |cxt| body.check(Val::Type, cxt),
                 );
-                let scope = cxt.pop_uquant().unwrap();
+                let scope = q.then(|| cxt.pop_uquant().unwrap());
                 (
-                    scope.into_iter().fold(
+                    scope.into_iter().flatten().fold(
                         Term::Fun(Pi, *i, s, Box::new(aty), Arc::new(body)),
                         |acc, (s, ty)| {
                             Term::Fun(Pi, Impl, s, Box::new(ty.quote(cxt.qenv())), Arc::new(acc))

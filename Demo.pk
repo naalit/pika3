@@ -147,16 +147,9 @@ def pinfer = (a, b: a) => b
 def p_nomatch : (Type, Type) -> (Type, Type) = x => x
 
 def universal : a -> a = x => x
+# This is `({a:_} -> a -> a) -> ...`; perhaps should be `{a:_} -> (a -> a) -> ...` instead?
 def universal2 = (f : a -> a) => f pinfer
-# : `val universal3 : ({a: Type} -> a -> a) -> {a: Type} -> a -> a`
-# which is kind of weird. but it does work. i'm not really sure what to think of this - it does make sense to quantify over the whole function, but that's not easy to do - could also make sense to give an error
 def universal3 : (a -> a) -> a -> a = f => x => x
-# similarly
-# : `val universal4 : ({a: Type} -> a -> a) -> ({a: Type} -> a -> a)`
-# which is of course exactly the same lol
 def universal4 : (a -> a) -> (a -> a) = f => f
-# and `val universal5 : {a: Type} -> ({a: Type} -> a -> a, a) -> a`
-# which... well, this does still compile... but this is probably the least intuitive, since the outer `a` literally does scope over the inner `a`
 def universal5 : (a -> a, a) -> a = (f, x) => f x
-# and here `val make_pair : {a: Type} -> a -> {b: Type} -> b -> (a, b)`. which is neat! and probably what we want - we usually tuple, so if we're currying we're doing it for a reason
 def make_pair : a -> b -> (a, b) = a => b => (a, b)
