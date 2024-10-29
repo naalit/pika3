@@ -49,7 +49,7 @@ def q2 : (a : _) -> (b : _) -> a -> b -> _ = _ => _ => x => y => y
 # implicit parameters
 def i1 = {Type} -> {b: Type} -> b -> b
 def i2 : i1 -> Nat = f => f {Nat} {Nat} one
-def i3 : i1 -> Nat = f => f one # note that we can't find a solution for the first implicit parameter here! this will be an error at some point
+def i3 : i1 -> Nat = f => f {Type} one # we can't find a solution for the first implicit parameter here, it needs to be explicit
 def i4 : {a : Type} -> a -> a = x => x
 
 # inferred lambdas
@@ -159,6 +159,14 @@ def recursive : a -> a = x => recursive x
 def takes_fun : a -> (a -> a) -> a = x => f => f x
 def ttttest = (x : Nat) => takes_fun x
 def recursive_inferred = (x : Nat) => takes_fun x recursive_inferred
-def recursive_inferred_2 = (x : Nat) => recursive_inferred_2 x # we can't actually infer the return type here
+# def recursive_inferred_2 = (x : Nat) => recursive_inferred_2 x # we can't actually infer the return type here
 
 def third_i : (a, b, c) -> c = (_, _, x) => x
+
+def unclear = x => x
+def solve1 = unclear one
+# def solve2 = unclear Type
+
+# mutual recursion! the first definition knows the argument type, the second knows the return type
+def mutual1 = (x: Nat) => mutual2 x
+def mutual2 = y => mutual1 y -> Type
