@@ -160,3 +160,5 @@ def takes_fun : a -> (a -> a) -> a = x => f => f x
 def ttttest = (x : Nat) => takes_fun x
 def recursive_inferred = (x : Nat) => takes_fun x recursive_inferred
 def recursive_inferred_2 = (x : Nat) => recursive_inferred_2 x # we can't actually infer the return type here
+
+def third_i : (a, b, c) -> c = (_, _, x) => x

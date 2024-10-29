@@ -1185,7 +1185,7 @@ struct Cxt {
     metas: Ref<HashMap<Meta, MetaEntry>>,
     zonked_metas: Ref<HashMap<(Meta, bool), Val>>,
     env: SEnv,
-    uquant_stack: Ref<Vec<HashMap<Sym, Arc<Val>>>>,
+    uquant_stack: Ref<Vec<Vec<(Sym, Arc<Val>)>>>,
     errors: Errors,
 }
 impl Cxt {
@@ -1232,7 +1232,7 @@ impl Cxt {
     fn push_uquant(&self) {
         self.uquant_stack.with_mut(|v| v.push(default()));
     }
-    fn pop_uquant(&self) -> Option<HashMap<Sym, Arc<Val>>> {
+    fn pop_uquant(&self) -> Option<Vec<(Sym, Arc<Val>)>> {
         self.uquant_stack.with_mut(|v| v.pop())
     }
     fn lookup(&self, n: Name) -> Option<(Term, Arc<Val>)> {
@@ -1265,11 +1265,12 @@ impl Cxt {
                     .or_else(|| {
                         self.uquant_stack.with_mut(|v| {
                             v.last_mut().map(|v| {
+                                assert!(!v.iter().any(|(s, _)| s.0 == n));
                                 let s = self.scxt().bind(n);
                                 // TODO span for the name
                                 let ty =
                                     Arc::new(self.new_meta(Val::Type, self.errors.span.span()));
-                                v.insert(s, ty.clone());
+                                v.push((s, ty.clone()));
                                 (s, ty)
                             })
                         })
@@ -1876,7 +1877,7 @@ impl SPre {
                 );
                 let scope = q.then(|| cxt.pop_uquant().unwrap());
                 (
-                    scope.into_iter().flatten().fold(
+                    scope.into_iter().flatten().rfold(
                         Term::Fun(Pi, *i, s, Box::new(aty), Arc::new(body)),
                         |acc, (s, ty)| {
                             Term::Fun(Pi, Impl, s, Box::new(ty.quote(cxt.qenv())), Arc::new(acc))
@@ -1906,7 +1907,7 @@ impl SPre {
                 let rty = pat.compile(&[rty], &cxt2);
                 let scope = q.then(|| cxt.pop_uquant().unwrap());
                 (
-                    scope.iter().flatten().fold(
+                    scope.iter().flatten().rfold(
                         Term::Fun(Lam, *i, s, Box::new(aty2.clone()), Arc::new(body)),
                         |acc, (s, ty)| {
                             // Don't introduce a redex, the user clearly intended to make a polymorphic lambda
