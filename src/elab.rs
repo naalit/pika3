@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU32;
 
+use tap::Pipe;
+
 use crate::common::*;
 use crate::parser::{Pre, PrePat, PreStmt, SPre, SPrePat};
 
@@ -29,7 +31,11 @@ pub fn elab_module(file: File, def: Def, db: &DB) -> ModuleElabResult {
             }
             for (m, val) in elab.solved_metas {
                 let mval = Val::Neutral(VHead::Meta(m), default()).zonk(&root_cxt, true);
-                if !mval.unify(&val, span, &root_cxt) {
+                if !mval
+                    .clone()
+                    .glued()
+                    .unify((*val).clone().glued(), span, &root_cxt)
+                {
                     errors.push(Error {
                         secondary: if let Some(s) = source_map.get(&m) {
                             vec![Label {
@@ -112,7 +118,7 @@ pub fn elab_def(def: Def, db: &DB) -> Option<DefElabResult> {
             let vty = ty.eval(&cxt.env());
             (val.check(vty.clone(), &cxt), vty)
         }
-        None => val.infer(&cxt, true),
+        None => val.infer(&cxt, true).pipe(|(x, y)| (x, y.as_small())),
     }) {
         (Some(val), ty)
     } else if let Some(ty) = ty {
@@ -130,7 +136,11 @@ pub fn elab_def(def: Def, db: &DB) -> Option<DefElabResult> {
     let ty = ty.zonk(&cxt, true);
     if !solved_ty {
         let ety = Val::Neutral(VHead::Meta(Meta(def, 0)), default()).zonk(&cxt, true);
-        if !ty.unify(&ety, pre.name.span(), &cxt) {
+        if !ty
+            .clone()
+            .glued()
+            .unify(ety.clone().glued(), pre.name.span(), &cxt)
+        {
             cxt.err(
                 "definition body has type "
                     + ty.pretty(&cxt.db)
@@ -450,7 +460,7 @@ impl Term {
                 Some(t) => {
                     *self = t.quote(&default());
                     // inline further metas in the solution
-                    // self.zonk_(cxt, senv);
+                    // self.zonk_(cxt, qenv, beta_reduce);
                     // (should be unnecessary with pre-zonked meta solutions)
                     // (however, that only holds as long as we don't zonk until the end of the definition)
                     return true;
@@ -674,9 +684,7 @@ fn split_ty(
     mut names: impl Iterator<Item = Option<Name>>,
     cxt: &mut Cxt,
 ) -> Option<Vec<PConsTy>> {
-    let mut ty = ty.clone();
-    ty.whnf(cxt);
-    match &ty {
+    match &ty.clone().glued().whnf(cxt) {
         Val::Fun(Sigma(n2), i, n1, aty, _, _) => {
             // TODO better system for names accessible in types in patterns
             // let n1 = names.next().flatten().unwrap_or(cxt.db.inaccessible(*n1));
@@ -857,7 +865,7 @@ impl PRow {
                 }
                 IPat::Var(n, Some(paty)) => {
                     let aty = paty.check(Val::Type, cxt).eval(cxt.env());
-                    if !aty.unify(&t, pat.1, cxt) {
+                    if !aty.clone().glued().unify((*t).clone().glued(), pat.1, cxt) {
                         cxt.err(
                             Doc::start("mismatched types: pattern has type ")
                                 + aty.pretty(&cxt.db)
@@ -969,7 +977,13 @@ fn compile_rows(rows: &[PRow], pcxt: &mut PCxt, cxt: &Cxt) -> PTree {
                     .iter()
                     .zip(&row.assignments)
                     // TODO better span?
-                    .all(|((n1, _, t1), (n2, _, t2))| *n1 == *n2 && t1.unify(t2, pcxt.span, cxt))
+                    .all(|((n1, _, t1), (n2, _, t2))| {
+                        *n1 == *n2
+                            && (**t1)
+                                .clone()
+                                .glued()
+                                .unify((**t2).clone().glued(), pcxt.span, cxt)
+                    })
             {
                 panic!("mismatched bindings for body {}", row.body)
             }
@@ -984,9 +998,8 @@ fn compile_rows(rows: &[PRow], pcxt: &mut PCxt, cxt: &Cxt) -> PTree {
                         (*n, *s, {
                             // Needed to account for locals solved during pattern compilation
                             // TODO but those locals can be in the spine ??? do we even need this?
-                            let mut t2 = (**t).clone();
-                            t2.whnf(cxt);
-                            Arc::new(t2)
+                            // Arc::new((**t).clone().glued().whnf(cxt).clone())
+                            t.clone()
                         })
                     })
                     .collect(),
@@ -1177,17 +1190,20 @@ impl PMatch {
         term
     }
 
-    fn new(ty: Option<Val>, branches: &[SPrePat], ocxt: &mut Cxt) -> (Sym, PMatch) {
+    fn new(ty: Option<GVal>, branches: &[SPrePat], ocxt: &mut Cxt) -> (Sym, PMatch) {
         let (name, ty) = branches
             .first()
             .map(|p| match p.ipat(&ocxt.db).0 {
                 IPat::Var(n, None) => (
                     n,
-                    ty.unwrap_or_else(|| ocxt.new_meta(Val::Type, MetaSource::TypeOf(n), p.span())),
+                    ty.unwrap_or_else(|| {
+                        ocxt.new_meta(Val::Type, MetaSource::TypeOf(n), p.span())
+                            .glued()
+                    }),
                 ),
                 IPat::Var(n, Some(paty)) => (
                     n,
-                    ty.unwrap_or_else(|| paty.check(Val::Type, &ocxt).eval(ocxt.env())),
+                    ty.unwrap_or_else(|| paty.check(Val::Type, &ocxt).eval(ocxt.env()).glued()),
                 ),
                 IPat::CPat(n, _) => (
                     n.unwrap_or(ocxt.db.name("_")),
@@ -1197,11 +1213,12 @@ impl PMatch {
                             MetaSource::TypeOf(n.unwrap_or(ocxt.db.name("_"))),
                             p.span(),
                         )
+                        .glued()
                     }),
                 ),
             })
             .unwrap();
-        let ty = Arc::new(ty);
+        let ty = Arc::new(ty.as_small());
 
         let var = ocxt.bind_(name, ty.clone());
         let mut cxt = ocxt.clone();
@@ -1620,7 +1637,12 @@ impl UnfoldState {
 impl VElim {
     fn unify_(&self, other: &VElim, span: Span, cxt: &Cxt, mode: UnfoldState) -> bool {
         match (self, other) {
-            (VElim::App(_, x), VElim::App(_, y)) => x.unify_(y, span, cxt, mode),
+            (VElim::App(_, x), VElim::App(_, y)) => {
+                (**x)
+                    .clone()
+                    .glued()
+                    .unify_((**y).clone().glued(), span, cxt, mode)
+            }
             (
                 VElim::Match(branches1, fallback1, env1),
                 VElim::Match(branches2, fallback2, env2),
@@ -1641,13 +1663,21 @@ impl VElim {
                         env2.0
                             .insert(s2, Arc::new(Val::Neutral(VHead::Sym(s), default())));
                     }
-                    if !t1.eval(&env1).unify_(&t2.eval(&env2), span, cxt, mode) {
+                    if !t1
+                        .eval(&env1)
+                        .glued()
+                        .unify_(t2.eval(&env2).glued(), span, cxt, mode)
+                    {
                         return false;
                     }
                 }
                 if let Some(fallback1) = fallback1 {
                     let fallback2 = fallback2.as_ref().unwrap();
-                    if !fallback1.eval(env1).unify(&fallback2.eval(env2), span, cxt) {
+                    if !fallback1
+                        .eval(env1)
+                        .glued()
+                        .unify(fallback2.eval(env2).glued(), span, cxt)
+                    {
                         return false;
                     }
                 }
@@ -1657,19 +1687,35 @@ impl VElim {
         }
     }
 }
+#[derive(Clone, Debug)]
+struct GVal(Val, Val);
+impl GVal {
+    fn whnf(&mut self, cxt: &Cxt) -> &Val {
+        self.1.whnf_(cxt);
+        &self.1
+    }
+    fn as_small(self) -> Val {
+        self.0
+    }
+    fn as_big(self) -> Val {
+        self.1
+    }
+    fn small(&self) -> &Val {
+        &self.0
+    }
+    fn big(&self) -> &Val {
+        &self.1
+    }
+    fn map(self, mut f: impl FnMut(Val) -> Val) -> Self {
+        GVal(f(self.0), f(self.1))
+    }
+}
+impl From<Val> for GVal {
+    fn from(value: Val) -> Self {
+        value.glued()
+    }
+}
 impl Val {
-    fn cow_whnf<'a>(s: Cow<'a, Val>, cxt: &Cxt) -> Cow<'a, Val> {
-        match s.maybe_whnf(cxt) {
-            Some(s) => Owned(s),
-            None => s,
-        }
-    }
-    fn as_whnf(&self, cxt: &Cxt) -> Cow<Val> {
-        match self.maybe_whnf(cxt) {
-            Some(s) => Owned(s),
-            None => Borrowed(self),
-        }
-    }
     fn and_whnf(self, cxt: &Cxt) -> Val {
         match self.maybe_whnf(cxt) {
             Some(s) => s,
@@ -1745,23 +1791,28 @@ impl Val {
             _ => None,
         }
     }
-    fn whnf(&mut self, cxt: &Cxt) {
+    fn glued(self) -> GVal {
+        GVal(self.clone(), self)
+    }
+    fn whnf_(&mut self, cxt: &Cxt) {
         if let Some(s) = self.maybe_whnf(cxt) {
             *self = s;
         }
         return;
     }
-    fn unify(&self, other: &Val, span: Span, cxt: &Cxt) -> bool {
+}
+impl GVal {
+    fn unify(self, other: GVal, span: Span, cxt: &Cxt) -> bool {
         self.unify_(other, span, cxt, UnfoldState::Maybe)
     }
-    fn unify_(&self, other: &Val, span: Span, cxt: &Cxt, mut mode: UnfoldState) -> bool {
-        let (mut a, mut b) = (Borrowed(self), Borrowed(other));
+    fn unify_(self, other: GVal, span: Span, cxt: &Cxt, mut mode: UnfoldState) -> bool {
+        let (mut a, mut b) = (self, other);
         loop {
             if mode == UnfoldState::Yes {
-                a = Val::cow_whnf(a, cxt);
-                b = Val::cow_whnf(b, cxt);
+                a.whnf(cxt);
+                b.whnf(cxt);
             }
-            break match (&*a, &*b) {
+            break match (a.big(), b.big()) {
                 (Val::Error, _) | (_, Val::Error) => true,
                 (Val::Type, Val::Type) => true,
                 (Val::Neutral(s, sp), Val::Neutral(s2, sp2))
@@ -1774,13 +1825,20 @@ impl Val {
                 {
                     true
                 }
-                (Val::Neutral(VHead::Meta(m), spine), b)
-                | (b, Val::Neutral(VHead::Meta(m), spine))
-                    if !matches!(b, Val::Neutral(VHead::Meta(m2), _) if m2 == m)
+                (Val::Neutral(VHead::Meta(m), spine), _)
+                    if !matches!(b.big(), Val::Neutral(VHead::Meta(m2), _) if m2 == m)
                         && spine.iter().all(|x| matches!(x, VElim::App(_, _)))
                         && cxt.meta_val(*m).is_none() =>
                 {
-                    cxt.solve_meta(*m, spine, b.clone(), Some(span));
+                    cxt.solve_meta(*m, spine, b.small().clone(), Some(span));
+                    true
+                }
+                (_, Val::Neutral(VHead::Meta(m), spine))
+                    if !matches!(a.big(), Val::Neutral(VHead::Meta(m2), _) if m2 == m)
+                        && spine.iter().all(|x| matches!(x, VElim::App(_, _)))
+                        && cxt.meta_val(*m).is_none() =>
+                {
+                    cxt.solve_meta(*m, spine, a.small().clone(), Some(span));
                     true
                 }
                 (Val::Neutral(_, _), _) | (_, Val::Neutral(_, _)) if mode == UnfoldState::Maybe => {
@@ -1792,11 +1850,15 @@ impl Val {
                 {
                     let s = cxt.scxt().bind(n1.0);
                     let arg = Val::Neutral(VHead::Sym(s), default());
-                    if !aty.unify_(aty2, span, cxt, mode) {
+                    if !(**aty)
+                        .clone()
+                        .glued()
+                        .unify_((**aty2).clone().glued(), span, cxt, mode)
+                    {
                         false
                     } else {
-                        a = Owned(a.into_owned().app(arg.clone()));
-                        b = Owned(b.into_owned().app(arg));
+                        a = a.as_big().app(arg.clone()).glued();
+                        b = b.as_big().app(arg).glued();
                         mode = UnfoldState::Maybe;
                         continue;
                     }
@@ -1806,8 +1868,8 @@ impl Val {
                 (Val::Fun(Lam, _, n, _, _, _), _) | (_, Val::Fun(Lam, _, n, _, _, _)) => {
                     let s = cxt.scxt().bind(n.0);
                     let arg = Val::Neutral(VHead::Sym(s), default());
-                    a = Owned(a.into_owned().app(arg.clone()));
-                    b = Owned(b.into_owned().app(arg));
+                    a = a.as_big().app(arg.clone()).glued();
+                    b = b.as_big().app(arg).glued();
                     continue;
                 }
                 (_, _) => false,
@@ -1817,31 +1879,30 @@ impl Val {
 }
 
 // don't call this if checking against an implicit lambda
-fn insert_metas(term: Term, mut ty: Val, cxt: &Cxt, span: Span) -> (Term, Val) {
-    ty.whnf(cxt);
-    match &ty {
+fn insert_metas(term: Term, mut ty: GVal, cxt: &Cxt, span: Span) -> (Term, GVal) {
+    match ty.whnf(cxt) {
         Val::Fun(Pi, Impl, n, aty, _, _) => {
             let m = cxt.new_meta((**aty).clone(), MetaSource::ImpArg(n.0), span);
             let term = Term::App(
                 Box::new(term),
                 TElim::App(Impl, Box::new(m.quote(&cxt.qenv()))),
             );
-            let ty = ty.app(m);
+            let ty = ty.map(|x| x.app(m.clone()));
             insert_metas(term, ty, cxt, span)
         }
         _ => (term, ty),
     }
 }
 
-fn elab_block(block: &[PreStmt], last_: &SPre, ty: Option<Val>, cxt1: &Cxt) -> (Term, Val) {
+fn elab_block(block: &[PreStmt], last_: &SPre, ty: Option<GVal>, cxt1: &Cxt) -> (Term, Val) {
     let mut cxt = cxt1.clone();
     let mut v = Vec::new();
     for x in block {
         let (vsym, t, p, x) = match x {
             PreStmt::Expr(x) => {
                 let (x, xty) = x.infer(&cxt, true);
-                let vsym = cxt.bind_(cxt.db.name("_"), xty.clone());
-                (vsym, xty, None, x)
+                let vsym = cxt.bind_(cxt.db.name("_"), xty.small().clone());
+                (vsym, xty.as_small(), None, x)
             }
             PreStmt::Let(pat, body) if matches!(&***pat, PrePat::Binder(_, _)) => {
                 let cxt_start = cxt.clone();
@@ -1853,7 +1914,7 @@ fn elab_block(block: &[PreStmt], last_: &SPre, ty: Option<Val>, cxt1: &Cxt) -> (
             PreStmt::Let(pat, body) => {
                 let (body, aty) = body.infer(&cxt, true);
                 let (sym, pat) = PMatch::new(Some(aty.clone()), &[pat.clone()], &mut cxt);
-                (sym, aty, Some(pat), body)
+                (sym, aty.as_small(), Some(pat), body)
             }
         };
         let t2 = t.quote(&cxt.qenv());
@@ -1863,7 +1924,8 @@ fn elab_block(block: &[PreStmt], last_: &SPre, ty: Option<Val>, cxt1: &Cxt) -> (
         v.push((vsym, t2, p, x));
     }
     let explicit_ty = ty.is_some();
-    let (last, mut lty) = last_.elab(ty, &cxt);
+    let (last, lty) = last_.elab(ty, &cxt);
+    let mut lty = lty.as_small();
     let term = v.into_iter().rfold(last, |acc, (s, t, p, x)| {
         let acc = match p {
             Some(p) => p.compile(&[acc], &cxt),
@@ -1900,7 +1962,7 @@ fn elab_block(block: &[PreStmt], last_: &SPre, ty: Option<Val>, cxt1: &Cxt) -> (
 
 impl SPre {
     // Helper to delegate to infer or check
-    fn elab(&self, ty: Option<Val>, cxt: &Cxt) -> (Term, Val) {
+    fn elab(&self, ty: Option<GVal>, cxt: &Cxt) -> (Term, GVal) {
         match ty {
             Some(ty) => {
                 let s = self.check(ty.clone(), cxt);
@@ -1910,10 +1972,10 @@ impl SPre {
         }
     }
 
-    fn infer(&self, cxt: &Cxt, should_insert_metas: bool) -> (Term, Val) {
+    fn infer(&self, cxt: &Cxt, should_insert_metas: bool) -> (Term, GVal) {
         with_stack(|| self.infer_(cxt, should_insert_metas))
     }
-    fn infer_(&self, cxt: &Cxt, mut should_insert_metas: bool) -> (Term, Val) {
+    fn infer_(&self, cxt: &Cxt, mut should_insert_metas: bool) -> (Term, GVal) {
         let (s, sty) = match &***self {
             Pre::Var(name) if cxt.db.name("_") == *name => {
                 // hole
@@ -1932,8 +1994,7 @@ impl SPre {
             },
             Pre::App(fs, x, i) => {
                 let (mut f, mut fty) = fs.infer(cxt, *i == Expl);
-                fty.whnf(cxt);
-                let aty = match &fty {
+                let aty = match fty.whnf(cxt) {
                     Val::Error => Val::Error,
                     Val::Fun(Pi, i2, _, aty, _, _) if i == i2 => (**aty).clone(),
                     Val::Fun(Pi, _, _, _, _, _) => {
@@ -1941,12 +2002,12 @@ impl SPre {
                             "wrong function type: expected "
                                 + Doc::start(*i)
                                 + " function but got "
-                                + fty.pretty_at(cxt),
+                                + fty.small().pretty_at(cxt),
                             fs.span(),
                         );
                         // prevent .app() from panicking
                         f = Term::Error;
-                        fty = Val::Error;
+                        fty = Val::Error.glued();
                         Val::Error
                     }
                     Val::Neutral(VHead::Meta(m), spine) if cxt.meta_val(*m).is_none() => {
@@ -1988,14 +2049,16 @@ impl SPre {
                             ),
                             Some(self.span()),
                         );
-                        fty.zonk(cxt, true);
                         m1
                     }
                     _ => {
-                        cxt.err("not a function type: " + fty.pretty_at(cxt), fs.span());
+                        cxt.err(
+                            "not a function type: " + fty.small().pretty_at(cxt),
+                            fs.span(),
+                        );
                         // prevent .app() from panicking
                         f = Term::Error;
-                        fty = Val::Error;
+                        fty = Val::Error.glued();
                         Val::Error
                     }
                 };
@@ -2003,7 +2066,7 @@ impl SPre {
                 let vx = x.eval(cxt.env());
                 (
                     Term::App(Box::new(f), TElim::App(*i, Box::new(x))),
-                    fty.app(vx),
+                    fty.as_small().app(vx),
                 )
             }
             Pre::Pi(i, n, paty, body) => {
@@ -2048,7 +2111,7 @@ impl SPre {
 
                 let cxt3 = pat.bind(0, &cxt2);
                 let (body, rty) = body.infer(&cxt3, true);
-                let rty = rty.quote(&cxt3.qenv());
+                let rty = rty.small().quote(&cxt3.qenv());
                 let body = pat.compile(&[body], &cxt2);
                 let rty = pat.compile(&[rty], &cxt2);
                 let scope = q.then(|| cxt.pop_uquant().unwrap());
@@ -2082,10 +2145,10 @@ impl SPre {
             // Similarly assume non-dependent pair
             Pre::Sigma(i, None, a, None, b) => {
                 let (a, aty) = a.infer(cxt, true);
-                let aty = Arc::new(aty);
+                let aty = Arc::new(aty.as_small());
                 let (s, cxt) = cxt.bind(cxt.db.name("_"), aty.clone());
                 let (b, bty) = b.infer(&cxt, true);
-                let bty = bty.quote(cxt.qenv());
+                let bty = bty.small().quote(cxt.qenv());
                 (
                     Term::Pair(Box::new(a), Box::new(b)),
                     Val::Fun(
@@ -2106,6 +2169,7 @@ impl SPre {
             Pre::Type => (Term::Type, Val::Type),
             Pre::Error => (Term::Error, Val::Error),
         };
+        let sty = sty.glued();
         if should_insert_metas {
             insert_metas(s, sty, cxt, self.span())
         } else {
@@ -2113,16 +2177,18 @@ impl SPre {
         }
     }
 
-    fn check(&self, mut ty: Val, cxt: &Cxt) -> Term {
-        ty.whnf(cxt);
-        match (&***self, &ty) {
+    fn check(&self, ty: impl Into<GVal>, cxt: &Cxt) -> Term {
+        let mut ty = ty.into();
+        match (&***self, ty.whnf(cxt)) {
             (Pre::Lam(i, pat, body), Val::Fun(Pi, i2, _, aty2, _, _)) if i == i2 => {
                 let mut cxt = cxt.clone();
-                let (sym, pat) = PMatch::new(Some((**aty2).clone()), &[pat.clone()], &mut cxt);
+                let (sym, pat) =
+                    PMatch::new(Some((**aty2).clone().glued()), &[pat.clone()], &mut cxt);
                 let aty = aty2.quote(cxt.qenv());
 
                 let va = Val::Neutral(VHead::Sym(sym), default());
-                let rty = ty.clone().app(va.clone());
+                // TODO why doesn't as_small() work here
+                let rty = ty.as_big().app(va.clone());
                 let cxt = pat.bind(0, &cxt);
                 let body = pat.compile(&[body.check(rty, &cxt)], &cxt);
                 Term::Fun(Lam, *i, sym, Box::new(aty), Arc::new(body))
@@ -2140,7 +2206,7 @@ impl SPre {
             (Pre::Sigma(i, None, a, None, b), Val::Fun(Sigma(_), i2, _, aty, _, _)) if i == i2 => {
                 let a = a.check((**aty).clone(), cxt);
                 let va = a.eval(&cxt.env());
-                let rty = ty.app(va);
+                let rty = ty.as_small().app(va);
                 let b = b.check(rty, cxt);
                 Term::Pair(Box::new(a), Box::new(b))
             }
@@ -2152,7 +2218,7 @@ impl SPre {
                 // don't let them access the name in the term (shadowing existing names would be unintuitive)
                 let n = cxt.db.inaccessible(n.0);
                 let (sym, cxt) = cxt.bind(n, aty.clone());
-                let rty = ty.app(Val::Neutral(VHead::Sym(sym), default()));
+                let rty = ty.as_small().app(Val::Neutral(VHead::Sym(sym), default()));
                 let body = self.check(rty, &cxt);
                 Term::Fun(Lam, Impl, sym, Box::new(aty2), Arc::new(body))
             }
@@ -2162,19 +2228,19 @@ impl SPre {
                     .new_meta((**aty).clone(), MetaSource::ImpArg(n.0), self.span())
                     .quote(&cxt.qenv());
                 let va = a.eval(&cxt.env());
-                let rty = ty.app(va);
+                let rty = ty.as_small().app(va);
                 let b = self.check(rty, &cxt);
                 Term::Pair(Box::new(a), Box::new(b))
             }
 
             (_, _) => {
-                let (s, sty) = self.infer(cxt, !matches!(ty, Val::Fun(Pi, Impl, _, _, _, _)));
-                if !ty.unify(&sty, self.span(), cxt) {
+                let (s, sty) = self.infer(cxt, !matches!(ty.big(), Val::Fun(Pi, Impl, _, _, _, _)));
+                if !ty.clone().unify(sty.clone(), self.span(), cxt) {
                     cxt.err(
                         "could not match types: expected "
-                            + ty.zonk(cxt, true).pretty_at(cxt)
+                            + ty.small().zonk(cxt, true).pretty_at(cxt)
                             + ", found "
-                            + sty.zonk(cxt, true).pretty_at(cxt),
+                            + sty.small().zonk(cxt, true).pretty_at(cxt),
                         self.span(),
                     );
                 }
