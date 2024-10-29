@@ -147,7 +147,6 @@ def pinfer = (a, b: a) => b
 def p_nomatch : (Type, Type) -> (Type, Type) = x => x
 
 def universal : a -> a = x => x
-# This is `({a:_} -> a -> a) -> ...`; perhaps should be `{a:_} -> (a -> a) -> ...` instead?
 def universal2 = (f : {a:_} -> a -> a) => f pinfer
 def universal3 : (a -> a) -> a -> a = f => x => x
 def universal4 : (a -> a) -> (a -> a) = f => f
@@ -155,3 +154,9 @@ def universal5 : (a -> a, a) -> a = (f, x) => f x
 def universal6 = (x : a) => x
 def universal7 = (f : a -> a) => (x : a) => f x
 def make_pair : a -> b -> (a, b) = a => b => (a, b)
+
+def recursive : a -> a = x => recursive x
+def takes_fun : a -> (a -> a) -> a = x => f => f x
+def ttttest = (x : Nat) => takes_fun x
+def recursive_inferred = (x : Nat) => takes_fun x recursive_inferred
+def recursive_inferred_2 = (x : Nat) => recursive_inferred_2 x # we can't actually infer the return type here

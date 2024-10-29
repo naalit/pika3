@@ -184,13 +184,15 @@ impl DB {
         self.idefs.intern(&DefLoc::Crate(name))
     }
 
-    pub fn lookup_def_name(&self, at: Def, name: Name) -> Option<(Def, Arc<Val>)> {
+    /// If the Option<type> is None, then the definition is recursive and we need a meta
+    pub fn lookup_def_name(&self, at: Def, name: Name) -> Option<(Def, Option<Arc<Val>>)> {
         let mut at = at;
         loop {
             let def = self.idefs.intern(&DefLoc::Child(at, name));
             match self.elab.def_type(def, self) {
-                Some(t) => break Some((def, t)),
-                None => match self.idefs.get(at).parent() {
+                Ok(t) => break Some((def, Some(t))),
+                Err(DefElabError::Recursive) => break Some((def, None)),
+                Err(DefElabError::NotFound) => match self.idefs.get(at).parent() {
                     Some(a) => {
                         at = a;
                         continue;
@@ -281,16 +283,24 @@ struct CacheEntry {
     checked_revision: u64,
 }
 
+pub enum DefElabError {
+    NotFound,
+    Recursive,
+}
+
 #[derive(Clone, Default)]
 pub struct ElabCache {
     cache: Ref<HashMap<Def, CacheEntry>>,
     current_deps: Ref<HashSet<Query>>,
+    in_progress: Ref<HashSet<Def>>,
     revision: u64,
 }
 impl ElabCache {
     fn recompute(&self, key: Def, db: &DB) {
         let stored = self.current_deps.take();
         // TODO what's the right thing to do with defs that don't exist (this returns None)?
+        assert!(!self.in_progress.with(|s| s.contains(&key)));
+        self.in_progress.with_mut(|s| s.insert(key));
         if let Some(result) = crate::elab::elab_def(key, db) {
             let dependencies = self.current_deps.set(stored);
             self.cache.with_mut(|c| {
@@ -305,6 +315,7 @@ impl ElabCache {
                 )
             });
         }
+        self.in_progress.with_mut(|s| s.remove(&key));
     }
 
     fn check_valid(&self, key: Def, db: &DB) -> bool {
@@ -388,17 +399,26 @@ impl ElabCache {
             .with_mut(|m| m.retain(|k, _| db.def_file(*k).0 != f))
     }
 
-    pub fn def_value(&self, key: Def, db: &DB) -> Option<DefElabResult> {
+    pub fn def_value(&self, key: Def, db: &DB) -> Result<DefElabResult, DefElabError> {
+        if self.in_progress.with(|s| s.contains(&key)) {
+            return Err(DefElabError::Recursive);
+        }
         self.current_deps.with_mut(|a| a.insert(Query::DefVal(key)));
         self.maybe_recompute(key.clone(), db);
-        self.cache.with(|c| c.get(&key).map(|e| e.result.clone()))
+        self.cache
+            .with(|c| c.get(&key).map(|e| e.result.clone()))
+            .ok_or(DefElabError::NotFound)
     }
 
-    pub fn def_type(&self, key: Def, db: &DB) -> Option<Arc<Val>> {
+    pub fn def_type(&self, key: Def, db: &DB) -> Result<Arc<Val>, DefElabError> {
+        if self.in_progress.with(|s| s.contains(&key)) {
+            return Err(DefElabError::Recursive);
+        }
         self.current_deps
             .with_mut(|a| a.insert(Query::DefType(key)));
         self.maybe_recompute(key.clone(), db);
         self.cache
             .with(|c| c.get(&key).map(|e| e.result.def.ty.clone()))
+            .ok_or(DefElabError::NotFound)
     }
 }

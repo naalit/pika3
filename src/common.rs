@@ -90,6 +90,12 @@ impl<A: PartialEq> PartialEq for Ref<A> {
         self.with(|a| other.with(|b| a == b))
     }
 }
+impl<A> From<A> for Ref<A> {
+    fn from(value: A) -> Self {
+        Ref(Arc::new(RwLock::new(value)))
+    }
+}
+
 impl<A> Ref<A> {
     #[inline]
     pub fn with<R>(&self, f: impl FnOnce(&A) -> R) -> R {
@@ -118,6 +124,9 @@ pub struct S<A>(pub A, pub Span);
 impl<A> S<A> {
     pub fn span(&self) -> Span {
         self.1
+    }
+    pub fn map<B>(self, f: impl FnOnce(A) -> B) -> S<B> {
+        S(f(self.0), self.1)
     }
 }
 impl<A> std::ops::Deref for S<A> {
