@@ -218,6 +218,36 @@ impl Pretty for Def {
     }
 }
 
+#[derive(Clone)]
+pub struct Errors {
+    pub errors: Ref<Vec<Error>>,
+    pub db: DB,
+    pub span: AbsSpan,
+}
+impl Errors {
+    pub fn panic(&self) -> ! {
+        for i in self.errors.take() {
+            i.write_cli(self.span.0, &mut FileCache::new(self.db.clone()));
+        }
+        panic!()
+    }
+}
+
+impl Default for Errors {
+    fn default() -> Self {
+        Self {
+            errors: Default::default(),
+            db: Default::default(),
+            span: AbsSpan(Interned::empty(), Span(0, 0)),
+        }
+    }
+}
+impl Errors {
+    pub fn push(&self, error: Error) {
+        self.errors.with_mut(|v| v.push(error))
+    }
+}
+
 fn byte_to_char(rope: &Rope, byte: usize) -> usize {
     let mut b = 0;
     let mut li = 0;
