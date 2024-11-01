@@ -17,10 +17,18 @@ impl Pretty for Meta {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Builtin {
+    Type,
+    Borrow,
+    Static,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Head {
     Sym(Sym),
     Def(Def),
     Meta(Meta),
+    Builtin(Builtin),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -31,7 +39,6 @@ pub enum Term {
     Fun(Class, Icit, Sym, Box<Term>, Arc<Term>),
     Pair(Box<Term>, Box<Term>),
     Error,
-    Type,
 }
 
 // It would be nice for this to be im::HashMap, but that's slower in practice unfortunately. maybe we can make a hybrid or something?
@@ -58,11 +65,13 @@ pub enum Val {
     Fun(Class, Icit, Sym, Arc<Val>, Arc<Term>, Arc<Env>),
     Pair(Arc<Val>, Arc<Val>),
     Error,
-    Type,
 }
 impl Val {
     pub fn sym(sym: Sym) -> Val {
         Val::Neutral(Head::Sym(sym), default())
+    }
+    pub fn builtin(builtin: Builtin) -> Val {
+        Val::Neutral(Head::Builtin(builtin), default())
     }
 }
 
@@ -78,8 +87,7 @@ impl Term {
     pub fn eval(&self, env: &Env) -> Val {
         with_stack(|| match self {
             Term::Head(Head::Sym(s)) => env.get(s).map(|x| (**x).clone()).unwrap_or(Val::sym(*s)),
-            Term::Head(Head::Def(d)) => Val::Neutral(Head::Def(*d), default()),
-            Term::Head(Head::Meta(m)) => Val::Neutral(Head::Meta(*m), default()),
+            Term::Head(h) => Val::Neutral(*h, default()),
             Term::App(f, x) => x.eval(env).elim(f.eval(env)),
             Term::Fun(c, i, s, aty, body) => Val::Fun(
                 *c,
@@ -91,7 +99,6 @@ impl Term {
             ),
             Term::Pair(a, b) => Val::Pair(Arc::new(a.eval(env)), Arc::new(b.eval(env))),
             Term::Error => Val::Error,
-            Term::Type => Val::Type,
         })
     }
 }
@@ -151,8 +158,7 @@ impl Term {
     fn subst(&self, env: &SEnv) -> Result<Term, Sym> {
         Ok(match self {
             Term::Head(Head::Sym(s)) => env.get(*s).quote_(&env.qenv)?,
-            Term::Head(Head::Def(d)) => Term::Head(Head::Def(*d)),
-            Term::Head(Head::Meta(m)) => Term::Head(Head::Meta(*m)),
+            Term::Head(h) => Term::Head(*h),
             Term::App(f, x) => Term::App(Box::new(f.subst(env)?), x.subst(env)?),
             Term::Fun(c, i, s, aty, body) => {
                 let (s, env2) = env.bind(*s);
@@ -166,7 +172,6 @@ impl Term {
             }
             Term::Pair(a, b) => Term::Pair(Box::new(a.subst(env)?), Box::new(b.subst(env)?)),
             Term::Error => Term::Error,
-            Term::Type => Term::Type,
         })
     }
 }
@@ -216,7 +221,6 @@ impl Val {
             }
             Val::Pair(a, b) => Term::Pair(Box::new(a.quote_(env)?), Box::new(b.quote_(env)?)),
             Val::Error => Term::Error,
-            Val::Type => Term::Type,
         })
     }
 }
@@ -257,7 +261,7 @@ impl Term {
                 a.zonk_(cxt, qenv, beta_reduce);
                 b.zonk_(cxt, qenv, beta_reduce);
             }
-            Term::Head(_) | Term::Error | Term::Type => (),
+            Term::Head(_) | Term::Error => (),
         }
         false
     }
@@ -307,6 +311,15 @@ impl VElim {
                 };
                 v[0].2
                     .eval(&Arc::make_mut(&mut env).tap_mut(|v| v.0.extend([(s1, va), (s2, vb)])))
+            }
+
+            // Merge borrow lists
+            // TODO similar for single concrete borrows (and sort them for easy unification?)
+            (VElim::App(Expl, v), Val::Neutral(Head::Builtin(Builtin::Static), spine))
+                if matches!(&*v, Val::Neutral(Head::Builtin(Builtin::Static), _)) =>
+            {
+                // This should be okay since we can't pattern-match on borrows
+                spine.into_iter().fold(Arc::unwrap_or_clone(v), |acc, x| x.elim(acc))
             }
 
             (x, Val::Neutral(s, vec)) => Val::Neutral(s, vec.tap_mut(|v| v.push(x))),
@@ -443,6 +456,8 @@ impl Val {
                     }
                     Head::Sym(s) => cxt.local_val(*s),
                     Head::Meta(m) => cxt.meta_val(*m),
+                    // TODO resolve applicable builtins?
+                    Head::Builtin(_) => None,
                 } {
                     Some(
                         match &*val {
@@ -543,6 +558,20 @@ fn pretty_binder(name: Name, icit: Icit, prec: Prec, rest: Doc, db: &DB) -> Doc 
     }
 }
 
+impl std::fmt::Display for Builtin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                Builtin::Type => "Type",
+                Builtin::Borrow => "Borrow",
+                Builtin::Static => "'()",
+            }
+        )
+    }
+}
+
 impl Pretty for Term {
     fn pretty(&self, db: &DB) -> Doc {
         match self {
@@ -550,6 +579,7 @@ impl Pretty for Term {
             Term::Head(Head::Sym(s)) => Doc::start(db.get(s.0)), // + &*format!("@{}", s.1),
             Term::Head(Head::Def(d)) => db.idefs.get(*d).name().pretty(db),
             Term::Head(Head::Meta(m)) => m.pretty(db),
+            Term::Head(Head::Builtin(b)) => Doc::start(b),
             // TODO we probably want to show implicit and explicit application differently, but that requires threading icits through neutral spines...
             Term::App(f, TElim::App(i, x)) => (f.pretty(db).nest(Prec::App)
                 + " "
@@ -605,7 +635,6 @@ impl Pretty for Term {
                     .prec(Prec::Pair)
             }
             Term::Error => Doc::keyword("error"),
-            Term::Type => Doc::start("Type"),
         }
     }
 }

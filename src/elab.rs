@@ -2,6 +2,7 @@ mod pattern;
 mod term;
 
 use pattern::*;
+use rustc_hash::FxHashMap;
 use term::*;
 pub use term::{Term, Val};
 
@@ -108,7 +109,7 @@ pub fn elab_module(file: File, def: Def, db: &DB) -> ModuleElabResult {
                 )
                 .with_label("metavariable introduced here"),
             ),
-            MetaEntry::Solved(_) => (),
+            MetaEntry::Solved(_, _) => (),
         }
     }
     errors.append(&mut root_cxt.errors.errors.take());
@@ -189,7 +190,7 @@ pub fn elab_def(def: Def, db: &DB) -> Option<DefElabResult> {
             m.iter()
                 .filter_map(|(m, v)| match v {
                     MetaEntry::Unsolved(_, source) => Some((*m, *source)),
-                    MetaEntry::Solved(_) => None,
+                    MetaEntry::Solved(_, _) => None,
                 })
                 .collect()
         }),
@@ -200,7 +201,7 @@ pub fn elab_def(def: Def, db: &DB) -> Option<DefElabResult> {
             .filter(|(m, _)| m.0 != def || m.1 == 0)
             .filter_map(|(m, v)| match v {
                 MetaEntry::Unsolved(_, _) => None,
-                MetaEntry::Solved(val) => Some((m, val)),
+                MetaEntry::Solved(val, _) => Some((m, val)),
             })
             .collect(),
         errors: cxt.errors.errors.take().into_iter().collect(),
@@ -213,7 +214,7 @@ enum MetaEntry {
     // The first field is the type; we'll need that eventually for typeclass resolution, but it doesn't matter right now
     // TODO error on unsolved metas (that's why the span is here)
     Unsolved(Arc<Val>, S<MetaSource>),
-    Solved(Arc<Val>),
+    Solved(Arc<Val>, im::HashSet<Meta>),
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -232,6 +233,8 @@ impl Pretty for MetaSource {
     }
 }
 
+type UQuant = (Vec<(Sym, Arc<Val>)>, Vec<(Meta, Arc<Val>, u32)>);
+
 #[derive(Clone)]
 struct Cxt {
     db: DB,
@@ -240,7 +243,7 @@ struct Cxt {
     metas: Ref<HashMap<Meta, MetaEntry>>,
     zonked_metas: Ref<HashMap<(Meta, bool), Val>>,
     env: SEnv,
-    uquant_stack: Ref<Vec<Vec<(Sym, Arc<Val>)>>>,
+    uquant_stack: Ref<Vec<UQuant>>,
     errors: Errors,
 }
 impl Cxt {
@@ -294,7 +297,7 @@ impl Cxt {
     fn push_uquant(&self) {
         self.uquant_stack.with_mut(|v| v.push(default()));
     }
-    fn pop_uquant(&self) -> Option<Vec<(Sym, Arc<Val>)>> {
+    fn pop_uquant(&self) -> Option<UQuant> {
         self.uquant_stack.with_mut(|v| v.pop())
     }
     fn lookup(&self, n: Name) -> Option<(Term, Arc<Val>)> {
@@ -320,21 +323,19 @@ impl Cxt {
                     .with(|v| {
                         v.iter()
                             .rev()
-                            .flatten()
+                            .flat_map(|(v, _)| v)
                             .find(|(s, _)| s.0 == n)
                             .map(|(s, v)| (*s, v.clone()))
                     })
                     .or_else(|| {
                         self.uquant_stack.with_mut(|v| {
-                            v.last_mut().map(|v| {
+                            v.last_mut().map(|(v, _)| {
                                 assert!(!v.iter().any(|(s, _)| s.0 == n));
                                 let s = self.scxt().bind(n);
                                 // TODO span for the name
-                                let ty = Arc::new(self.new_meta(
-                                    Val::Type,
-                                    MetaSource::TypeOf(n),
-                                    self.errors.span.span(),
-                                ));
+                                let ty = Arc::new(
+                                    self.type_meta(MetaSource::TypeOf(n), self.errors.span.span()),
+                                );
                                 v.push((s, ty.clone()));
                                 (s, ty)
                             })
@@ -399,33 +400,39 @@ impl Cxt {
         &self.env.qenv.scxt
     }
 
-    fn new_meta(&self, ty: Val, source: MetaSource, span: Span) -> Val {
-        // When making a meta with type (a, b), we're more likely to be able to solve it if we can solve each component separately
-        // So we make two metas (possibly recursively), and return (?0, ?1)
-        // In general this can be applied to any single-constructor datatype, but we probably won't actually implement that
-        // But since we usually tuple function arguments, this makes type inference work much better in practice
-        if let Val::Fun(Sigma(_), _, _, aty, _, _) = &ty {
-            let m1 = self.new_meta((**aty).clone(), source, span);
-            let bty = ty.app(m1.clone());
-            let m2 = self.new_meta(bty, source, span);
-            let val = Val::Pair(Arc::new(m1), Arc::new(m2));
-            return val;
-        }
-
-        // This can skip numbers in the presence of solved external metas but that shouldn't matter
-        let m = Meta(self.def, self.metas.with(|x| x.len()) as u32);
-        self.metas
-            .with_mut(|x| x.insert(m, MetaEntry::Unsolved(Arc::new(ty), S(source, span))));
-        let v = Val::Neutral(
-            Head::Meta(m),
+    fn type_meta(&self, source: MetaSource, span: Span) -> Val {
+        self.type_meta_with_spine(
+            source,
+            span,
             self.env
                 .env
                 .keys()
                 // TODO is this correct?
-                .map(|s| VElim::App(Expl, Arc::new(Val::sym(*s))))
-                .collect(),
-        );
-        v
+                .map(|s| VElim::App(Expl, Arc::new(Val::sym(*s)))),
+        )
+    }
+    fn new_meta(&self, ty: Val, source: MetaSource, span: Span) -> Val {
+        self.new_meta_with_spine(
+            ty,
+            source,
+            span,
+            self.env
+                .env
+                .keys()
+                // TODO is this correct?
+                .map(|s| VElim::App(Expl, Arc::new(Val::sym(*s)))),
+        )
+    }
+    fn type_meta_with_spine(
+        &self,
+        source: MetaSource,
+        span: Span,
+        spine: impl IntoIterator<Item = VElim>,
+    ) -> Val {
+        let spine: Vec<_> = spine.into_iter().collect();
+        let b =
+            self.new_meta_with_spine(Val::builtin(Builtin::Borrow), source, span, spine.clone());
+        self.new_meta_with_spine(Val::builtin(Builtin::Type).app(b), source, span, spine)
     }
     fn new_meta_with_spine(
         &self,
@@ -434,6 +441,19 @@ impl Cxt {
         span: Span,
         spine: impl IntoIterator<Item = VElim>,
     ) -> Val {
+        // When making a meta with type (a, b), we're more likely to be able to solve it if we can solve each component separately
+        // So we make two metas (possibly recursively), and return (?0, ?1)
+        // In general this can be applied to any single-constructor datatype, but we probably won't actually implement that
+        // But since we usually tuple function arguments, this makes type inference work much better in practice
+        if let Val::Fun(Sigma(_), _, _, aty, _, _) = &ty {
+            let spine: Vec<_> = spine.into_iter().collect();
+            let m1 = self.new_meta_with_spine((**aty).clone(), source, span, spine.clone());
+            let bty = ty.app(m1.clone());
+            let m2 = self.new_meta_with_spine(bty, source, span, spine);
+            let val = Val::Pair(Arc::new(m1), Arc::new(m2));
+            return val;
+        }
+
         // This can skip numbers in the presence of solved external metas but that shouldn't matter
         let m = Meta(self.def, self.metas.with(|x| x.len()) as u32);
         self.metas
@@ -445,7 +465,7 @@ impl Cxt {
         self.metas.with(|x| {
             x.get(&m).and_then(|x| match x {
                 MetaEntry::Unsolved(_, source) => Some(*source),
-                MetaEntry::Solved(_) => None,
+                MetaEntry::Solved(_, _) => None,
             })
         })
     }
@@ -453,7 +473,7 @@ impl Cxt {
         self.metas.with(|x| {
             x.get(&m).and_then(|x| match x {
                 MetaEntry::Unsolved(_, _) => None,
-                MetaEntry::Solved(arc) => Some(arc.clone()),
+                MetaEntry::Solved(arc, _) => Some(arc.clone()),
             })
         })
     }
@@ -514,10 +534,24 @@ impl Cxt {
                         Arc::new(acc),
                     )
                 });
+                let metas = term.find_metas();
+                if metas.contains(&meta) {
+                    self.err(
+                        Doc::start("cannot solve meta ")
+                            + self
+                                .meta_source(meta)
+                                .map_or(meta.pretty(&self.db), |m| m.pretty(&self.db))
+                            + " to a term that mentions the same meta: "
+                            + solution.pretty(&self.db)
+                            + "`",
+                        span,
+                    );
+                    return false;
+                }
                 // Eval in an empty environment
                 let val = term.eval(&default());
                 self.metas
-                    .with_mut(|m| m.insert(meta, MetaEntry::Solved(Arc::new(val))));
+                    .with_mut(|m| m.insert(meta, MetaEntry::Solved(Arc::new(val), metas)));
                 true
             }
             Err(_) if !zonked => {
@@ -540,6 +574,55 @@ impl Cxt {
                 );
                 false
             }
+        }
+    }
+}
+
+impl Term {
+    fn find_metas(&self) -> im::HashSet<Meta> {
+        match self {
+            Term::Head(Head::Meta(m)) => std::iter::once(*m).collect(),
+            Term::App(term, telim) => term.find_metas().union(match telim {
+                TElim::Match(branches, fallback) => branches
+                    .iter()
+                    .map(|(_, _, t)| t)
+                    .chain(fallback)
+                    .fold(default(), |acc, x| acc.union(x.find_metas())),
+                TElim::App(_, term) => term.find_metas(),
+            }),
+            Term::Fun(_, _, _, ty, body) => ty.find_metas().union(body.find_metas()),
+            Term::Pair(term, term1) => term.find_metas().union(term1.find_metas()),
+            Term::Error | Term::Head(_) => default(),
+        }
+    }
+    fn replace_metas(&mut self, metas: &FxHashMap<Meta, Val>, cxt: &Cxt) {
+        match self {
+            Term::Head(Head::Meta(m)) => match metas.get(m) {
+                None => (),
+                Some(val) => *self = val.quote(cxt.qenv()),
+            },
+            Term::App(term, telim) => {
+                term.replace_metas(metas, cxt);
+                match telim {
+                    TElim::Match(vec, fallback) => {
+                        vec.iter_mut()
+                            .for_each(|(_, _, t)| Arc::make_mut(t).replace_metas(metas, cxt));
+                        if let Some(f) = fallback {
+                            Arc::make_mut(f).replace_metas(metas, cxt);
+                        }
+                    }
+                    TElim::App(_, term) => term.replace_metas(metas, cxt),
+                }
+            }
+            Term::Fun(_, _, _, ty, body) => {
+                ty.replace_metas(metas, cxt);
+                Arc::make_mut(body).replace_metas(metas, cxt);
+            }
+            Term::Pair(term, term1) => {
+                term.replace_metas(metas, cxt);
+                term1.replace_metas(metas, cxt);
+            }
+            Term::Error | Term::Head(_) => todo!(),
         }
     }
 }
@@ -700,6 +783,15 @@ fn insert_metas(term: Term, mut ty: GVal, cxt: &Cxt, span: Span) -> (Term, GVal)
     match ty.whnf(cxt) {
         Val::Fun(Pi, Impl, n, aty, _, _) => {
             let m = cxt.new_meta((**aty).clone(), MetaSource::ImpArg(n.0), span);
+            if let Val::Neutral(Head::Meta(m), spine) = &m {
+                cxt.uquant_stack.with_mut(|v| {
+                    if let Some((_, v)) = v.last_mut() {
+                        v.push((*m, aty.clone(), spine.len() as u32));
+                    }
+                });
+            } else {
+                unreachable!()
+            }
             let term = Term::App(
                 Box::new(term),
                 TElim::App(Impl, Box::new(m.quote(&cxt.qenv()))),
@@ -796,7 +888,7 @@ impl SPre {
         let (s, sty) = match &***self {
             Pre::Var(name) if cxt.db.name("_") == *name => {
                 // hole
-                let mty = cxt.new_meta(Val::Type, MetaSource::TypeOf(*name), self.span());
+                let mty = cxt.type_meta(MetaSource::TypeOf(*name), self.span());
                 let m = cxt
                     .new_meta(mty.clone(), MetaSource::Hole, self.span())
                     .quote(&cxt.qenv());
@@ -831,8 +923,7 @@ impl SPre {
                         // Solve it to a pi type with more metas
                         // The new metas will use the same scope as the old ones
                         // TODO extend that scoping principle to other areas where metas are solved to more metas
-                        let m1 = cxt.new_meta_with_spine(
-                            Val::Type,
+                        let m1 = cxt.type_meta_with_spine(
                             cxt.meta_source(*m)
                                 .as_deref()
                                 .copied()
@@ -931,7 +1022,32 @@ impl SPre {
                 let rty = rty.small().quote(&cxt3.qenv());
                 let body = pat.compile(&[body], &cxt2);
                 let rty = pat.compile(&[rty], &cxt2);
-                let scope = q.then(|| cxt.pop_uquant().unwrap());
+                let metas = FxHashMap::default();
+                let scope = q
+                    .then(|| cxt.pop_uquant().unwrap())
+                    .map(|(mut scope, umetas)| {
+                        for (m, t, l) in umetas {
+                            if cxt.meta_val(m).is_none() {
+                                // TODO it's possible to get the name from the meta insertion point in insert_metas
+                                let s = cxt.scxt().bind(cxt.db.name("_"));
+                                metas.insert(
+                                    m,
+                                    (0..l).fold(Term::Head(Head::Sym(s)), |acc, _| {
+                                        Term::Fun(
+                                            Lam,
+                                            Expl,
+                                            cxt.scxt().bind(cxt.db.name("_")),
+                                            Box::new(Term::Error),
+                                            Arc::new(acc),
+                                        )
+                                    }),
+                                );
+                                scope.push((s, t));
+                            }
+                        }
+                        scope
+                    });
+                // TODO call replace_metas
                 (
                     scope.iter().flatten().rfold(
                         Term::Fun(Lam, *i, s, Box::new(aty2.clone()), Arc::new(body)),
@@ -994,6 +1110,9 @@ impl SPre {
         }
     }
 
+    fn check_type(&self, cxt: &Cxt) -> Term {
+        todo!()
+    }
     fn check(&self, ty: impl Into<GVal>, cxt: &Cxt) -> Term {
         let mut ty = ty.into();
         match (&***self, ty.whnf(cxt)) {

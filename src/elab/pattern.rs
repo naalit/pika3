@@ -108,16 +108,14 @@ fn split_ty(
                 // solve metas with more metas
                 let n = (*vars[0]).clone().ensure_named(&cxt.db).name().unwrap();
                 let n2 = (*vars[1]).clone().ensure_named(&cxt.db).name().unwrap();
-                let ta = Arc::new(cxt.new_meta_with_spine(
-                    Val::Type,
+                let ta = Arc::new(cxt.type_meta_with_spine(
                     MetaSource::TypeOf(n),
                     vars[0].span(),
                     spine.iter().cloned(),
                 ));
                 let (s, cxt2) = cxt.bind(n, ta.clone());
                 let tb = cxt2
-                    .new_meta_with_spine(
-                        Val::Type,
+                    .type_meta_with_spine(
                         MetaSource::TypeOf(n2),
                         vars[1].span(),
                         spine
