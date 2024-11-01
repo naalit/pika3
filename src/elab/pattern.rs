@@ -1,5 +1,4 @@
 use super::*;
-use crate::common::*;
 
 fn ty_pat_bind_needed(pre_ty: &SPre, cxt: &Cxt) -> bool {
     match &***pre_ty {

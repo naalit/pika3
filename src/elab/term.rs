@@ -1,5 +1,6 @@
 use super::*;
-use crate::common::*;
+
+use std::sync::atomic::AtomicU32;
 
 // -- types --
 

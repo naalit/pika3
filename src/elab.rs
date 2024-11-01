@@ -5,11 +5,6 @@ use pattern::*;
 use term::*;
 pub use term::{Term, Val};
 
-use std::collections::HashMap;
-use std::sync::atomic::AtomicU32;
-
-use tap::Pipe;
-
 use crate::common::*;
 use crate::parser::{Pre, PrePat, PreStmt, SPre, SPrePat};
 

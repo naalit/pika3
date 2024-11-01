@@ -1,6 +1,6 @@
 use lsp_types::Url;
 pub use std::borrow::Cow::{self, Borrowed, Owned};
-use std::collections::HashMap;
+pub use std::collections::HashMap;
 use std::path::PathBuf;
 pub use std::sync::Arc;
 use std::{fmt::Display, sync::RwLock};
@@ -8,7 +8,7 @@ use yansi::Color;
 
 pub use educe::Educe;
 pub use im_rope::Rope;
-pub use tap::Tap;
+pub use tap::{Pipe, Tap};
 
 pub use crate::query::DB;
 pub use crate::{
