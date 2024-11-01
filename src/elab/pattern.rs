@@ -240,7 +240,7 @@ impl PRow {
                     Some(s)
                 }
                 IPat::Var(n, Some(paty)) => {
-                    let aty = paty.check(Val::Type, cxt).eval(cxt.env());
+                    let aty = paty.check_type(cxt).eval(cxt.env());
                     if !aty.clone().glued().unify((*t).clone().glued(), pat.1, cxt) {
                         cxt.err(
                             Doc::start("mismatched types: pattern has type ")
@@ -576,24 +576,17 @@ impl PMatch {
             .map(|p| match p.ipat(&ocxt.db).0 {
                 IPat::Var(n, None) => (
                     n,
-                    ty.unwrap_or_else(|| {
-                        ocxt.new_meta(Val::Type, MetaSource::TypeOf(n), p.span())
-                            .glued()
-                    }),
+                    ty.unwrap_or_else(|| ocxt.type_meta(MetaSource::TypeOf(n), p.span()).glued()),
                 ),
                 IPat::Var(n, Some(paty)) => (
                     n,
-                    ty.unwrap_or_else(|| paty.check(Val::Type, &ocxt).eval(ocxt.env()).glued()),
+                    ty.unwrap_or_else(|| paty.check_type(&ocxt).eval(ocxt.env()).glued()),
                 ),
                 IPat::CPat(n, _) => (
                     n.unwrap_or(ocxt.db.name("_")),
                     ty.unwrap_or_else(|| {
-                        ocxt.new_meta(
-                            Val::Type,
-                            MetaSource::TypeOf(n.unwrap_or(ocxt.db.name("_"))),
-                            p.span(),
-                        )
-                        .glued()
+                        ocxt.type_meta(MetaSource::TypeOf(n.unwrap_or(ocxt.db.name("_"))), p.span())
+                            .glued()
                     }),
                 ),
             })

@@ -27,6 +27,7 @@ pub enum PreStmt {
 #[derive(Debug, Clone)]
 pub enum Pre {
     Type,
+    Static,
     Var(Name),
     Binder(SPre, SPre),
     App(SPre, SPre, Icit),
@@ -280,6 +281,12 @@ impl Parser {
                     s.next();
                     Pre::Type
                 }
+                Tok::Quote => {
+                    s.next();
+                    s.expect(Tok::POpen);
+                    s.expect(Tok::PClose);
+                    Pre::Static
+                }
                 Tok::Name => Pre::Var(s.name()),
                 Tok::POpen => {
                     s.next();
@@ -465,6 +472,7 @@ impl Tok {
                 | Tok::MutKw
                 | Tok::OwnKw
                 | Tok::Minus
+                | Tok::Quote
                 | Tok::IntLit
                 | Tok::StringLit
                 | Tok::FloatLit

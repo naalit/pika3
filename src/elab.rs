@@ -100,18 +100,18 @@ pub fn elab_module(file: File, def: Def, db: &DB) -> ModuleElabResult {
         elab.ty = Arc::new(elab.ty.zonk(&root_cxt, true));
         // We should really also zonk bodies, but that makes some of the smalltt examples slow so i'll wait until we actually need it
     }
-    for (m, val) in root_cxt.metas.take() {
-        match val {
-            MetaEntry::Unsolved(_, source) => errors.push(
-                Error::simple(
-                    "could not find solution for " + source.pretty(db) + " (" + m.pretty(db) + ")",
-                    source.span(),
-                )
-                .with_label("metavariable introduced here"),
-            ),
-            MetaEntry::Solved(_, _) => (),
-        }
-    }
+    // for (m, val) in root_cxt.metas.take() {
+    //     match val {
+    //         MetaEntry::Unsolved(_, source) => errors.push(
+    //             Error::simple(
+    //                 "could not find solution for " + source.pretty(db) + " (" + m.pretty(db) + ")",
+    //                 source.span(),
+    //             )
+    //             .with_label("metavariable introduced here"),
+    //         ),
+    //         MetaEntry::Solved(_, _) => (),
+    //     }
+    // }
     errors.append(&mut root_cxt.errors.errors.take());
     ModuleElabResult {
         module: Arc::new(Module { defs }),
@@ -133,7 +133,7 @@ pub fn elab_def(def: Def, db: &DB) -> Option<DefElabResult> {
     eprintln!("[elab def {}]", def.pretty(db));
 
     let cxt = Cxt::new(def, AbsSpan(file, pre.name.span()), db.clone());
-    let ty = pre.0.ty.as_ref().map(|ty| ty.check(Val::Type, &cxt));
+    let ty = pre.0.ty.as_ref().map(|ty| ty.check_type(&cxt));
     let solved_ty = match &ty {
         Some(ty) => {
             let ty = ty.eval(cxt.env()).zonk(&cxt, true);
@@ -221,6 +221,7 @@ enum MetaEntry {
 pub enum MetaSource {
     TypeOf(Name),
     ImpArg(Name),
+    Borrow,
     Hole,
 }
 impl Pretty for MetaSource {
@@ -229,6 +230,7 @@ impl Pretty for MetaSource {
             MetaSource::TypeOf(n) => "type of " + n.pretty(db),
             MetaSource::ImpArg(n) => "implicit argument " + n.pretty(db),
             MetaSource::Hole => "hole".into(),
+            MetaSource::Borrow => "type borrow parameter".into(),
         }
     }
 }
@@ -262,7 +264,8 @@ impl Cxt {
         let metas = std::iter::once((
             Meta(context, 0),
             MetaEntry::Unsolved(
-                Arc::new(Val::Type),
+                // TODO can defs have non-static borrows
+                Arc::new(Val::builtin(Builtin::Type).app(Val::builtin(Builtin::Static))),
                 S(
                     MetaSource::TypeOf(db.idefs.get(context).name()),
                     span.span(),
@@ -430,8 +433,13 @@ impl Cxt {
         spine: impl IntoIterator<Item = VElim>,
     ) -> Val {
         let spine: Vec<_> = spine.into_iter().collect();
-        let b =
-            self.new_meta_with_spine(Val::builtin(Builtin::Borrow), source, span, spine.clone());
+        // problem: this borrow isn't getting solved bc we never unify the type of this meta with anything
+        let b = self.new_meta_with_spine(
+            Val::builtin(Builtin::Borrow),
+            MetaSource::Borrow,
+            span,
+            spine.clone(),
+        );
         self.new_meta_with_spine(Val::builtin(Builtin::Type).app(b), source, span, spine)
     }
     fn new_meta_with_spine(
@@ -456,9 +464,19 @@ impl Cxt {
 
         // This can skip numbers in the presence of solved external metas but that shouldn't matter
         let m = Meta(self.def, self.metas.with(|x| x.len()) as u32);
+        let ty = Arc::new(ty);
         self.metas
-            .with_mut(|x| x.insert(m, MetaEntry::Unsolved(Arc::new(ty), S(source, span))));
-        let v = Val::Neutral(Head::Meta(m), spine.into_iter().collect());
+            .with_mut(|x| x.insert(m, MetaEntry::Unsolved(ty.clone(), S(source, span))));
+        let v: Vec<_> = spine.into_iter().collect();
+        let l = v.len();
+        let v = Val::Neutral(Head::Meta(m), v);
+        if matches!(source, MetaSource::ImpArg(_) | MetaSource::Borrow) {
+            self.uquant_stack.with_mut(|v| {
+                if let Some((_, v)) = v.last_mut() {
+                    v.push((m, ty, l as u32));
+                }
+            });
+        }
         v
     }
     fn meta_source(&self, m: Meta) -> Option<S<MetaSource>> {
@@ -622,7 +640,7 @@ impl Term {
                 term.replace_metas(metas, cxt);
                 term1.replace_metas(metas, cxt);
             }
-            Term::Error | Term::Head(_) => todo!(),
+            Term::Error | Term::Head(_) => (),
         }
     }
 }
@@ -712,7 +730,6 @@ impl GVal {
             }
             break match (a.big(), b.big()) {
                 (Val::Error, _) | (_, Val::Error) => true,
-                (Val::Type, Val::Type) => true,
                 (Val::Neutral(s, sp), Val::Neutral(s2, sp2))
                     if s == s2
                         && sp.len() == sp2.len()
@@ -722,6 +739,11 @@ impl GVal {
                             .all(|(x, y)| x.unify_(y, span, cxt, mode.spine_mode())) =>
                 {
                     true
+                }
+                // Solve the newest meta first
+                (Val::Neutral(Head::Meta(m1), _), Val::Neutral(Head::Meta(m2), _)) if m2 > m1 => {
+                    std::mem::swap(&mut a, &mut b);
+                    continue;
                 }
                 (Val::Neutral(Head::Meta(m), spine), _)
                     if !matches!(b.big(), Val::Neutral(Head::Meta(m2), _) if m2 == m)
@@ -783,15 +805,6 @@ fn insert_metas(term: Term, mut ty: GVal, cxt: &Cxt, span: Span) -> (Term, GVal)
     match ty.whnf(cxt) {
         Val::Fun(Pi, Impl, n, aty, _, _) => {
             let m = cxt.new_meta((**aty).clone(), MetaSource::ImpArg(n.0), span);
-            if let Val::Neutral(Head::Meta(m), spine) = &m {
-                cxt.uquant_stack.with_mut(|v| {
-                    if let Some((_, v)) = v.last_mut() {
-                        v.push((*m, aty.clone(), spine.len() as u32));
-                    }
-                });
-            } else {
-                unreachable!()
-            }
             let term = Term::App(
                 Box::new(term),
                 TElim::App(Impl, Box::new(m.quote(&cxt.qenv()))),
@@ -932,8 +945,7 @@ impl SPre {
                             spine.clone(),
                         );
                         let (s, cxt2) = cxt.bind(cxt.db.name("_"), m1.clone());
-                        let m2 = cxt2.new_meta_with_spine(
-                            Val::Type,
+                        let m2 = cxt2.type_meta_with_spine(
                             cxt.meta_source(*m)
                                 .as_deref()
                                 .copied()
@@ -982,7 +994,7 @@ impl SPre {
                 if q {
                     cxt.push_uquant();
                 }
-                let aty = paty.check(Val::Type, cxt);
+                let aty = paty.check_type(cxt);
                 let vaty = aty.eval(cxt.env());
                 let (s, cxt) = cxt.bind(*n, vaty.clone());
                 let body = pat_bind_type(
@@ -990,21 +1002,51 @@ impl SPre {
                     Val::Neutral(Head::Sym(s), default()),
                     &vaty,
                     &cxt,
-                    |cxt| body.check(Val::Type, cxt),
+                    |cxt| body.check_type(cxt),
                 );
-                let scope = q.then(|| cxt.pop_uquant().unwrap());
+                let mut metas = FxHashMap::default();
+                let scope = q
+                    .then(|| cxt.pop_uquant().unwrap())
+                    .map(|(mut scope, umetas)| {
+                        for (m, t, l) in umetas {
+                            if cxt.meta_val(m).is_none() {
+                                // TODO it's possible to get the name from the meta insertion point in insert_metas
+                                let s = cxt.scxt().bind(cxt.db.name("_"));
+                                metas.insert(
+                                    m,
+                                    (0..l)
+                                        .fold(Term::Head(Head::Sym(s)), |acc, _| {
+                                            Term::Fun(
+                                                Lam,
+                                                Expl,
+                                                cxt.scxt().bind(cxt.db.name("_")),
+                                                Box::new(Term::Error),
+                                                Arc::new(acc),
+                                            )
+                                        })
+                                        .eval(cxt.env()),
+                                );
+                                scope.push((s, t));
+                            }
+                        }
+                        scope
+                    });
+                let mut x = scope.into_iter().flatten().rfold(
+                    Term::Fun(Pi, *i, s, Box::new(aty), Arc::new(body)),
+                    |acc, (s, ty)| {
+                        Term::Fun(Pi, Impl, s, Box::new(ty.quote(cxt.qenv())), Arc::new(acc))
+                    },
+                );
+                x.replace_metas(&metas, &cxt);
                 (
-                    scope.into_iter().flatten().rfold(
-                        Term::Fun(Pi, *i, s, Box::new(aty), Arc::new(body)),
-                        |acc, (s, ty)| {
-                            Term::Fun(Pi, Impl, s, Box::new(ty.quote(cxt.qenv())), Arc::new(acc))
-                        },
-                    ),
-                    Val::Type,
+                    x,
+                    // TODO annotate pi type with borrow
+                    Val::builtin(Builtin::Type).app(Val::builtin(Builtin::Static)),
                 )
             }
             Pre::Sigma(_, Some(_), _, _, _) | Pre::Sigma(_, _, _, Some(_), _) => {
-                (self.check(Val::Type, cxt), Val::Type)
+                let (t, b) = self.check_type_(cxt);
+                (t, Val::builtin(Builtin::Type).app(b))
             }
             // If no type is given, assume monomorphic lambdas
             Pre::Lam(i, pat, body) => {
@@ -1022,7 +1064,7 @@ impl SPre {
                 let rty = rty.small().quote(&cxt3.qenv());
                 let body = pat.compile(&[body], &cxt2);
                 let rty = pat.compile(&[rty], &cxt2);
-                let metas = FxHashMap::default();
+                let mut metas = FxHashMap::default();
                 let scope = q
                     .then(|| cxt.pop_uquant().unwrap())
                     .map(|(mut scope, umetas)| {
@@ -1032,23 +1074,24 @@ impl SPre {
                                 let s = cxt.scxt().bind(cxt.db.name("_"));
                                 metas.insert(
                                     m,
-                                    (0..l).fold(Term::Head(Head::Sym(s)), |acc, _| {
-                                        Term::Fun(
-                                            Lam,
-                                            Expl,
-                                            cxt.scxt().bind(cxt.db.name("_")),
-                                            Box::new(Term::Error),
-                                            Arc::new(acc),
-                                        )
-                                    }),
+                                    (0..l)
+                                        .fold(Term::Head(Head::Sym(s)), |acc, _| {
+                                            Term::Fun(
+                                                Lam,
+                                                Expl,
+                                                cxt.scxt().bind(cxt.db.name("_")),
+                                                Box::new(Term::Error),
+                                                Arc::new(acc),
+                                            )
+                                        })
+                                        .eval(cxt.env()),
                                 );
                                 scope.push((s, t));
                             }
                         }
                         scope
                     });
-                // TODO call replace_metas
-                (
+                let (mut x, mut t) = (
                     scope.iter().flatten().rfold(
                         Term::Fun(Lam, *i, s, Box::new(aty2.clone()), Arc::new(body)),
                         |acc, (s, ty)| {
@@ -1057,23 +1100,16 @@ impl SPre {
                             Term::Fun(Lam, Impl, *s, Box::new(ty.quote(cxt.qenv())), Arc::new(acc))
                         },
                     ),
-                    scope
-                        .into_iter()
-                        .flatten()
-                        .fold(
-                            Term::Fun(Pi, *i, s, Box::new(aty2), Arc::new(rty)),
-                            |acc, (s, ty)| {
-                                Term::Fun(
-                                    Pi,
-                                    Impl,
-                                    s,
-                                    Box::new(ty.quote(cxt.qenv())),
-                                    Arc::new(acc),
-                                )
-                            },
-                        )
-                        .eval(cxt.env()),
-                )
+                    scope.into_iter().flatten().fold(
+                        Term::Fun(Pi, *i, s, Box::new(aty2), Arc::new(rty)),
+                        |acc, (s, ty)| {
+                            Term::Fun(Pi, Impl, s, Box::new(ty.quote(cxt.qenv())), Arc::new(acc))
+                        },
+                    ),
+                );
+                x.replace_metas(&metas, cxt);
+                t.replace_metas(&metas, cxt);
+                (x, t.eval(cxt.env()))
             }
             // Similarly assume non-dependent pair
             Pre::Sigma(i, None, a, None, b) => {
@@ -1099,7 +1135,25 @@ impl SPre {
                 (Term::Error, Val::Error)
             }
             Pre::Do(block, last) => elab_block(block, last, None, cxt),
-            Pre::Type => (Term::Type, Val::Type),
+            Pre::Static => (
+                Term::Head(Head::Builtin(Builtin::Static)),
+                Val::builtin(Builtin::Borrow),
+            ),
+            // Type : Borrow -> Type '()
+            Pre::Type => (
+                Term::Head(Head::Builtin(Builtin::Type)),
+                Val::Fun(
+                    Pi,
+                    Expl,
+                    cxt.scxt().bind(cxt.db.name("_")),
+                    Arc::new(Val::builtin(Builtin::Borrow)),
+                    Arc::new(Term::App(
+                        Box::new(Term::Head(Head::Builtin(Builtin::Type))),
+                        TElim::App(Expl, Box::new(Term::Head(Head::Builtin(Builtin::Static)))),
+                    )),
+                    default(),
+                ),
+            ),
             Pre::Error => (Term::Error, Val::Error),
         };
         let sty = sty.glued();
@@ -1111,7 +1165,47 @@ impl SPre {
     }
 
     fn check_type(&self, cxt: &Cxt) -> Term {
-        todo!()
+        let (s, _) = self.check_type_(cxt);
+        s
+    }
+    // second return value is the borrow
+    fn check_type_(&self, cxt: &Cxt) -> (Term, Val) {
+        match &***self {
+            // when checking pair against type, assume sigma
+            Pre::Sigma(i, n1, aty, n2, body) => {
+                let n1 = n1.map(|x| *x).unwrap_or(cxt.db.name("_"));
+                let n2 = n2.map(|x| *x).unwrap_or(cxt.db.name("_"));
+                let (aty, ba) = aty.check_type_(cxt);
+                let vaty = aty.eval(cxt.env());
+                let (s, cxt) = cxt.bind(n1, vaty);
+                let (body, bb) = body.check_type_(&cxt);
+                (
+                    Term::Fun(Sigma(n2), *i, s, Box::new(aty), Arc::new(body)),
+                    ba.app(bb),
+                )
+            }
+            _ => {
+                // FIXME: if we solve this to another meta then that meta should get the uquant-ness
+                let mb = cxt.new_meta(
+                    Val::builtin(Builtin::Borrow),
+                    MetaSource::Borrow,
+                    self.span(),
+                );
+                let (s, sty) = self.infer(cxt, true);
+                if !sty.clone().unify(
+                    Val::builtin(Builtin::Type).app(mb.clone()).into(),
+                    self.span(),
+                    cxt,
+                ) {
+                    cxt.err(
+                        "could not match types: expected Type '_, found "
+                            + sty.small().zonk(cxt, true).pretty(&cxt.db),
+                        self.span(),
+                    );
+                }
+                (s, mb)
+            }
+        }
     }
     fn check(&self, ty: impl Into<GVal>, cxt: &Cxt) -> Term {
         let mut ty = ty.into();
@@ -1130,13 +1224,14 @@ impl SPre {
                 Term::Fun(Lam, *i, sym, Box::new(aty), Arc::new(body))
             }
             // when checking pair against type, assume sigma
-            (Pre::Sigma(i, n1, aty, n2, body), Val::Type) => {
+            (Pre::Sigma(i, n1, aty, n2, body), Val::Neutral(Head::Builtin(Builtin::Type), _)) => {
                 let n1 = n1.map(|x| *x).unwrap_or(cxt.db.name("_"));
                 let n2 = n2.map(|x| *x).unwrap_or(cxt.db.name("_"));
-                let aty = aty.check(Val::Type, cxt);
+                // propagate the borrow through both sides
+                let aty = aty.check(ty.clone(), cxt);
                 let vaty = aty.eval(cxt.env());
                 let (s, cxt) = cxt.bind(n1, vaty);
-                let body = body.check(Val::Type, &cxt);
+                let body = body.check(ty.clone(), &cxt);
                 Term::Fun(Sigma(n2), *i, s, Box::new(aty), Arc::new(body))
             }
             (Pre::Sigma(i, None, a, None, b), Val::Fun(Sigma(_), i2, _, aty, _, _)) if i == i2 => {

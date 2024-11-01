@@ -319,7 +319,9 @@ impl VElim {
                 if matches!(&*v, Val::Neutral(Head::Builtin(Builtin::Static), _)) =>
             {
                 // This should be okay since we can't pattern-match on borrows
-                spine.into_iter().fold(Arc::unwrap_or_clone(v), |acc, x| x.elim(acc))
+                spine
+                    .into_iter()
+                    .fold(Arc::unwrap_or_clone(v), |acc, x| x.elim(acc))
             }
 
             (x, Val::Neutral(s, vec)) => Val::Neutral(s, vec.tap_mut(|v| v.push(x))),

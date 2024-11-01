@@ -65,6 +65,7 @@ pub enum Tok {
     NEq,
     LPipe,
     RPipe,
+    Quote,
     FloatLit,
     IntLit,
     Name,
@@ -362,6 +363,8 @@ impl Lexer {
             '@' => self.tok(Tok::At),
             '\\' => self.tok(Tok::Backslash),
             ';' => self.tok(Tok::Newline),
+            // TODO this should be treated differently as part of identifiers
+            '\'' => self.tok(Tok::Quote),
 
             '\n' => {
                 // We're going to emit one or more tokens which might include newline, indent, and dedent
@@ -568,6 +571,7 @@ impl<'i> fmt::Display for Tok {
             Tok::NEq => "'!='",
             Tok::LPipe => "'<|'",
             Tok::RPipe => "'|>'",
+            Tok::Quote => "'",
             Tok::FloatLit => "float literal",
             Tok::IntLit => "int literal",
             Tok::Name => "name",
