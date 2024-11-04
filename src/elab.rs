@@ -331,14 +331,17 @@ impl Cxt {
                             .map(|(s, v)| (*s, v.clone()))
                     })
                     .or_else(|| {
+                        if self.uquant_stack.with(|v| v.is_empty()) {
+                            return None;
+                        }
+                        // TODO span for the name
+                        let ty = Arc::new(
+                            self.type_meta(MetaSource::TypeOf(n), self.errors.span.span()),
+                        );
                         self.uquant_stack.with_mut(|v| {
                             v.last_mut().map(|(v, _)| {
                                 assert!(!v.iter().any(|(s, _)| s.0 == n));
                                 let s = self.scxt().bind(n);
-                                // TODO span for the name
-                                let ty = Arc::new(
-                                    self.type_meta(MetaSource::TypeOf(n), self.errors.span.span()),
-                                );
                                 v.push((s, ty.clone()));
                                 (s, ty)
                             })
@@ -614,9 +617,22 @@ impl Term {
         }
     }
     fn replace_metas(&mut self, metas: &FxHashMap<Meta, Val>, cxt: &Cxt) {
+        fn needs_zonk(meta: Meta, cxt: &Cxt, metas: &FxHashMap<Meta, Val>) -> bool {
+            cxt.metas.with(|w| match w.get(&meta) {
+                Some(MetaEntry::Solved(_, occurs)) => occurs
+                    .iter()
+                    .any(|m| metas.contains_key(m) || needs_zonk(*m, cxt, metas)),
+                _ => false,
+            })
+        }
         match self {
             Term::Head(Head::Meta(m)) => match metas.get(m) {
-                None => (),
+                None => {
+                    if needs_zonk(*m, cxt, metas) {
+                        self.zonk(cxt, false);
+                        self.replace_metas(metas, cxt);
+                    }
+                }
                 Some(val) => *self = val.quote(cxt.qenv()),
             },
             Term::App(term, telim) => {
@@ -1008,6 +1024,7 @@ impl SPre {
                 let scope = q
                     .then(|| cxt.pop_uquant().unwrap())
                     .map(|(mut scope, umetas)| {
+                        let mut rv = Vec::new();
                         for (m, t, l) in umetas {
                             if cxt.meta_val(m).is_none() {
                                 // TODO it's possible to get the name from the meta insertion point in insert_metas
@@ -1026,10 +1043,11 @@ impl SPre {
                                         })
                                         .eval(cxt.env()),
                                 );
-                                scope.push((s, t));
+                                rv.push((s, t));
                             }
                         }
-                        scope
+                        rv.append(&mut scope);
+                        rv
                     });
                 let mut x = scope.into_iter().flatten().rfold(
                     Term::Fun(Pi, *i, s, Box::new(aty), Arc::new(body)),
@@ -1064,10 +1082,12 @@ impl SPre {
                 let rty = rty.small().quote(&cxt3.qenv());
                 let body = pat.compile(&[body], &cxt2);
                 let rty = pat.compile(&[rty], &cxt2);
+
                 let mut metas = FxHashMap::default();
                 let scope = q
                     .then(|| cxt.pop_uquant().unwrap())
                     .map(|(mut scope, umetas)| {
+                        let mut rv = Vec::new();
                         for (m, t, l) in umetas {
                             if cxt.meta_val(m).is_none() {
                                 // TODO it's possible to get the name from the meta insertion point in insert_metas
@@ -1086,11 +1106,13 @@ impl SPre {
                                         })
                                         .eval(cxt.env()),
                                 );
-                                scope.push((s, t));
+                                rv.push((s, t));
                             }
                         }
-                        scope
+                        rv.append(&mut scope);
+                        rv
                     });
+
                 let (mut x, mut t) = (
                     scope.iter().flatten().rfold(
                         Term::Fun(Lam, *i, s, Box::new(aty2.clone()), Arc::new(body)),
@@ -1100,7 +1122,7 @@ impl SPre {
                             Term::Fun(Lam, Impl, *s, Box::new(ty.quote(cxt.qenv())), Arc::new(acc))
                         },
                     ),
-                    scope.into_iter().flatten().fold(
+                    scope.into_iter().flatten().rfold(
                         Term::Fun(Pi, *i, s, Box::new(aty2), Arc::new(rty)),
                         |acc, (s, ty)| {
                             Term::Fun(Pi, Impl, s, Box::new(ty.quote(cxt.qenv())), Arc::new(acc))
@@ -1185,13 +1207,38 @@ impl SPre {
                 )
             }
             _ => {
-                // FIXME: if we solve this to another meta then that meta should get the uquant-ness
+                let (s, mut sty) = self.infer(cxt, true);
+
+                match sty.whnf(cxt) {
+                    Val::Neutral(Head::Builtin(Builtin::Type), spine) if spine.len() == 1 => {
+                        match &spine[0] {
+                            VElim::App(Expl, b) => return (s, (**b).clone()),
+                            _ => (),
+                        }
+                    }
+                    Val::Neutral(Head::Meta(m), spine) if cxt.meta_val(*m).is_none() => {
+                        let mb = cxt.new_meta_with_spine(
+                            Val::builtin(Builtin::Borrow),
+                            MetaSource::Borrow,
+                            self.span(),
+                            spine.iter().cloned(),
+                        );
+                        cxt.solve_meta(
+                            *m,
+                            spine,
+                            Val::builtin(Builtin::Type).app(mb.clone()).into(),
+                            Some(self.span()),
+                        );
+                        return (s, mb);
+                    }
+                    _ => (),
+                }
+
                 let mb = cxt.new_meta(
                     Val::builtin(Builtin::Borrow),
                     MetaSource::Borrow,
                     self.span(),
                 );
-                let (s, sty) = self.infer(cxt, true);
                 if !sty.clone().unify(
                     Val::builtin(Builtin::Type).app(mb.clone()).into(),
                     self.span(),

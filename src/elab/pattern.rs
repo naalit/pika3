@@ -621,7 +621,15 @@ impl PMatch {
             .iter()
             .enumerate()
             .map(|(i, p)| {
-                let ipat = p.ipat(&cxt.db);
+                let mut ipat = p.ipat(&cxt.db);
+                // We already checked the first branch's type, so we don't want to repeat that work
+                // (especially since it could introduce extra universally-quantified metas etc)
+                if i == 0 {
+                    match &mut *ipat {
+                        IPat::Var(_, ty) => *ty = None,
+                        IPat::CPat(_, _) => (),
+                    }
+                }
                 PRow {
                     cols: vec![(var, ty.clone(), ipat)],
                     assignments: default(),
