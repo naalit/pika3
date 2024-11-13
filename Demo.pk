@@ -181,3 +181,4 @@ def p12_demotion : own own Nat -> own Nat = x => x
 def p15 = (x : own Nat, y : Nat) => add x y
 def p16_ambient : (own Nat, own Nat) -> own Nat = (x, y) => add x y
 def p17_type : own Type = Type
+# def p18_ambient_e : (own Nat, own Nat) -> own own Nat = (x, y) => add x y

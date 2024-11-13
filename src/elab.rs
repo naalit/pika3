@@ -241,6 +241,7 @@ struct Cxt {
     zonked_metas: Ref<HashMap<(Meta, bool), Val>>,
     env: SEnv,
     uquant_stack: Ref<Vec<Vec<(Sym, Arc<Val>)>>>,
+    cap_surplus: Ref<Option<u32>>,
     errors: Errors,
 }
 impl Cxt {
@@ -276,6 +277,7 @@ impl Cxt {
             env,
             metas,
             uquant_stack: default(),
+            cap_surplus: None.into(),
             zonked_metas: default(),
         }
     }
@@ -297,11 +299,25 @@ impl Cxt {
     fn pop_uquant(&self) -> Option<Vec<(Sym, Arc<Val>)>> {
         self.uquant_stack.with_mut(|v| v.pop())
     }
+
+    fn report_surplus(&self, v: u32) {
+        self.cap_surplus
+            .with_mut(|t| *t = Some(t.map_or(v, |t| t.min(v))))
+    }
+    fn record_surplus<R>(&self, f: impl FnOnce() -> R) -> (Option<u32>, R) {
+        let before = self.cap_surplus.take();
+        let r = f();
+        (self.cap_surplus.set(before), r)
+    }
+
     fn lookup(&self, n: Name) -> Option<(Term, Arc<Val>)> {
         // first try locals
         self.bindings
             .get(&n)
-            .map(|(val, ty)| (val.quote(&self.qenv()), ty.clone()))
+            .map(|(val, ty)| {
+                self.report_surplus(0);
+                (val.quote(&self.qenv()), ty.clone())
+            })
             .or_else(|| {
                 self.db.lookup_def_name(self.def, n).map(|(d, t)| {
                     (
@@ -1063,14 +1079,16 @@ impl SPre {
             }
 
             (_, _) => {
-                let (s, mut sty) =
-                    self.infer(cxt, !matches!(ty.big(), Val::Fun(Pi, Impl, _, _, _, _)));
+                let (r, (s, mut sty)) = cxt.record_surplus(|| {
+                    self.infer(cxt, !matches!(ty.big(), Val::Fun(Pi, Impl, _, _, _, _)))
+                });
                 if !ty.clone().unify(sty.clone(), self.span(), cxt) {
                     // Try to coerce if possible
                     match (ty.whnf(cxt), sty.whnf(cxt)) {
                         // demotion is always available
-                        (ty_, Val::Cap(_, sty)) if !matches!(ty_, Val::Cap(_, _)) => {
+                        (ty_, Val::Cap(l2, sty)) if !matches!(ty_, Val::Cap(_, _)) => {
                             if ty.clone().unify((**sty).clone().glued(), self.span(), cxt) {
+                                r.map(|r| cxt.report_surplus(r + l2));
                                 return s;
                             }
                         }
@@ -1080,12 +1098,29 @@ impl SPre {
                                 self.span(),
                                 cxt,
                             ) {
+                                r.map(|r| cxt.report_surplus(r + (l2 - l1)));
                                 return s;
                             }
                         }
                         // TODO we can promote for auto-copy types
-                        // (Val::Cap(l1, ty), _) => {}
-                        // (Val::Cap(l1, ty), Val::Cap(l2, sty)) if *l1 > *l2 => {}
+                        (Val::Cap(l1, ty), _) if r.map_or(true, |r| r >= *l1) => {
+                            if (**ty).clone().glued().unify(sty.clone(), self.span(), cxt) {
+                                r.map(|r| cxt.report_surplus(r - l1));
+                                return s;
+                            }
+                        }
+                        (Val::Cap(l1, ty), Val::Cap(l2, sty))
+                            if *l1 > *l2 && r.map_or(true, |r| r >= l1 - l2) =>
+                        {
+                            if (**ty).clone().glued().unify(
+                                (**sty).clone().glued(),
+                                self.span(),
+                                cxt,
+                            ) {
+                                r.map(|r| cxt.report_surplus(r - (l1 - l2)));
+                                return s;
+                            }
+                        }
                         _ => (),
                     }
 
@@ -1097,6 +1132,7 @@ impl SPre {
                         self.span(),
                     );
                 }
+                r.map(|r| cxt.report_surplus(r));
                 s
             }
         }
