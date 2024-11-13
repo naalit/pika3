@@ -640,26 +640,6 @@ impl GVal {
                 {
                     true
                 }
-                (Val::Neutral(Head::Meta(m), spine), _)
-                    if !matches!(b.big(), Val::Neutral(Head::Meta(m2), _) if m2 == m)
-                        && spine.iter().all(|x| matches!(x, VElim::App(_, _)))
-                        && cxt.meta_val(*m).is_none() =>
-                {
-                    cxt.solve_meta(*m, spine, b.small().clone(), Some(span));
-                    true
-                }
-                (_, Val::Neutral(Head::Meta(m), spine))
-                    if !matches!(a.big(), Val::Neutral(Head::Meta(m2), _) if m2 == m)
-                        && spine.iter().all(|x| matches!(x, VElim::App(_, _)))
-                        && cxt.meta_val(*m).is_none() =>
-                {
-                    cxt.solve_meta(*m, spine, a.small().clone(), Some(span));
-                    true
-                }
-                (Val::Neutral(_, _), _) | (_, Val::Neutral(_, _)) if mode == UnfoldState::Maybe => {
-                    mode = UnfoldState::Yes;
-                    continue;
-                }
                 (Val::Fun(c, i1, n1, aty, _, _), Val::Fun(c2, i2, _, aty2, _, _))
                     if (c == c2 || matches!((c, c2), (Sigma(_), Sigma(_)))) && i1 == i2 =>
                 {
@@ -678,6 +658,33 @@ impl GVal {
                         continue;
                     }
                 }
+                (Val::Cap(l, t), Val::Cap(l2, t2)) if *l == *l2 => {
+                    a = (**t).clone().glued();
+                    b = (**t2).clone().glued();
+                    continue;
+                }
+
+                (Val::Neutral(Head::Meta(m), spine), _)
+                    if !matches!(b.big(), Val::Neutral(Head::Meta(m2), _) if m2 == m)
+                        && spine.iter().all(|x| matches!(x, VElim::App(_, _)))
+                        && cxt.meta_val(*m).is_none() =>
+                {
+                    cxt.solve_meta(*m, spine, b.small().clone(), Some(span));
+                    true
+                }
+                (_, Val::Neutral(Head::Meta(m), spine))
+                    if !matches!(a.big(), Val::Neutral(Head::Meta(m2), _) if m2 == m)
+                        && spine.iter().all(|x| matches!(x, VElim::App(_, _)))
+                        && cxt.meta_val(*m).is_none() =>
+                {
+                    cxt.solve_meta(*m, spine, a.small().clone(), Some(span));
+                    true
+                }
+
+                (Val::Neutral(_, _), _) | (_, Val::Neutral(_, _)) if mode == UnfoldState::Maybe => {
+                    mode = UnfoldState::Yes;
+                    continue;
+                }
                 // eta-expand if there's a lambda on only one side
                 // TODO this might have problems since we don't make sure the icits match?
                 (Val::Fun(Lam, _, n, _, _, _), _) | (_, Val::Fun(Lam, _, n, _, _, _)) => {
@@ -687,6 +694,7 @@ impl GVal {
                     b = b.as_big().app(arg).glued();
                     continue;
                 }
+
                 (_, _) => false,
             };
         }
@@ -978,6 +986,10 @@ impl SPre {
                     ),
                 )
             }
+            Pre::Cap(l, x) => {
+                let x = x.check(Val::Type, cxt);
+                (Term::Cap(*l, Box::new(x)), Val::Type)
+            }
             Pre::Binder(_, _) => {
                 cxt.err("binder not allowed in this context", self.span());
                 (Term::Error, Val::Error)
@@ -995,7 +1007,7 @@ impl SPre {
     }
 
     fn check(&self, ty: impl Into<GVal>, cxt: &Cxt) -> Term {
-        let mut ty = ty.into();
+        let mut ty: GVal = ty.into();
         match (&***self, ty.whnf(cxt)) {
             (Pre::Lam(i, pat, body), Val::Fun(Pi, i2, _, aty2, _, _)) if i == i2 => {
                 let mut cxt = cxt.clone();
@@ -1051,8 +1063,32 @@ impl SPre {
             }
 
             (_, _) => {
-                let (s, sty) = self.infer(cxt, !matches!(ty.big(), Val::Fun(Pi, Impl, _, _, _, _)));
+                let (s, mut sty) =
+                    self.infer(cxt, !matches!(ty.big(), Val::Fun(Pi, Impl, _, _, _, _)));
                 if !ty.clone().unify(sty.clone(), self.span(), cxt) {
+                    // Try to coerce if possible
+                    match (ty.whnf(cxt), sty.whnf(cxt)) {
+                        // demotion is always available
+                        (ty_, Val::Cap(_, sty)) if !matches!(ty_, Val::Cap(_, _)) => {
+                            if ty.clone().unify((**sty).clone().glued(), self.span(), cxt) {
+                                return s;
+                            }
+                        }
+                        (Val::Cap(l1, ty), Val::Cap(l2, sty)) if *l1 < *l2 => {
+                            if (**ty).clone().glued().unify(
+                                (**sty).clone().glued(),
+                                self.span(),
+                                cxt,
+                            ) {
+                                return s;
+                            }
+                        }
+                        // TODO we can promote for auto-copy types
+                        // (Val::Cap(l1, ty), _) => {}
+                        // (Val::Cap(l1, ty), Val::Cap(l2, sty)) if *l1 > *l2 => {}
+                        _ => (),
+                    }
+
                     cxt.err(
                         "could not match types: expected "
                             + ty.small().zonk(cxt, true).pretty(&cxt.db)

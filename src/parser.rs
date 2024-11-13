@@ -34,6 +34,7 @@ pub enum Pre {
     Sigma(Icit, Option<SName>, SPre, Option<SName>, SPre),
     Lam(Icit, SPrePat, SPre),
     Do(Vec<PreStmt>, SPre),
+    Cap(u32, SPre),
     Error,
 }
 pub type SPre = S<Box<Pre>>;
@@ -337,6 +338,10 @@ impl Parser {
     }
     fn app(&mut self) -> SPre {
         let start = self.pos();
+        if self.maybe(Tok::OwnKw) {
+            let rest = self.app();
+            return S(Box::new(Pre::Cap(1, rest)), Span(start, self.pos_right()));
+        }
         let mut a = self.atom();
         // make sure we don't get in an infinite loop - stop looking for atoms if we don't consume any input
         let mut last = start;

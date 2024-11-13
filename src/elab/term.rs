@@ -30,6 +30,7 @@ pub enum Term {
     /// Argument type annotation
     Fun(Class, Icit, Sym, Box<Term>, Arc<Term>),
     Pair(Box<Term>, Box<Term>),
+    Cap(u32, Box<Term>),
     Error,
     Type,
 }
@@ -57,6 +58,7 @@ pub enum Val {
     Neutral(Head, Spine),
     Fun(Class, Icit, Sym, Arc<Val>, Arc<Term>, Arc<Env>),
     Pair(Arc<Val>, Arc<Val>),
+    Cap(u32, Arc<Val>),
     Error,
     Type,
 }
@@ -89,6 +91,10 @@ impl Term {
                 body.clone(),
                 Arc::new(env.clone()),
             ),
+            Term::Cap(l, x) => match x.eval(env) {
+                Val::Cap(l2, x) => Val::Cap(*l + l2, x),
+                x => Val::Cap(*l, Arc::new(x)),
+            },
             Term::Pair(a, b) => Val::Pair(Arc::new(a.eval(env)), Arc::new(b.eval(env))),
             Term::Error => Val::Error,
             Term::Type => Val::Type,
@@ -164,6 +170,7 @@ impl Term {
                     Arc::new(body.subst(&env2)?),
                 )
             }
+            Term::Cap(l, x) => Term::Cap(*l, Box::new(x.subst(env)?)),
             Term::Pair(a, b) => Term::Pair(Box::new(a.subst(env)?), Box::new(b.subst(env)?)),
             Term::Error => Term::Error,
             Term::Type => Term::Type,
@@ -214,6 +221,7 @@ impl Val {
                     Arc::new(body.subst(&senv)?),
                 )
             }
+            Val::Cap(l, x) => Term::Cap(*l, Box::new(x.quote_(env)?)),
             Val::Pair(a, b) => Term::Pair(Box::new(a.quote_(env)?), Box::new(b.quote_(env)?)),
             Val::Error => Term::Error,
             Val::Type => Term::Type,
@@ -256,6 +264,9 @@ impl Term {
             Term::Pair(a, b) => {
                 a.zonk_(cxt, qenv, beta_reduce);
                 b.zonk_(cxt, qenv, beta_reduce);
+            }
+            Term::Cap(_, x) => {
+                x.zonk_(cxt, qenv, beta_reduce);
             }
             Term::Head(_) | Term::Error | Term::Type => (),
         }
@@ -603,6 +614,11 @@ impl Pretty for Term {
             Term::Pair(a, b) => {
                 (a.pretty(db).nest(Prec::Pi) + ", " + b.pretty(db).nest(Prec::Pair))
                     .prec(Prec::Pair)
+            }
+            Term::Cap(l, x) => {
+                (Doc::intersperse((0..*l).map(|_| Doc::keyword("own ")), Doc::none())
+                    + x.pretty(db).nest(Prec::App))
+                .prec(Prec::App)
             }
             Term::Error => Doc::keyword("error"),
             Term::Type => Doc::start("Type"),
