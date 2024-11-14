@@ -45,6 +45,7 @@ pub enum Tok {
     Equals,
     Arrow,
     WideArrow,
+    WavyArrow,
     Plus,
     Minus,
     Times,
@@ -330,6 +331,14 @@ impl Lexer {
                     _ => self.tok_in_place(Tok::Equals),
                 })
             }
+            '~' => {
+                self.next();
+                if self.peek() == Some('>') {
+                    Some(self.tok(Tok::WavyArrow))
+                } else {
+                    None
+                }
+            }
             // '-' could be the start of a negative number
             // This seems to be the best way to access the next character
             '-' if self
@@ -548,6 +557,7 @@ impl<'i> fmt::Display for Tok {
             Tok::Equals => "'='",
             Tok::Arrow => "'->'",
             Tok::WideArrow => "'=>'",
+            Tok::WavyArrow => "'~>'",
             Tok::Plus => "'+'",
             Tok::Minus => "'-'",
             Tok::Times => "'*'",

@@ -29,7 +29,7 @@ pub fn with_stack<A>(c: impl FnOnce() -> A) -> A {
 pub enum Class {
     Lam,
     /// Pi types can have -n on the argument
-    Pi(u32),
+    Pi(u32, Cap),
     /// Sigmas, unlike other closures, can have a name assigned to the second value (the closure body)
     Sigma(Name),
 }

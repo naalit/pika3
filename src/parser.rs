@@ -30,7 +30,7 @@ pub enum Pre {
     Var(Name),
     Binder(SPre, SPre),
     App(SPre, SPre, Icit),
-    Pi(Icit, Name, u32, SPre, SPre),
+    Pi(Icit, Name, u32, Cap, SPre, SPre),
     Sigma(Icit, Option<SName>, SPre, Option<SName>, SPre),
     Lam(Icit, SPrePat, SPre),
     Do(Vec<PreStmt>, SPre),
@@ -406,18 +406,23 @@ impl Parser {
             self.expect(Tok::CClose);
         }
         let icit = if implicit { Impl } else { Expl };
-        if matches!(self.peek(), Tok::BitAnd | Tok::Arrow) {
+        if matches!(self.peek(), Tok::BitAnd | Tok::Arrow | Tok::WavyArrow) {
             // pi (possibly &->)
             let mut n = 0;
             while self.maybe(Tok::BitAnd) {
                 n += 1;
             }
-            self.expect(Tok::Arrow);
+            let c = if self.maybe(Tok::WavyArrow) {
+                Cap::Own
+            } else {
+                self.expect(Tok::Arrow);
+                Cap::Imm
+            };
             let rhs = self.fun(false);
             let (name, lhs) = self.reparse_pi_param(lhs);
             let name = name.map(|x| *x).unwrap_or(self.db.name("_"));
             S(
-                Box::new(Pre::Pi(icit, name, n, lhs, rhs)),
+                Box::new(Pre::Pi(icit, name, n, c, lhs, rhs)),
                 Span(start, self.pos_right()),
             )
         } else if self.maybe(Tok::WideArrow) {
@@ -466,7 +471,10 @@ impl Parser {
                 self.expect(Tok::Newline);
             }
             if last == self.pos() {
-                self.error("expected end of file", self.tok_span());
+                self.error(
+                    &format!("expected end of file, found {}", self.peek()),
+                    self.tok_span(),
+                );
                 break;
             }
             last = self.pos();

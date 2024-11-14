@@ -185,7 +185,7 @@ def p17_type : own Type = Type
 def p19_minus_one : own Nat &-> Nat = x => x
 # def p20_minus_one_e : Nat &-> Nat = x => x
 
-def with_fun : ((U -> U) &-> r) -> r = f => f (x => x)
+def with_fun : ((U ~> U) &~> r) -> r = f => f (x => x)
 def p21_good =
   with_fun (f => do
     let f2 = with_fun
@@ -211,3 +211,10 @@ def p21_good =
 
 # def p23_dup_e : a -> (a, a) = x => (x, x)
 def p24_dup_type : Type -> (Type, Type) = x => (x, x)
+def p25_dupf : (a -> a) -> (a -> a, a -> a) = x => (x, x)
+# def p26_dupf_e : (a ~> a) -> (a ~> a, a ~> a) = x => (x, x)
+# def p27_dupf_e = do
+#   let f : Type ~> Type = x => x
+#   (f, f)
+# def p28_callf_e : ref (a ~> a) -> a -> a = f => x => f x
+def p29_curry_e : (a ~> a) -> a -> a = f => x => f x # TODO: we can't capture something owned inside a -> function!

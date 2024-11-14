@@ -614,11 +614,14 @@ impl Pretty for Term {
             ) + " => "
                 + body.pretty(db))
             .prec(Prec::Term),
-            Term::Fun(Pi(n), i, s, aty, body) => {
+            Term::Fun(Pi(n, c), i, s, aty, body) => {
                 (pretty_binder(s.0, *i, Prec::App, aty.pretty(db), db)
                     + " "
                     + Doc::intersperse((0..*n).map(|_| "&".into()), Doc::none())
-                    + "-> "
+                    + match c {
+                        Cap::Own => "~> ",
+                        Cap::Imm => "-> ",
+                    }
                     + body.pretty(db).nest(Prec::Pi))
                 .prec(Prec::Pi)
             }

@@ -240,7 +240,7 @@ impl Val {
                 a.is_owned() || self.clone().app(Val::sym(*s)).is_owned()
             }
             // TODO FnOnce equivalent
-            Val::Fun(Pi(_), _, _, _, _, _) => false,
+            Val::Fun(Pi(_, c), _, _, _, _, _) => *c == Cap::Own,
             Val::Fun { .. } => true,
             Val::Pair(_, _) => unreachable!(),
             Val::Cap(_, c, t) => *c == Cap::Own && t.is_owned(),
@@ -805,7 +805,7 @@ impl GVal {
 // don't call this if checking against an implicit lambda
 fn insert_metas(term: Term, mut ty: GVal, cxt: &Cxt, span: Span) -> (Term, GVal) {
     match ty.whnf(cxt) {
-        Val::Fun(Pi(_), Impl, n, aty, _, _) => {
+        Val::Fun(Pi(_, _), Impl, n, aty, _, _) => {
             let m = cxt.new_meta((**aty).clone(), MetaSource::ImpArg(n.0), span);
             let term = Term::App(
                 Box::new(term),
@@ -921,16 +921,30 @@ impl SPre {
             },
             Pre::App(fs, x, i) => {
                 let (mut f, mut fty) = fs.infer(cxt, *i == Expl);
-                let aty = match fty.whnf(cxt).uncap().2 {
+                let (_, fc, vfty) = fty.whnf(cxt).uncap();
+                let aty = match vfty {
                     Val::Error => Val::Error,
                     // TODO: calling `-1 (+1 t, +0 u) -> ()` with `(+0 t, +0 u)` should be fine, right?
                     // TODO: and also how does this affect the surplus of the result?
-                    Val::Fun(Pi(_), i2, _, aty, _, _) if i == i2 => (**aty).clone(),
-                    Val::Fun(Pi(_), _, _, _, _, _) => {
+                    Val::Fun(Pi(_, c), i2, _, aty, _, _) if i == i2 && fc >= *c => (**aty).clone(),
+                    Val::Fun(Pi(_, c), _, _, _, _, _) if fc >= *c => {
                         cxt.err(
                             "wrong function type: expected "
                                 + Doc::start(*i)
                                 + " function but got "
+                                + fty.small().pretty(&cxt.db),
+                            fs.span(),
+                        );
+                        // prevent .app() from panicking
+                        f = Term::Error;
+                        fty = Val::Error.glued();
+                        Val::Error
+                    }
+                    Val::Fun(Pi(_, Cap::Own), _, _, _, _, _) if fc == Cap::Imm => {
+                        cxt.err(
+                            "cannot call owned ~> function through "
+                                + Doc::keyword("imm")
+                                + " reference of type "
                                 + fty.small().pretty(&cxt.db),
                             fs.span(),
                         );
@@ -969,7 +983,7 @@ impl SPre {
                             *m,
                             spine,
                             Val::Fun(
-                                Pi(0),
+                                Pi(0, Cap::Imm),
                                 *i,
                                 s,
                                 Arc::new(m1.clone()),
@@ -998,7 +1012,7 @@ impl SPre {
                     fty.as_small().app(vx),
                 )
             }
-            Pre::Pi(i, n, l, paty, body) => {
+            Pre::Pi(i, n, l, c, paty, body) => {
                 let q = !cxt.has_uquant();
                 if q {
                     cxt.push_uquant();
@@ -1017,11 +1031,11 @@ impl SPre {
                 let scope = q.then(|| cxt.pop_uquant().unwrap());
                 (
                     scope.into_iter().flatten().rfold(
-                        Term::Fun(Pi(*l), *i, s, Box::new(aty), Arc::new(body)),
+                        Term::Fun(Pi(*l, *c), *i, s, Box::new(aty), Arc::new(body)),
                         |acc, (s, ty)| {
                             Term::Fun(
-                                // use -0 for the uquant pis
-                                Pi(0),
+                                // use -0 imm for the uquant pis
+                                Pi(0, Cap::Imm),
                                 Impl,
                                 s,
                                 Box::new(ty.quote(cxt.qenv())),
@@ -1065,10 +1079,10 @@ impl SPre {
                         .into_iter()
                         .flatten()
                         .fold(
-                            Term::Fun(Pi(0), *i, s, Box::new(aty2), Arc::new(rty)),
+                            Term::Fun(Pi(0, Cap::Imm), *i, s, Box::new(aty2), Arc::new(rty)),
                             |acc, (s, ty)| {
                                 Term::Fun(
-                                    Pi(0),
+                                    Pi(0, Cap::Imm),
                                     Impl,
                                     s,
                                     Box::new(ty.quote(cxt.qenv())),
@@ -1121,7 +1135,7 @@ impl SPre {
     fn check(&self, ty: impl Into<GVal>, cxt: &Cxt) -> Term {
         let mut ty: GVal = ty.into();
         match (&***self, ty.whnf(cxt)) {
-            (Pre::Lam(i, pat, body), Val::Fun(Pi(l), i2, _, aty2, _, _)) if i == i2 => {
+            (Pre::Lam(i, pat, body), Val::Fun(Pi(l, _), i2, _, aty2, _, _)) if i == i2 => {
                 let l = *l;
                 let mut cxt = cxt.clone();
                 let (sym, pat) =
@@ -1156,7 +1170,7 @@ impl SPre {
             (Pre::Do(block, last), _) => elab_block(block, last, Some(ty), cxt).0,
 
             // insert lambda when checking (non-implicit lambda) against implicit function type
-            (_, Val::Fun(Pi(l), Impl, n, aty, _, _)) => {
+            (_, Val::Fun(Pi(l, _), Impl, n, aty, _, _)) => {
                 let l = *l;
                 let aty2 = aty.quote(cxt.qenv());
                 // don't let them access the name in the term (shadowing existing names would be unintuitive)
@@ -1184,7 +1198,10 @@ impl SPre {
 
             (_, _) => {
                 let (r, (s, mut sty)) = cxt.record_surplus(|| {
-                    self.infer(cxt, !matches!(ty.big(), Val::Fun(Pi(_), Impl, _, _, _, _)))
+                    self.infer(
+                        cxt,
+                        !matches!(ty.big(), Val::Fun(Pi(_, _), Impl, _, _, _, _)),
+                    )
                 });
                 if !ty.clone().unify(sty.clone(), self.span(), cxt) {
                     // Try to coerce if possible
