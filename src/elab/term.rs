@@ -30,7 +30,7 @@ pub enum Term {
     /// Argument type annotation
     Fun(Class, Icit, Sym, Box<Term>, Arc<Term>),
     Pair(Box<Term>, Box<Term>),
-    Cap(u32, Box<Term>),
+    Cap(u32, Cap, Box<Term>),
     Error,
     Type,
 }
@@ -58,7 +58,7 @@ pub enum Val {
     Neutral(Head, Spine),
     Fun(Class, Icit, Sym, Arc<Val>, Arc<Term>, Arc<Env>),
     Pair(Arc<Val>, Arc<Val>),
-    Cap(u32, Arc<Val>),
+    Cap(u32, Cap, Arc<Val>),
     Error,
     Type,
 }
@@ -71,14 +71,14 @@ impl Val {
             return self;
         }
         match self {
-            Val::Cap(l2, rest) => Val::Cap(l + l2, rest),
-            _ => Val::Cap(l, Arc::new(self)),
+            Val::Cap(l2, c, rest) => Val::Cap(l + l2, c, rest),
+            _ => Val::Cap(l, Cap::Own, Arc::new(self)),
         }
     }
-    pub fn uncap(&self) -> (u32, &Val) {
+    pub fn uncap(&self) -> (u32, Cap, &Val) {
         match self {
-            Val::Cap(l, rest) => (*l, rest),
-            _ => (0, self),
+            Val::Cap(l, c, rest) => (*l, *c, rest),
+            _ => (0, Cap::Own, self),
         }
     }
 }
@@ -106,9 +106,9 @@ impl Term {
                 body.clone(),
                 Arc::new(env.clone()),
             ),
-            Term::Cap(l, x) => match x.eval(env) {
-                Val::Cap(l2, x) => Val::Cap(*l + l2, x),
-                x => Val::Cap(*l, Arc::new(x)),
+            Term::Cap(l, c, x) => match x.eval(env) {
+                Val::Cap(l2, c2, x) => Val::Cap(*l + l2, (*c).min(c2), x),
+                x => Val::Cap(*l, *c, Arc::new(x)),
             },
             Term::Pair(a, b) => Val::Pair(Arc::new(a.eval(env)), Arc::new(b.eval(env))),
             Term::Error => Val::Error,
@@ -185,7 +185,7 @@ impl Term {
                     Arc::new(body.subst(&env2)?),
                 )
             }
-            Term::Cap(l, x) => Term::Cap(*l, Box::new(x.subst(env)?)),
+            Term::Cap(l, c, x) => Term::Cap(*l, *c, Box::new(x.subst(env)?)),
             Term::Pair(a, b) => Term::Pair(Box::new(a.subst(env)?), Box::new(b.subst(env)?)),
             Term::Error => Term::Error,
             Term::Type => Term::Type,
@@ -236,7 +236,7 @@ impl Val {
                     Arc::new(body.subst(&senv)?),
                 )
             }
-            Val::Cap(l, x) => Term::Cap(*l, Box::new(x.quote_(env)?)),
+            Val::Cap(l, c, x) => Term::Cap(*l, *c, Box::new(x.quote_(env)?)),
             Val::Pair(a, b) => Term::Pair(Box::new(a.quote_(env)?), Box::new(b.quote_(env)?)),
             Val::Error => Term::Error,
             Val::Type => Term::Type,
@@ -280,7 +280,7 @@ impl Term {
                 a.zonk_(cxt, qenv, beta_reduce);
                 b.zonk_(cxt, qenv, beta_reduce);
             }
-            Term::Cap(_, x) => {
+            Term::Cap(_, _, x) => {
                 x.zonk_(cxt, qenv, beta_reduce);
             }
             Term::Head(_) | Term::Error | Term::Type => (),
@@ -632,11 +632,20 @@ impl Pretty for Term {
                 (a.pretty(db).nest(Prec::Pi) + ", " + b.pretty(db).nest(Prec::Pair))
                     .prec(Prec::Pair)
             }
-            Term::Cap(l, x) => {
-                (Doc::intersperse((0..*l).map(|_| Doc::keyword("own ")), Doc::none())
-                    + x.pretty(db).nest(Prec::App))
-                .prec(Prec::App)
-            }
+            Term::Cap(l, c, x) => (Doc::intersperse(
+                (0..*l).map(|_| {
+                    Doc::keyword(match c {
+                        Cap::Own => "own ",
+                        Cap::Imm => "imm ",
+                    })
+                }),
+                Doc::none(),
+            ) + (if *c == Cap::Imm && *l == 0 {
+                Doc::keyword("ref ")
+            } else {
+                Doc::none()
+            }) + x.pretty(db).nest(Prec::App))
+            .prec(Prec::App),
             Term::Error => Doc::keyword("error"),
             Term::Type => Doc::start("Type"),
         }

@@ -232,11 +232,78 @@ impl Pretty for MetaSource {
     }
 }
 
+impl Val {
+    fn is_owned(&self) -> bool {
+        match self {
+            Val::Neutral(_, _) => true,
+            Val::Fun(Sigma(_), _, s, a, _, _) => {
+                a.is_owned() || self.clone().app(Val::sym(*s)).is_owned()
+            }
+            // TODO FnOnce equivalent
+            Val::Fun(Pi(_), _, _, _, _, _) => false,
+            Val::Fun { .. } => true,
+            Val::Pair(_, _) => unreachable!(),
+            Val::Cap(_, c, t) => *c == Cap::Own && t.is_owned(),
+            Val::Error => false,
+            Val::Type => false,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct VarEntry {
+    name: Name,
+    val: Arc<Val>,
+    ty: Arc<Val>,
+    level: u32,
+    invalidated: Ref<Option<Span>>,
+}
+enum VarResult<'a> {
+    Local(Span, &'a VarEntry),
+    Other(Term, Arc<Val>),
+}
+impl VarResult<'_> {
+    fn consume(self, cxt: &Cxt) -> (Term, Arc<Val>) {
+        match self {
+            VarResult::Local(span, entry) => {
+                if (*entry.ty).clone().glued().whnf(cxt).is_owned() {
+                    if let Some(ispan) = entry.invalidated.get() {
+                        cxt.errors.push(
+                            Error::simple(
+                                "tried to access variable "
+                                    + entry.name.pretty(&cxt.db)
+                                    + " which has already been consumed",
+                                span,
+                            )
+                            .with_secondary(Label {
+                                span: ispan,
+                                message: "variable "
+                                    + entry.name.pretty(&cxt.db)
+                                    + " was consumed here",
+                                color: Some(Doc::COLOR2),
+                            }),
+                        );
+                    } else {
+                        entry.invalidated.set(Some(span));
+                    }
+                }
+                cxt.report_surplus(0);
+                (
+                    entry.val.quote(cxt.qenv()),
+                    // TODO keep arc ??
+                    Arc::new((*entry.ty).clone().add_cap_level(cxt.level - entry.level)),
+                )
+            }
+            VarResult::Other(term, ty) => (term, ty),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct Cxt {
     db: DB,
     def: Def,
-    bindings: im::HashMap<Name, (Val, Arc<Val>, u32)>,
+    bindings: im::HashMap<Name, VarEntry>,
     metas: Ref<HashMap<Meta, MetaEntry>>,
     zonked_metas: Ref<HashMap<(Meta, bool), Val>>,
     env: SEnv,
@@ -312,21 +379,14 @@ impl Cxt {
         (self.cap_surplus.set(before), r)
     }
 
-    fn lookup(&self, n: Name) -> Option<(Term, Arc<Val>)> {
+    fn lookup(&self, n: SName) -> Option<VarResult> {
         // first try locals
         self.bindings
-            .get(&n)
-            .map(|(val, ty, l)| {
-                self.report_surplus(0);
-                (
-                    val.quote(&self.qenv()),
-                    // TODO keep arc ??
-                    Arc::new((**ty).clone().add_cap_level(self.level - *l)),
-                )
-            })
+            .get(&n.0)
+            .map(|entry| VarResult::Local(n.span(), entry))
             .or_else(|| {
-                self.db.lookup_def_name(self.def, n).map(|(d, t)| {
-                    (
+                self.db.lookup_def_name(self.def, n.0).map(|(d, t)| {
+                    VarResult::Other(
                         Term::Head(Head::Def(d)),
                         match t {
                             Some(t) => t.clone(),
@@ -343,18 +403,18 @@ impl Cxt {
                         v.iter()
                             .rev()
                             .flatten()
-                            .find(|(s, _)| s.0 == n)
+                            .find(|(s, _)| s.0 == n.0)
                             .map(|(s, v)| (*s, v.clone()))
                     })
                     .or_else(|| {
                         self.uquant_stack.with_mut(|v| {
                             v.last_mut().map(|v| {
-                                assert!(!v.iter().any(|(s, _)| s.0 == n));
-                                let s = self.scxt().bind(n);
+                                assert!(!v.iter().any(|(s, _)| s.0 == n.0));
+                                let s = self.scxt().bind(n.0);
                                 // TODO span for the name
                                 let ty = Arc::new(self.new_meta(
                                     Val::Type,
-                                    MetaSource::TypeOf(n),
+                                    MetaSource::TypeOf(n.0),
                                     self.errors.span.span(),
                                 ));
                                 v.push((s, ty.clone()));
@@ -362,7 +422,7 @@ impl Cxt {
                             })
                         })
                     })?;
-                Some((Term::Head(Head::Sym(sym)), ty))
+                Some(VarResult::Other(Term::Head(Head::Sym(sym)), ty))
             })
     }
     fn solved_locals(&self) -> Vec<(Sym, Arc<Val>)> {
@@ -391,17 +451,28 @@ impl Cxt {
         }
     }
     fn bind_val(&mut self, n: Name, v: Val, ty: impl Into<Arc<Val>>) {
-        self.bindings.insert(n, (v, ty.into(), self.level));
+        self.bindings.insert(
+            n,
+            VarEntry {
+                name: n,
+                val: Arc::new(v),
+                invalidated: default(),
+                level: self.level,
+                ty: ty.into(),
+            },
+        );
     }
     fn bind_raw(&mut self, name: Name, sym: Sym, ty: impl Into<Arc<Val>>) -> Sym {
         self.env.env.0.insert(sym, Arc::new(Val::sym(sym)));
         self.bindings.insert(
             name,
-            (
-                Val::Neutral(Head::Sym(sym), default()),
-                ty.into(),
-                self.level,
-            ),
+            VarEntry {
+                name,
+                val: Arc::new(Val::sym(sym)),
+                invalidated: default(),
+                level: self.level,
+                ty: ty.into(),
+            },
         );
         sym
     }
@@ -686,7 +757,7 @@ impl GVal {
                         continue;
                     }
                 }
-                (Val::Cap(l, t), Val::Cap(l2, t2)) if *l == *l2 => {
+                (Val::Cap(l, c, t), Val::Cap(l2, c2, t2)) if *l == *l2 && *c == *c2 => {
                     a = (**t).clone().glued();
                     b = (**t2).clone().glued();
                     continue;
@@ -838,8 +909,11 @@ impl SPre {
                     .quote(&cxt.qenv());
                 (m, mty)
             }
-            Pre::Var(name) => match cxt.lookup(*name) {
-                Some((term, ty)) => (term, Arc::unwrap_or_clone(ty)),
+            Pre::Var(name) => match cxt.lookup(S(*name, self.span())) {
+                Some(entry) => {
+                    let (term, ty) = entry.consume(cxt);
+                    (term, Arc::unwrap_or_clone(ty))
+                }
                 None => {
                     cxt.err("name not found: " + name.pretty(&cxt.db), self.span());
                     (Term::Error, Val::Error)
@@ -847,7 +921,7 @@ impl SPre {
             },
             Pre::App(fs, x, i) => {
                 let (mut f, mut fty) = fs.infer(cxt, *i == Expl);
-                let aty = match fty.whnf(cxt).uncap().1 {
+                let aty = match fty.whnf(cxt).uncap().2 {
                     Val::Error => Val::Error,
                     // TODO: calling `-1 (+1 t, +0 u) -> ()` with `(+0 t, +0 u)` should be fine, right?
                     // TODO: and also how does this affect the surplus of the result?
@@ -1024,9 +1098,9 @@ impl SPre {
                     ),
                 )
             }
-            Pre::Cap(l, x) => {
+            Pre::Cap(l, c, x) => {
                 let x = x.check(Val::Type, cxt);
-                (Term::Cap(*l, Box::new(x)), Val::Type)
+                (Term::Cap(*l, *c, Box::new(x)), Val::Type)
             }
             Pre::Binder(_, _) => {
                 cxt.err("binder not allowed in this context", self.span());
@@ -1116,13 +1190,19 @@ impl SPre {
                     // Try to coerce if possible
                     match (ty.whnf(cxt), sty.whnf(cxt)) {
                         // demotion is always available
-                        (ty_, Val::Cap(l2, sty)) if !matches!(ty_, Val::Cap(_, _)) => {
+                        (ty_, Val::Cap(l2, Cap::Own, sty)) if !matches!(ty_, Val::Cap(_, _, _)) => {
                             if ty.clone().unify((**sty).clone().glued(), self.span(), cxt) {
                                 r.map(|r| cxt.report_surplus(r + l2));
                                 return s;
                             }
                         }
-                        (Val::Cap(l1, ty), Val::Cap(l2, sty)) if *l1 < *l2 => {
+                        (Val::Cap(0, Cap::Imm, ty), _sty) if !matches!(_sty, Val::Cap(_, _, _)) => {
+                            if (**ty).clone().glued().unify(sty.clone(), self.span(), cxt) {
+                                r.map(|r| cxt.report_surplus(r));
+                                return s;
+                            }
+                        }
+                        (Val::Cap(l1, c1, ty), Val::Cap(l2, c2, sty)) if *l1 <= *l2 && c2 >= c1 => {
                             if (**ty).clone().glued().unify(
                                 (**sty).clone().glued(),
                                 self.span(),
@@ -1133,14 +1213,14 @@ impl SPre {
                             }
                         }
                         // promotion is available if we have enough cap-level surplus
-                        (Val::Cap(l1, ty), _) if r.map_or(true, |r| r >= *l1) => {
+                        (Val::Cap(l1, Cap::Own, ty), _) if r.map_or(true, |r| r >= *l1) => {
                             if (**ty).clone().glued().unify(sty.clone(), self.span(), cxt) {
                                 r.map(|r| cxt.report_surplus(r - l1));
                                 return s;
                             }
                         }
-                        (Val::Cap(l1, ty), Val::Cap(l2, sty))
-                            if *l1 > *l2 && r.map_or(true, |r| r >= l1 - l2) =>
+                        (Val::Cap(l1, c1, ty), Val::Cap(l2, c2, sty))
+                            if *l1 > *l2 && c2 >= c1 && r.map_or(true, |r| r >= l1 - l2) =>
                         {
                             if (**ty).clone().glued().unify(
                                 (**sty).clone().glued(),

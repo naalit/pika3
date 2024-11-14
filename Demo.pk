@@ -3,8 +3,8 @@ def q : (a: Type) -> a -> a = _ => x => x
 
 # Church equality and naturals
 
-def Eq : {a : Type} -> a -> a -> Type = {a} => x => y => (P : a -> Type) -> P x -> P y
-def refl : {a : Type} -> {x : a} -> Eq x x = P => px => px
+def Eq : {a : Type} -> ref a -> ref a -> Type = {a} => x => y => (P : ref a -> Type) -> P x -> P y
+def refl : {a : Type} -> {x : ref a} -> Eq x x = P => px => px
 
 def Nat : Type = (a : Type) -> (a -> a) -> a -> a
 def zero : Nat = _ => f => x => x
@@ -59,7 +59,7 @@ def l2 = x => y => x -> y
 def Pair : Type -> Type -> Type
   = A => B => (P : Type) -> (A -> B -> P) -> P
 
-def dup : {A:Type} -> A -> Pair A A
+def dup : {A:Type} -> ref A -> Pair (ref A) (ref A)
   = a => P => p => p a a
 
 def id : {A:Type} -> A -> A
@@ -208,3 +208,6 @@ def p21_good =
 #     f2 U
 #     U
 #   )
+
+# def p23_dup_e : a -> (a, a) = x => (x, x)
+def p24_dup_type : Type -> (Type, Type) = x => (x, x)

@@ -50,6 +50,12 @@ impl Display for Icit {
     }
 }
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Cap {
+    Imm,
+    Own,
+}
+
 pub type Str = Arc<str>;
 
 pub trait ToRope {
@@ -114,6 +120,11 @@ impl<A> Ref<A> {
     }
     pub fn set(&self, val: A) -> A {
         self.with_mut(|a| std::mem::replace(a, val))
+    }
+}
+impl<A: Copy> Ref<A> {
+    pub fn get(&self) -> A {
+        self.with(|x| *x)
     }
 }
 
@@ -422,6 +433,11 @@ impl Error {
 
     pub fn with_label(mut self, m: impl Into<Doc>) -> Error {
         self.primary.message = m.into();
+        self
+    }
+
+    pub fn with_secondary(mut self, m: Label) -> Error {
+        self.secondary.push(m);
         self
     }
 
