@@ -236,12 +236,13 @@ impl Pretty for MetaSource {
 struct Cxt {
     db: DB,
     def: Def,
-    bindings: im::HashMap<Name, (Val, Arc<Val>)>,
+    bindings: im::HashMap<Name, (Val, Arc<Val>, u32)>,
     metas: Ref<HashMap<Meta, MetaEntry>>,
     zonked_metas: Ref<HashMap<(Meta, bool), Val>>,
     env: SEnv,
     uquant_stack: Ref<Vec<Vec<(Sym, Arc<Val>)>>>,
     cap_surplus: Ref<Option<u32>>,
+    level: u32,
     errors: Errors,
 }
 impl Cxt {
@@ -278,6 +279,7 @@ impl Cxt {
             metas,
             uquant_stack: default(),
             cap_surplus: None.into(),
+            level: 0,
             zonked_metas: default(),
         }
     }
@@ -314,9 +316,13 @@ impl Cxt {
         // first try locals
         self.bindings
             .get(&n)
-            .map(|(val, ty)| {
+            .map(|(val, ty, l)| {
                 self.report_surplus(0);
-                (val.quote(&self.qenv()), ty.clone())
+                (
+                    val.quote(&self.qenv()),
+                    // TODO keep arc ??
+                    Arc::new((**ty).clone().add_cap_level(self.level - *l)),
+                )
             })
             .or_else(|| {
                 self.db.lookup_def_name(self.def, n).map(|(d, t)| {
@@ -385,12 +391,18 @@ impl Cxt {
         }
     }
     fn bind_val(&mut self, n: Name, v: Val, ty: impl Into<Arc<Val>>) {
-        self.bindings.insert(n, (v, ty.into()));
+        self.bindings.insert(n, (v, ty.into(), self.level));
     }
     fn bind_raw(&mut self, name: Name, sym: Sym, ty: impl Into<Arc<Val>>) -> Sym {
         self.env.env.0.insert(sym, Arc::new(Val::sym(sym)));
-        self.bindings
-            .insert(name, (Val::Neutral(Head::Sym(sym), default()), ty.into()));
+        self.bindings.insert(
+            name,
+            (
+                Val::Neutral(Head::Sym(sym), default()),
+                ty.into(),
+                self.level,
+            ),
+        );
         sym
     }
     fn bind_(&mut self, n: Name, ty: impl Into<Arc<Val>>) -> Sym {
@@ -722,7 +734,7 @@ impl GVal {
 // don't call this if checking against an implicit lambda
 fn insert_metas(term: Term, mut ty: GVal, cxt: &Cxt, span: Span) -> (Term, GVal) {
     match ty.whnf(cxt) {
-        Val::Fun(Pi, Impl, n, aty, _, _) => {
+        Val::Fun(Pi(_), Impl, n, aty, _, _) => {
             let m = cxt.new_meta((**aty).clone(), MetaSource::ImpArg(n.0), span);
             let term = Term::App(
                 Box::new(term),
@@ -835,10 +847,12 @@ impl SPre {
             },
             Pre::App(fs, x, i) => {
                 let (mut f, mut fty) = fs.infer(cxt, *i == Expl);
-                let aty = match fty.whnf(cxt) {
+                let aty = match fty.whnf(cxt).uncap().1 {
                     Val::Error => Val::Error,
-                    Val::Fun(Pi, i2, _, aty, _, _) if i == i2 => (**aty).clone(),
-                    Val::Fun(Pi, _, _, _, _, _) => {
+                    // TODO: calling `-1 (+1 t, +0 u) -> ()` with `(+0 t, +0 u)` should be fine, right?
+                    // TODO: and also how does this affect the surplus of the result?
+                    Val::Fun(Pi(_), i2, _, aty, _, _) if i == i2 => (**aty).clone(),
+                    Val::Fun(Pi(_), _, _, _, _, _) => {
                         cxt.err(
                             "wrong function type: expected "
                                 + Doc::start(*i)
@@ -881,7 +895,7 @@ impl SPre {
                             *m,
                             spine,
                             Val::Fun(
-                                Pi,
+                                Pi(0),
                                 *i,
                                 s,
                                 Arc::new(m1.clone()),
@@ -910,7 +924,7 @@ impl SPre {
                     fty.as_small().app(vx),
                 )
             }
-            Pre::Pi(i, n, paty, body) => {
+            Pre::Pi(i, n, l, paty, body) => {
                 let q = !cxt.has_uquant();
                 if q {
                     cxt.push_uquant();
@@ -918,6 +932,7 @@ impl SPre {
                 let aty = paty.check(Val::Type, cxt);
                 let vaty = aty.eval(cxt.env());
                 let (s, cxt) = cxt.bind(*n, vaty.clone());
+                // TODO do we apply the local promotion while checking the pi return type?
                 let body = pat_bind_type(
                     &paty,
                     Val::Neutral(Head::Sym(s), default()),
@@ -928,9 +943,16 @@ impl SPre {
                 let scope = q.then(|| cxt.pop_uquant().unwrap());
                 (
                     scope.into_iter().flatten().rfold(
-                        Term::Fun(Pi, *i, s, Box::new(aty), Arc::new(body)),
+                        Term::Fun(Pi(*l), *i, s, Box::new(aty), Arc::new(body)),
                         |acc, (s, ty)| {
-                            Term::Fun(Pi, Impl, s, Box::new(ty.quote(cxt.qenv())), Arc::new(acc))
+                            Term::Fun(
+                                // use -0 for the uquant pis
+                                Pi(0),
+                                Impl,
+                                s,
+                                Box::new(ty.quote(cxt.qenv())),
+                                Arc::new(acc),
+                            )
                         },
                     ),
                     Val::Type,
@@ -939,7 +961,7 @@ impl SPre {
             Pre::Sigma(_, Some(_), _, _, _) | Pre::Sigma(_, _, _, Some(_), _) => {
                 (self.check(Val::Type, cxt), Val::Type)
             }
-            // If no type is given, assume monomorphic lambdas
+            // If no type is given, assume monomorphic (-0) lambdas
             Pre::Lam(i, pat, body) => {
                 let q = !cxt.has_uquant();
                 if q {
@@ -969,10 +991,10 @@ impl SPre {
                         .into_iter()
                         .flatten()
                         .fold(
-                            Term::Fun(Pi, *i, s, Box::new(aty2), Arc::new(rty)),
+                            Term::Fun(Pi(0), *i, s, Box::new(aty2), Arc::new(rty)),
                             |acc, (s, ty)| {
                                 Term::Fun(
-                                    Pi,
+                                    Pi(0),
                                     Impl,
                                     s,
                                     Box::new(ty.quote(cxt.qenv())),
@@ -1025,7 +1047,8 @@ impl SPre {
     fn check(&self, ty: impl Into<GVal>, cxt: &Cxt) -> Term {
         let mut ty: GVal = ty.into();
         match (&***self, ty.whnf(cxt)) {
-            (Pre::Lam(i, pat, body), Val::Fun(Pi, i2, _, aty2, _, _)) if i == i2 => {
+            (Pre::Lam(i, pat, body), Val::Fun(Pi(l), i2, _, aty2, _, _)) if i == i2 => {
+                let l = *l;
                 let mut cxt = cxt.clone();
                 let (sym, pat) =
                     PMatch::new(Some((**aty2).clone().glued()), &[pat.clone()], &mut cxt);
@@ -1033,7 +1056,8 @@ impl SPre {
 
                 let va = Val::Neutral(Head::Sym(sym), default());
                 // TODO why doesn't as_small() work here
-                let rty = ty.as_big().app(va.clone());
+                cxt.level += l;
+                let rty = ty.as_big().app(va.clone()).add_cap_level(l);
                 let cxt = pat.bind(0, &cxt);
                 let body = pat.compile(&[body.check(rty, &cxt)], &cxt);
                 Term::Fun(Lam, *i, sym, Box::new(aty), Arc::new(body))
@@ -1058,12 +1082,18 @@ impl SPre {
             (Pre::Do(block, last), _) => elab_block(block, last, Some(ty), cxt).0,
 
             // insert lambda when checking (non-implicit lambda) against implicit function type
-            (_, Val::Fun(Pi, Impl, n, aty, _, _)) => {
+            (_, Val::Fun(Pi(l), Impl, n, aty, _, _)) => {
+                let l = *l;
                 let aty2 = aty.quote(cxt.qenv());
                 // don't let them access the name in the term (shadowing existing names would be unintuitive)
                 let n = cxt.db.inaccessible(n.0);
+                let mut cxt = cxt.clone();
+                cxt.level += l;
                 let (sym, cxt) = cxt.bind(n, aty.clone());
-                let rty = ty.as_small().app(Val::Neutral(Head::Sym(sym), default()));
+                let rty = ty
+                    .as_small()
+                    .app(Val::Neutral(Head::Sym(sym), default()))
+                    .add_cap_level(l);
                 let body = self.check(rty, &cxt);
                 Term::Fun(Lam, Impl, sym, Box::new(aty2), Arc::new(body))
             }
@@ -1080,7 +1110,7 @@ impl SPre {
 
             (_, _) => {
                 let (r, (s, mut sty)) = cxt.record_surplus(|| {
-                    self.infer(cxt, !matches!(ty.big(), Val::Fun(Pi, Impl, _, _, _, _)))
+                    self.infer(cxt, !matches!(ty.big(), Val::Fun(Pi(_), Impl, _, _, _, _)))
                 });
                 if !ty.clone().unify(sty.clone(), self.span(), cxt) {
                     // Try to coerce if possible
@@ -1102,7 +1132,7 @@ impl SPre {
                                 return s;
                             }
                         }
-                        // TODO we can promote for auto-copy types
+                        // promotion is available if we have enough cap-level surplus
                         (Val::Cap(l1, ty), _) if r.map_or(true, |r| r >= *l1) => {
                             if (**ty).clone().glued().unify(sty.clone(), self.span(), cxt) {
                                 r.map(|r| cxt.report_surplus(r - l1));

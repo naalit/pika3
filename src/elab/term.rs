@@ -66,6 +66,21 @@ impl Val {
     pub fn sym(sym: Sym) -> Val {
         Val::Neutral(Head::Sym(sym), default())
     }
+    pub fn add_cap_level(self, l: u32) -> Val {
+        if l == 0 {
+            return self;
+        }
+        match self {
+            Val::Cap(l2, rest) => Val::Cap(l + l2, rest),
+            _ => Val::Cap(l, Arc::new(self)),
+        }
+    }
+    pub fn uncap(&self) -> (u32, &Val) {
+        match self {
+            Val::Cap(l, rest) => (*l, rest),
+            _ => (0, self),
+        }
+    }
 }
 
 // -- evaluation and quoting --
@@ -599,9 +614,11 @@ impl Pretty for Term {
             ) + " => "
                 + body.pretty(db))
             .prec(Prec::Term),
-            Term::Fun(Pi, i, s, aty, body) => {
+            Term::Fun(Pi(n), i, s, aty, body) => {
                 (pretty_binder(s.0, *i, Prec::App, aty.pretty(db), db)
-                    + " -> "
+                    + " "
+                    + Doc::intersperse((0..*n).map(|_| "&".into()), Doc::none())
+                    + "-> "
                     + body.pretty(db).nest(Prec::Pi))
                 .prec(Prec::Pi)
             }

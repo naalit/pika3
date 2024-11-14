@@ -30,7 +30,7 @@ pub enum Pre {
     Var(Name),
     Binder(SPre, SPre),
     App(SPre, SPre, Icit),
-    Pi(Icit, Name, SPre, SPre),
+    Pi(Icit, Name, u32, SPre, SPre),
     Sigma(Icit, Option<SName>, SPre, Option<SName>, SPre),
     Lam(Icit, SPrePat, SPre),
     Do(Vec<PreStmt>, SPre),
@@ -314,6 +314,7 @@ impl Parser {
                         }
                     }
                     s.in_indent = in_indent;
+                    s.skip_trivia(false);
                     let last = v
                         .pop()
                         .and_then(|x| match x {
@@ -390,13 +391,18 @@ impl Parser {
             self.expect(Tok::CClose);
         }
         let icit = if implicit { Impl } else { Expl };
-        if self.maybe(Tok::Arrow) {
-            // pi
+        if matches!(self.peek(), Tok::BitAnd | Tok::Arrow) {
+            // pi (possibly &->)
+            let mut n = 0;
+            while self.maybe(Tok::BitAnd) {
+                n += 1;
+            }
+            self.expect(Tok::Arrow);
             let rhs = self.fun(false);
             let (name, lhs) = self.reparse_pi_param(lhs);
             let name = name.map(|x| *x).unwrap_or(self.db.name("_"));
             S(
-                Box::new(Pre::Pi(icit, name, lhs, rhs)),
+                Box::new(Pre::Pi(icit, name, n, lhs, rhs)),
                 Span(start, self.pos_right()),
             )
         } else if self.maybe(Tok::WideArrow) {
