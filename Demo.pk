@@ -218,3 +218,17 @@ def p25_dupf : (a -> a) -> (a -> a, a -> a) = x => (x, x)
 #   (f, f)
 # def p28_callf_e : ref (a ~> a) -> a -> a = f => x => f x
 def p29_curry_e : (a ~> a) -> a -> a = f => x => f x # TODO: we can't capture something owned inside a -> function!
+
+def p30_imm : ref a &-> Type = _ => Type
+def p31_borrow : a -> a = x => do
+  let y = p30_imm x
+  x
+def p32_borrow : a -> (a, Type) = x => do
+  let y = p30_imm x
+  (x, y)
+def p33_imm : ref a -> Type = _ => Type
+# def p34_borrow_e : a -> (a, Type) = x => do
+#   let y = p33_imm x
+#   (x, y)
+def p35_imm : imm a -> imm a = x => x
+def p36_borrow : a -> ref a = x => p35_imm x

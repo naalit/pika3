@@ -75,6 +75,15 @@ impl Val {
             _ => Val::Cap(l, Cap::Own, Arc::new(self)),
         }
     }
+    pub fn as_cap(self, c: Cap) -> Val {
+        if c == Cap::Own {
+            return self;
+        }
+        match self {
+            Val::Cap(l, e, rest) => Val::Cap(l, c.min(e), rest),
+            _ => Val::Cap(0, c, Arc::new(self)),
+        }
+    }
     pub fn uncap(&self) -> (u32, Cap, &Val) {
         match self {
             Val::Cap(l, c, rest) => (*l, *c, rest),

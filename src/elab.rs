@@ -160,6 +160,9 @@ pub fn elab_def(def: Def, db: &DB) -> Option<DefElabResult> {
             pre.name.span(),
         );
     }
+
+    cxt.current_deps.take().check(&cxt);
+
     body.as_mut().map(|x| x.zonk(&cxt, false));
     let ty = ty.zonk(&cxt, true);
     if !solved_ty {
@@ -257,12 +260,70 @@ struct VarEntry {
     ty: Arc<Val>,
     level: u32,
     invalidated: Ref<Option<Span>>,
+    deps: VDeps,
+    borrow_gen: Ref<(u32, Span)>,
 }
 enum VarResult<'a> {
     Local(Span, &'a VarEntry),
     Other(Term, Arc<Val>),
 }
 impl VarResult<'_> {
+    fn ty(&self) -> &Val {
+        match self {
+            VarResult::Local(_, entry) => &entry.ty,
+            VarResult::Other(_, ty) => &ty,
+        }
+    }
+    fn borrow(self, cxt: &Cxt) -> (Term, Arc<Val>) {
+        match self {
+            VarResult::Local(span, entry) => {
+                if (*entry.ty).clone().glued().whnf(cxt).is_owned() {
+                    if let Some(ispan) = entry.invalidated.get() {
+                        cxt.errors.push(
+                            Error::simple(
+                                "tried to access variable "
+                                    + entry.name.pretty(&cxt.db)
+                                    + " which has already been consumed",
+                                span,
+                            )
+                            .with_secondary(Label {
+                                span: ispan,
+                                message: "variable "
+                                    + entry.name.pretty(&cxt.db)
+                                    + " was consumed here",
+                                color: Some(Doc::COLOR2),
+                            }),
+                        );
+                    }
+                } else {
+                    return self.consume(cxt);
+                }
+                let sym = match &*entry.val {
+                    Val::Neutral(Head::Sym(s), sp) if sp.is_empty() => *s,
+                    _ => return self.consume(cxt),
+                };
+                cxt.add_deps(Deps::from_var(
+                    entry
+                        .deps
+                        .iter()
+                        .cloned()
+                        .chain(std::iter::once((sym, 0, entry.borrow_gen.get().0)))
+                        .collect(),
+                    span,
+                ));
+                (
+                    entry.val.quote(cxt.qenv()),
+                    Arc::new(
+                        (*entry.ty)
+                            .clone()
+                            .add_cap_level(cxt.level - entry.level)
+                            .as_cap(Cap::Imm),
+                    ),
+                )
+            }
+            VarResult::Other(term, ty) => (term, ty),
+        }
+    }
     fn consume(self, cxt: &Cxt) -> (Term, Arc<Val>) {
         match self {
             VarResult::Local(span, entry) => {
@@ -286,8 +347,9 @@ impl VarResult<'_> {
                     } else {
                         entry.invalidated.set(Some(span));
                     }
+                    entry.borrow_gen.with_mut(|x| *x = (x.0 + 1, span));
                 }
-                cxt.report_surplus(0);
+                cxt.add_deps(Deps::from_var(entry.deps.clone(), span));
                 (
                     entry.val.quote(cxt.qenv()),
                     // TODO keep arc ??
@@ -295,6 +357,99 @@ impl VarResult<'_> {
                 )
             }
             VarResult::Other(term, ty) => (term, ty),
+        }
+    }
+}
+
+type VDeps = Vec<(Sym, i32, u32)>;
+#[derive(Default)]
+struct Deps {
+    surplus: Option<u32>,
+    // (level, borrow generation)
+    deps: HashMap<Sym, (Span, i32, u32)>,
+}
+impl Deps {
+    fn check(&self, cxt: &Cxt) {
+        for (s, (span, l, b)) in &self.deps {
+            if *l >= 0 {
+                let e = cxt.bindings.get(&s.0).unwrap();
+                assert_eq!(*e.val, Val::sym(*s));
+                if e.borrow_gen.get().0 > *b {
+                    cxt.errors.push(
+                        Error::simple(
+                            "this expression borrows "
+                                + s.0.pretty(&cxt.db)
+                                + " which has been mutated or consumed",
+                            *span,
+                        )
+                        .with_secondary(Label {
+                            span: e.borrow_gen.get().1,
+                            message: s.0.pretty(&cxt.db) + " was mutated or consumed here",
+                            color: Some(Doc::COLOR2),
+                        }),
+                    );
+                }
+            }
+        }
+    }
+    fn add(&mut self, other: Deps) {
+        match self.surplus {
+            None => self.surplus = other.surplus,
+            Some(r) => self.surplus = Some(other.surplus.map_or(r, |s| r.max(s))),
+        }
+        for (s, (span, vl, vb)) in other.deps {
+            match self.deps.get_mut(&s) {
+                None => {
+                    self.deps.insert(s, (span, vl, vb));
+                }
+                Some((_, l, b)) => {
+                    *l = vl.min(*l);
+                    *b = vb.min(*b);
+                }
+            }
+        }
+    }
+    fn demote(&mut self, by: u32) {
+        if by == 0 {
+            return;
+        }
+        if let Some(s) = &mut self.surplus {
+            *s += by;
+        }
+        for (_, (_, l, _)) in &mut self.deps {
+            *l -= by as i32;
+        }
+    }
+    fn try_promote(&mut self, by: u32) -> bool {
+        if by == 0 {
+            return true;
+        }
+        if let Some(s) = &mut self.surplus {
+            if *s >= by {
+                *s -= by;
+            } else {
+                return false;
+            }
+        }
+        for (_, (_, l, _)) in &mut self.deps {
+            *l += by as i32;
+        }
+        true
+    }
+    fn to_var(self) -> VDeps {
+        self.deps
+            .into_iter()
+            .map(|(k, (_, vl, vb))| (k, vl, vb))
+            .filter(|(_, vl, _)| *vl >= 0)
+            .collect()
+    }
+    fn from_var(d: VDeps, span: Span) -> Self {
+        Deps {
+            surplus: Some(0),
+            deps: d
+                .into_iter()
+                .map(|(k, vl, vb)| (k, (span, vl, vb)))
+                .collect(),
         }
     }
 }
@@ -308,7 +463,7 @@ struct Cxt {
     zonked_metas: Ref<HashMap<(Meta, bool), Val>>,
     env: SEnv,
     uquant_stack: Ref<Vec<Vec<(Sym, Arc<Val>)>>>,
-    cap_surplus: Ref<Option<u32>>,
+    current_deps: Ref<Deps>,
     level: u32,
     errors: Errors,
 }
@@ -345,7 +500,7 @@ impl Cxt {
             env,
             metas,
             uquant_stack: default(),
-            cap_surplus: None.into(),
+            current_deps: default(),
             level: 0,
             zonked_metas: default(),
         }
@@ -369,14 +524,13 @@ impl Cxt {
         self.uquant_stack.with_mut(|v| v.pop())
     }
 
-    fn report_surplus(&self, v: u32) {
-        self.cap_surplus
-            .with_mut(|t| *t = Some(t.map_or(v, |t| t.min(v))))
+    fn add_deps(&self, deps: Deps) {
+        self.current_deps.with_mut(|t| t.add(deps))
     }
-    fn record_surplus<R>(&self, f: impl FnOnce() -> R) -> (Option<u32>, R) {
-        let before = self.cap_surplus.take();
+    fn record_deps<R>(&self, f: impl FnOnce() -> R) -> (Deps, R) {
+        let before = self.current_deps.take();
         let r = f();
-        (self.cap_surplus.set(before), r)
+        (self.current_deps.set(before), r)
     }
 
     fn lookup(&self, n: SName) -> Option<VarResult> {
@@ -390,7 +544,6 @@ impl Cxt {
                         Term::Head(Head::Def(d)),
                         match t {
                             Some(t) => t.clone(),
-                            // TODO solve these across definitions
                             None => Arc::new(Val::Neutral(Head::Meta(Meta(d, 0)), default())),
                         },
                     )
@@ -450,6 +603,17 @@ impl Cxt {
             panic!("call can_solve first")
         }
     }
+    fn set_deps(&mut self, s: Sym, deps: VDeps) {
+        let e = self.bindings.get_mut(&s.0).unwrap();
+        if *e.val != Val::sym(s) {
+            eprintln!(
+                "warning: {} not {}",
+                s.0.pretty(&self.db),
+                e.val.pretty(&self.db)
+            );
+        }
+        e.deps = deps;
+    }
     fn bind_val(&mut self, n: Name, v: Val, ty: impl Into<Arc<Val>>) {
         self.bindings.insert(
             n,
@@ -459,6 +623,8 @@ impl Cxt {
                 invalidated: default(),
                 level: self.level,
                 ty: ty.into(),
+                deps: default(),
+                borrow_gen: (0, Span(0, 0)).into(),
             },
         );
     }
@@ -472,6 +638,8 @@ impl Cxt {
                 invalidated: default(),
                 level: self.level,
                 ty: ty.into(),
+                deps: default(),
+                borrow_gen: (0, Span(0, 0)).into(),
             },
         );
         sym
@@ -822,28 +990,30 @@ fn elab_block(block: &[PreStmt], last_: &SPre, ty: Option<GVal>, cxt1: &Cxt) -> 
     let mut cxt = cxt1.clone();
     let mut v = Vec::new();
     for x in block {
-        let (vsym, t, p, x) = match x {
+        let (vsym, deps, t, p, x) = match x {
             PreStmt::Expr(x) => {
-                let (x, xty) = x.infer(&cxt, true);
+                let (deps, (x, xty)) = cxt.record_deps(|| x.infer(&cxt, true));
                 let vsym = cxt.bind_(cxt.db.name("_"), xty.small().clone());
-                (vsym, xty.as_small(), None, x)
+                (vsym, deps, xty.as_small(), None, x)
             }
             PreStmt::Let(pat, body) if matches!(&***pat, PrePat::Binder(_, _)) => {
                 let cxt_start = cxt.clone();
                 let (sym, pat) = PMatch::new(None, &[pat.clone()], &mut cxt);
                 let aty = (*pat.ty).clone();
-                let body = body.check(aty.clone(), &cxt_start);
-                (sym, aty, Some(pat), body)
+                let (deps, body) = cxt.record_deps(|| body.check(aty.clone(), &cxt_start));
+                (sym, deps, aty, Some(pat), body)
             }
             PreStmt::Let(pat, body) => {
-                let (body, aty) = body.infer(&cxt, true);
+                let (deps, (body, aty)) = cxt.record_deps(|| body.infer(&cxt, true));
                 let (sym, pat) = PMatch::new(Some(aty.clone()), &[pat.clone()], &mut cxt);
-                (sym, aty.as_small(), Some(pat), body)
+                (sym, deps, aty.as_small(), Some(pat), body)
             }
         };
+        deps.check(&cxt);
         let t2 = t.quote(&cxt.qenv());
         if let Some(p) = &p {
             cxt = p.bind(0, &cxt);
+            cxt.set_deps(vsym, deps.to_var());
         }
         v.push((vsym, t2, p, x));
     }
@@ -897,9 +1067,9 @@ impl SPre {
     }
 
     fn infer(&self, cxt: &Cxt, should_insert_metas: bool) -> (Term, GVal) {
-        with_stack(|| self.infer_(cxt, should_insert_metas))
+        with_stack(|| self.infer_(cxt, should_insert_metas, false))
     }
-    fn infer_(&self, cxt: &Cxt, mut should_insert_metas: bool) -> (Term, GVal) {
+    fn infer_(&self, cxt: &Cxt, mut should_insert_metas: bool, can_borrow: bool) -> (Term, GVal) {
         let (s, sty) = match &***self {
             Pre::Var(name) if cxt.db.name("_") == *name => {
                 // hole
@@ -911,7 +1081,11 @@ impl SPre {
             }
             Pre::Var(name) => match cxt.lookup(S(*name, self.span())) {
                 Some(entry) => {
-                    let (term, ty) = entry.consume(cxt);
+                    let (term, ty) = if can_borrow && entry.ty().is_owned() {
+                        entry.borrow(cxt)
+                    } else {
+                        entry.consume(cxt)
+                    };
                     (term, Arc::unwrap_or_clone(ty))
                 }
                 None => {
@@ -922,11 +1096,13 @@ impl SPre {
             Pre::App(fs, x, i) => {
                 let (mut f, mut fty) = fs.infer(cxt, *i == Expl);
                 let (_, fc, vfty) = fty.whnf(cxt).uncap();
-                let aty = match vfty {
-                    Val::Error => Val::Error,
+                let (aty, l) = match vfty {
+                    Val::Error => (Val::Error, 0),
                     // TODO: calling `-1 (+1 t, +0 u) -> ()` with `(+0 t, +0 u)` should be fine, right?
                     // TODO: and also how does this affect the surplus of the result?
-                    Val::Fun(Pi(_, c), i2, _, aty, _, _) if i == i2 && fc >= *c => (**aty).clone(),
+                    Val::Fun(Pi(l, c), i2, _, aty, _, _) if i == i2 && fc >= *c => {
+                        ((**aty).clone(), *l)
+                    }
                     Val::Fun(Pi(_, c), _, _, _, _, _) if fc >= *c => {
                         cxt.err(
                             "wrong function type: expected "
@@ -938,7 +1114,7 @@ impl SPre {
                         // prevent .app() from panicking
                         f = Term::Error;
                         fty = Val::Error.glued();
-                        Val::Error
+                        (Val::Error, 0)
                     }
                     Val::Fun(Pi(_, Cap::Own), _, _, _, _, _) if fc == Cap::Imm => {
                         cxt.err(
@@ -951,7 +1127,7 @@ impl SPre {
                         // prevent .app() from panicking
                         f = Term::Error;
                         fty = Val::Error.glued();
-                        Val::Error
+                        (Val::Error, 0)
                     }
                     Val::Neutral(Head::Meta(m), spine) if cxt.meta_val(*m).is_none() => {
                         // Solve it to a pi type with more metas
@@ -992,7 +1168,7 @@ impl SPre {
                             ),
                             Some(self.span()),
                         );
-                        m1
+                        (m1, 0)
                     }
                     _ => {
                         cxt.err(
@@ -1002,10 +1178,12 @@ impl SPre {
                         // prevent .app() from panicking
                         f = Term::Error;
                         fty = Val::Error.glued();
-                        Val::Error
+                        (Val::Error, 0)
                     }
                 };
-                let x = x.check(aty, cxt);
+                let (mut r, x) = cxt.record_deps(|| x.check(aty, cxt));
+                r.demote(l);
+                cxt.add_deps(r);
                 let vx = x.eval(cxt.env());
                 (
                     Term::App(Box::new(f), TElim::App(*i, Box::new(x))),
@@ -1061,7 +1239,9 @@ impl SPre {
                 let aty2 = aty.quote(cxt.qenv());
 
                 let cxt3 = pat.bind(0, &cxt2);
-                let (body, rty) = body.infer(&cxt3, true);
+                // TODO should we do anything with this dependency?
+                let (deps, (body, rty)) = cxt.record_deps(|| body.infer(&cxt3, true));
+                deps.check(&cxt3);
                 let rty = rty.small().quote(&cxt3.qenv());
                 let body = pat.compile(&[body], &cxt2);
                 let rty = pat.compile(&[rty], &cxt2);
@@ -1147,7 +1327,10 @@ impl SPre {
                 cxt.level += l;
                 let rty = ty.as_big().app(va.clone()).add_cap_level(l);
                 let cxt = pat.bind(0, &cxt);
-                let body = pat.compile(&[body.check(rty, &cxt)], &cxt);
+                // TODO should we do anything with this dependency?
+                let (deps, body) = cxt.record_deps(|| body.check(rty, &cxt));
+                deps.check(&cxt);
+                let body = pat.compile(&[body], &cxt);
                 Term::Fun(Lam, *i, sym, Box::new(aty), Arc::new(body))
             }
             // when checking pair against type, assume sigma
@@ -1197,71 +1380,79 @@ impl SPre {
             }
 
             (_, _) => {
-                let (r, (s, mut sty)) = cxt.record_surplus(|| {
-                    self.infer(
+                let (r, (s, sty)) = cxt.record_deps(|| {
+                    self.infer_(
                         cxt,
                         !matches!(ty.big(), Val::Fun(Pi(_, _), Impl, _, _, _, _)),
+                        matches!(ty.big(), Val::Cap(_, Cap::Imm, _)),
                     )
                 });
-                if !ty.clone().unify(sty.clone(), self.span(), cxt) {
-                    // Try to coerce if possible
-                    match (ty.whnf(cxt), sty.whnf(cxt)) {
-                        // demotion is always available
-                        (ty_, Val::Cap(l2, Cap::Own, sty)) if !matches!(ty_, Val::Cap(_, _, _)) => {
-                            if ty.clone().unify((**sty).clone().glued(), self.span(), cxt) {
-                                r.map(|r| cxt.report_surplus(r + l2));
-                                return s;
-                            }
-                        }
-                        (Val::Cap(0, Cap::Imm, ty), _sty) if !matches!(_sty, Val::Cap(_, _, _)) => {
-                            if (**ty).clone().glued().unify(sty.clone(), self.span(), cxt) {
-                                r.map(|r| cxt.report_surplus(r));
-                                return s;
-                            }
-                        }
-                        (Val::Cap(l1, c1, ty), Val::Cap(l2, c2, sty)) if *l1 <= *l2 && c2 >= c1 => {
-                            if (**ty).clone().glued().unify(
-                                (**sty).clone().glued(),
-                                self.span(),
-                                cxt,
-                            ) {
-                                r.map(|r| cxt.report_surplus(r + (l2 - l1)));
-                                return s;
-                            }
-                        }
-                        // promotion is available if we have enough cap-level surplus
-                        (Val::Cap(l1, Cap::Own, ty), _) if r.map_or(true, |r| r >= *l1) => {
-                            if (**ty).clone().glued().unify(sty.clone(), self.span(), cxt) {
-                                r.map(|r| cxt.report_surplus(r - l1));
-                                return s;
-                            }
-                        }
-                        (Val::Cap(l1, c1, ty), Val::Cap(l2, c2, sty))
-                            if *l1 > *l2 && c2 >= c1 && r.map_or(true, |r| r >= l1 - l2) =>
-                        {
-                            if (**ty).clone().glued().unify(
-                                (**sty).clone().glued(),
-                                self.span(),
-                                cxt,
-                            ) {
-                                r.map(|r| cxt.report_surplus(r - (l1 - l2)));
-                                return s;
-                            }
-                        }
-                        _ => (),
-                    }
-
-                    cxt.err(
-                        "could not match types: expected "
-                            + ty.small().zonk(cxt, true).pretty(&cxt.db)
-                            + ", found "
-                            + sty.small().zonk(cxt, true).pretty(&cxt.db),
-                        self.span(),
-                    );
-                }
-                r.map(|r| cxt.report_surplus(r));
+                sty.coerce(ty, r, self.span(), cxt);
                 s
             }
         }
+    }
+}
+impl GVal {
+    fn coerce(mut self, mut to: GVal, mut r: Deps, span: Span, cxt: &Cxt) {
+        if !to.clone().unify(self.clone(), span, cxt) {
+            // Try to coerce if possible
+            match (to.whnf(cxt), self.whnf(cxt)) {
+                // demotion is always available
+                (ty_, Val::Cap(l2, Cap::Own, sty)) if !matches!(ty_, Val::Cap(_, _, _)) => {
+                    if to.clone().unify((**sty).clone().glued(), span, cxt) {
+                        r.demote(*l2);
+                        cxt.add_deps(r);
+                        return;
+                    }
+                }
+                (Val::Cap(0, Cap::Imm, ty), _sty) if !matches!(_sty, Val::Cap(_, _, _)) => {
+                    if (**ty).clone().glued().unify(self.clone(), span, cxt) {
+                        cxt.add_deps(r);
+                        return;
+                    }
+                }
+                (Val::Cap(l1, c1, ty), Val::Cap(l2, c2, sty)) if *l1 <= *l2 && c2 >= c1 => {
+                    if (**ty)
+                        .clone()
+                        .glued()
+                        .unify((**sty).clone().glued(), span, cxt)
+                    {
+                        r.demote(l2 - l1);
+                        cxt.add_deps(r);
+                        return;
+                    }
+                }
+                // promotion is available if we have enough cap-level surplus
+                (Val::Cap(l1, Cap::Own, ty), _) if r.try_promote(*l1) => {
+                    if (**ty).clone().glued().unify(self.clone(), span, cxt) {
+                        cxt.add_deps(r);
+                        return;
+                    }
+                }
+                (Val::Cap(l1, c1, ty), Val::Cap(l2, c2, sty))
+                    if *l1 > *l2 && c2 >= c1 && r.try_promote(l1 - l2) =>
+                {
+                    if (**ty)
+                        .clone()
+                        .glued()
+                        .unify((**sty).clone().glued(), span, cxt)
+                    {
+                        cxt.add_deps(r);
+                        return;
+                    }
+                }
+                _ => (),
+            }
+
+            cxt.err(
+                "could not match types: expected "
+                    + to.small().zonk(cxt, true).pretty(&cxt.db)
+                    + ", found "
+                    + self.small().zonk(cxt, true).pretty(&cxt.db),
+                span,
+            );
+        }
+        cxt.add_deps(r);
     }
 }
