@@ -55,6 +55,14 @@ pub enum Cap {
     Imm,
     Own,
 }
+impl Display for Cap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Cap::Imm => write!(f, "imm"),
+            Cap::Own => write!(f, "own"),
+        }
+    }
+}
 
 pub type Str = Arc<str>;
 

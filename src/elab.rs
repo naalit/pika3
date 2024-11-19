@@ -2,6 +2,7 @@ mod pattern;
 mod term;
 
 use pattern::*;
+use rustc_hash::{FxHashMap, FxHashSet};
 use term::*;
 pub use term::{Term, Val};
 
@@ -299,9 +300,19 @@ impl VarResult<'_> {
                     return self.consume(cxt);
                 }
                 let sym = match &*entry.val {
-                    Val::Neutral(Head::Sym(s), sp) if sp.is_empty() => *s,
+                    Val::Neutral(Head::Sym(s), sp) if sp.is_empty() && entry.name == s.0 => *s,
                     _ => return self.consume(cxt),
                 };
+                for (set, map) in &cxt.closure_stack {
+                    if set.contains(&sym) {
+                        map.with_mut(|map| match map.get_mut(&sym) {
+                            None => {
+                                map.insert(sym, (span, Cap::Imm));
+                            }
+                            _ => (),
+                        });
+                    }
+                }
                 cxt.add_deps(Deps::from_var(
                     entry
                         .deps
@@ -327,7 +338,8 @@ impl VarResult<'_> {
     fn consume(self, cxt: &Cxt) -> (Term, Arc<Val>) {
         match self {
             VarResult::Local(span, entry) => {
-                if (*entry.ty).clone().glued().whnf(cxt).is_owned() {
+                let is_owned = (*entry.ty).clone().glued().whnf(cxt).is_owned();
+                if is_owned {
                     if let Some(ispan) = entry.invalidated.get() {
                         cxt.errors.push(
                             Error::simple(
@@ -348,6 +360,28 @@ impl VarResult<'_> {
                         entry.invalidated.set(Some(span));
                     }
                     entry.borrow_gen.with_mut(|x| *x = (x.0 + 1, span));
+                }
+                match &*entry.val {
+                    Val::Neutral(Head::Sym(sym), sp) if sp.is_empty() && entry.name == sym.0 => {
+                        for (set, map) in &cxt.closure_stack {
+                            if set.contains(sym) {
+                                map.with_mut(|map| match map.get_mut(sym) {
+                                    None => {
+                                        map.insert(
+                                            *sym,
+                                            (span, if is_owned { Cap::Own } else { Cap::Imm }),
+                                        );
+                                    }
+                                    Some((_, Cap::Own)) => (),
+                                    Some(c) if is_owned => {
+                                        *c = (span, Cap::Own);
+                                    }
+                                    _ => (),
+                                });
+                            }
+                        }
+                    }
+                    _ => (),
                 }
                 cxt.add_deps(Deps::from_var(entry.deps.clone(), span));
                 (
@@ -459,10 +493,11 @@ struct Cxt {
     db: DB,
     def: Def,
     bindings: im::HashMap<Name, VarEntry>,
-    metas: Ref<HashMap<Meta, MetaEntry>>,
-    zonked_metas: Ref<HashMap<(Meta, bool), Val>>,
+    metas: Ref<FxHashMap<Meta, MetaEntry>>,
+    zonked_metas: Ref<FxHashMap<(Meta, bool), Val>>,
     env: SEnv,
     uquant_stack: Ref<Vec<Vec<(Sym, Arc<Val>)>>>,
+    closure_stack: Vec<(Arc<FxHashSet<Sym>>, Ref<FxHashMap<Sym, (Span, Cap)>>)>,
     current_deps: Ref<Deps>,
     level: u32,
     errors: Errors,
@@ -490,7 +525,7 @@ impl Cxt {
                 ),
             ),
         ))
-        .collect::<HashMap<_, _>>()
+        .collect::<FxHashMap<_, _>>()
         .into();
         Cxt {
             def: context,
@@ -500,6 +535,7 @@ impl Cxt {
             env,
             metas,
             uquant_stack: default(),
+            closure_stack: default(),
             current_deps: default(),
             level: 0,
             zonked_metas: default(),
@@ -522,6 +558,21 @@ impl Cxt {
     }
     fn pop_uquant(&self) -> Option<Vec<(Sym, Arc<Val>)>> {
         self.uquant_stack.with_mut(|v| v.pop())
+    }
+    fn push_closure(&mut self, ignore: Sym) {
+        let hs = self
+            .bindings
+            .iter()
+            .filter_map(|(k, v)| match &*v.val {
+                Val::Neutral(Head::Sym(s), sp) if sp.is_empty() && s.0 == *k => Some(*s),
+                _ => None,
+            })
+            .filter(|x| *x != ignore)
+            .collect();
+        self.closure_stack.push((Arc::new(hs), default()));
+    }
+    fn pop_closure(&mut self) -> Option<FxHashMap<Sym, (Span, Cap)>> {
+        self.closure_stack.pop().map(|(_, x)| x.take())
     }
 
     fn add_deps(&self, deps: Deps) {
@@ -1238,10 +1289,18 @@ impl SPre {
                 let aty = pat.ty.clone();
                 let aty2 = aty.quote(cxt.qenv());
 
-                let cxt3 = pat.bind(0, &cxt2);
+                cxt2.push_closure(s);
+                let mut cxt3 = pat.bind(0, &cxt2);
                 // TODO should we do anything with this dependency?
                 let (deps, (body, rty)) = cxt.record_deps(|| body.infer(&cxt3, true));
                 deps.check(&cxt3);
+                let cap = cxt3
+                    .pop_closure()
+                    .into_iter()
+                    .flatten()
+                    .any(|(_, (_, v))| v == Cap::Own)
+                    .then_some(Cap::Own)
+                    .unwrap_or(Cap::Imm);
                 let rty = rty.small().quote(&cxt3.qenv());
                 let body = pat.compile(&[body], &cxt2);
                 let rty = pat.compile(&[rty], &cxt2);
@@ -1259,7 +1318,7 @@ impl SPre {
                         .into_iter()
                         .flatten()
                         .fold(
-                            Term::Fun(Pi(0, Cap::Imm), *i, s, Box::new(aty2), Arc::new(rty)),
+                            Term::Fun(Pi(0, cap), *i, s, Box::new(aty2), Arc::new(rty)),
                             |acc, (s, ty)| {
                                 Term::Fun(
                                     Pi(0, Cap::Imm),
@@ -1315,7 +1374,8 @@ impl SPre {
     fn check(&self, ty: impl Into<GVal>, cxt: &Cxt) -> Term {
         let mut ty: GVal = ty.into();
         match (&***self, ty.whnf(cxt)) {
-            (Pre::Lam(i, pat, body), Val::Fun(Pi(l, _), i2, _, aty2, _, _)) if i == i2 => {
+            (Pre::Lam(i, pat, body), Val::Fun(Pi(l, c), i2, _, aty2, _, _)) if i == i2 => {
+                let c = *c;
                 let l = *l;
                 let mut cxt = cxt.clone();
                 let (sym, pat) =
@@ -1326,10 +1386,38 @@ impl SPre {
                 // TODO why doesn't as_small() work here
                 cxt.level += l;
                 let rty = ty.as_big().app(va.clone()).add_cap_level(l);
-                let cxt = pat.bind(0, &cxt);
+                cxt.push_closure(sym);
+                let mut cxt = pat.bind(0, &cxt);
                 // TODO should we do anything with this dependency?
                 let (deps, body) = cxt.record_deps(|| body.check(rty, &cxt));
                 deps.check(&cxt);
+                let (cs, (cspan, cap)) = cxt
+                    .pop_closure()
+                    .into_iter()
+                    .flatten()
+                    .find(|(_, (_, v))| *v == Cap::Own)
+                    .unwrap_or((sym, (self.span(), Cap::Imm)));
+                if cap > c {
+                    cxt.errors.push(
+                        Error::simple(
+                            "lambda is expected to have capability "
+                                + Doc::start(c)
+                                + " but captures local "
+                                + cs.0.pretty(&cxt.db)
+                                + " with capability "
+                                + Doc::start(cap),
+                            self.span(),
+                        )
+                        .with_secondary(Label {
+                            span: cspan,
+                            message: "local "
+                                + cs.0.pretty(&cxt.db)
+                                + " captured here as "
+                                + Doc::start(cap),
+                            color: Some(Doc::COLOR2),
+                        }),
+                    );
+                }
                 let body = pat.compile(&[body], &cxt);
                 Term::Fun(Lam, *i, sym, Box::new(aty), Arc::new(body))
             }

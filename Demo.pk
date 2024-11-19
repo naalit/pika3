@@ -39,7 +39,7 @@ def e : (f : Type -> Type) -> Eq (x => f x) f = f => refl
 
 # meta tests
 def c10b : Eq m10 m10b = refl
-def q1 : (a : _) -> (b : _) -> a -> b -> _ = _ => _ => x => y => x
+def q1 : (a : _) -> (b : _) -> a -> b ~> _ = _ => _ => x => y => x
 def q2 : (a : _) -> (b : _) -> a -> b -> _ = _ => _ => x => y => y
 
 # testing for meta scope errors
@@ -78,12 +78,12 @@ def letTest = do
 #   p
 
 def Vec : Type -> Nat -> Type
- = A => n => (V : Nat -> Type) -> ({n:_} -> A -> V n -> V (suc n)) -> V zero -> V n
+ = A => n => (V : Nat -> Type) ~> ({n:_} -> A -> V n -> V (suc n)) ~> V zero ~> V n
 
 def nil : {A:Type} -> Vec A zero
  = V => c => n => n
 
-def cons : {A:Type} -> {n:Nat} -> A -> Vec A n -> Vec A (suc n)
+def cons : {A:Type} -> {n:Nat} -> A -> Vec A n ~> Vec A (suc n)
  = a => v => V => c => n => c a (v V c n)
 
 def U = Type
@@ -153,10 +153,10 @@ def universal4 : (a -> a) -> (a -> a) = f => f
 def universal5 : (a -> a, a) -> a = (f, x) => f x
 def universal6 = (x : a) => x
 def universal7 = (f : a -> a) => (x : a) => f x
-def make_pair : a -> b -> (a, b) = a => b => (a, b)
+def make_pair : a -> b ~> (a, b) = a => b => (a, b)
 
 def recursive : a -> a = x => recursive x
-def takes_fun : a -> (a -> a) -> a = x => f => f x
+def takes_fun : a -> (a -> a) ~> a = x => f => f x
 def ttttest = (x : Nat) => takes_fun x
 def recursive_inferred = (x : Nat) => takes_fun x recursive_inferred
 # def recursive_inferred_2 = (x : Nat) => recursive_inferred_2 x # we can't actually infer the return type here
@@ -217,7 +217,7 @@ def p25_dupf : (a -> a) -> (a -> a, a -> a) = x => (x, x)
 #   let f : Type ~> Type = x => x
 #   (f, f)
 # def p28_callf_e : ref (a ~> a) -> a -> a = f => x => f x
-def p29_curry_e : (a ~> a) -> a -> a = f => x => f x # TODO: we can't capture something owned inside a -> function!
+# def p29_curry_e : (a ~> a) -> a -> a = f => x => f x
 
 def p30_imm : ref a &-> Type = _ => Type
 def p31_borrow : a -> a = x => do
@@ -231,4 +231,4 @@ def p33_imm : ref a -> Type = _ => Type
 #   let y = p33_imm x
 #   (x, y)
 def p35_imm : imm a -> imm a = x => x
-def p36_borrow : a -> ref a = x => p35_imm x
+# def p36_borrow_e : a -> ref a = x => p35_imm x # unclear if this should error or not
