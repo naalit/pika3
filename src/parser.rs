@@ -30,7 +30,7 @@ pub enum Pre {
     Var(Name),
     Binder(SPre, SPre),
     App(SPre, SPre, Icit),
-    Pi(Icit, Name, u32, Cap, SPre, SPre),
+    Pi(Icit, Name, u32, FCap, SPre, SPre),
     Sigma(Icit, Option<SName>, SPre, Option<SName>, SPre),
     Lam(Icit, SPrePat, SPre),
     Do(Vec<PreStmt>, SPre),
@@ -357,6 +357,12 @@ impl Parser {
                 Box::new(Pre::Cap(0, Cap::Imm, rest)),
                 Span(start, self.pos_right()),
             );
+        } else if self.maybe(Tok::MutKw) {
+            let rest = self.app();
+            return S(
+                Box::new(Pre::Cap(0, Cap::Mut, rest)),
+                Span(start, self.pos_right()),
+            );
         }
         let mut a = self.atom();
         // make sure we don't get in an infinite loop - stop looking for atoms if we don't consume any input
@@ -413,10 +419,10 @@ impl Parser {
                 n += 1;
             }
             let c = if self.maybe(Tok::WavyArrow) {
-                Cap::Own
+                FCap::Own
             } else {
                 self.expect(Tok::Arrow);
-                Cap::Imm
+                FCap::Imm
             };
             let rhs = self.fun(false);
             let (name, lhs) = self.reparse_pi_param(lhs);

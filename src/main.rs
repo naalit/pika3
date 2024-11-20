@@ -34,7 +34,11 @@ fn main() {
             // + i.body.as_ref().map_or("".into(), |x| x.pretty(&db)))
             .emit_stderr();
     }
+    let n = module.errors.len();
     for i in module.errors {
         i.write_cli(file, &mut cache);
+    }
+    if n != 0 {
+        eprintln!("{} errors emitted", n);
     }
 }

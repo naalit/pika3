@@ -29,7 +29,7 @@ pub fn with_stack<A>(c: impl FnOnce() -> A) -> A {
 pub enum Class {
     Lam,
     /// Pi types can have -n on the argument
-    Pi(u32, Cap),
+    Pi(u32, FCap),
     /// Sigmas, unlike other closures, can have a name assigned to the second value (the closure body)
     Sigma(Name),
 }
@@ -51,14 +51,38 @@ impl Display for Icit {
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum FCap {
+    Imm,
+    Own,
+}
+impl FCap {
+    pub fn cap(self) -> Cap {
+        match self {
+            FCap::Imm => Cap::Imm,
+            FCap::Own => Cap::Own,
+        }
+    }
+}
+impl Display for FCap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FCap::Imm => write!(f, "imm"),
+            FCap::Own => write!(f, "own"),
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Cap {
     Imm,
+    Mut,
     Own,
 }
 impl Display for Cap {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Cap::Imm => write!(f, "imm"),
+            Cap::Mut => write!(f, "mut"),
             Cap::Own => write!(f, "own"),
         }
     }

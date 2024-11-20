@@ -244,10 +244,10 @@ impl Val {
                 a.is_owned() || self.clone().app(Val::sym(*s)).is_owned()
             }
             // TODO FnOnce equivalent
-            Val::Fun(Pi(_, c), _, _, _, _, _) => *c == Cap::Own,
+            Val::Fun(Pi(_, c), _, _, _, _, _) => *c == FCap::Own,
             Val::Fun { .. } => true,
             Val::Pair(_, _) => unreachable!(),
-            Val::Cap(_, c, t) => *c == Cap::Own && t.is_owned(),
+            Val::Cap(_, c, t) => *c != Cap::Imm && t.is_owned(),
             Val::Error => false,
             Val::Type => false,
         }
@@ -275,67 +275,7 @@ impl VarResult<'_> {
             VarResult::Other(_, ty) => &ty,
         }
     }
-    fn borrow(self, cxt: &Cxt) -> (Term, Arc<Val>) {
-        match self {
-            VarResult::Local(span, entry) => {
-                if (*entry.ty).clone().glued().whnf(cxt).is_owned() {
-                    if let Some(ispan) = entry.invalidated.get() {
-                        cxt.errors.push(
-                            Error::simple(
-                                "tried to access variable "
-                                    + entry.name.pretty(&cxt.db)
-                                    + " which has already been consumed",
-                                span,
-                            )
-                            .with_secondary(Label {
-                                span: ispan,
-                                message: "variable "
-                                    + entry.name.pretty(&cxt.db)
-                                    + " was consumed here",
-                                color: Some(Doc::COLOR2),
-                            }),
-                        );
-                    }
-                } else {
-                    return self.consume(cxt);
-                }
-                let sym = match &*entry.val {
-                    Val::Neutral(Head::Sym(s), sp) if sp.is_empty() && entry.name == s.0 => *s,
-                    _ => return self.consume(cxt),
-                };
-                for (set, map) in &cxt.closure_stack {
-                    if set.contains(&sym) {
-                        map.with_mut(|map| match map.get_mut(&sym) {
-                            None => {
-                                map.insert(sym, (span, Cap::Imm));
-                            }
-                            _ => (),
-                        });
-                    }
-                }
-                cxt.add_deps(Deps::from_var(
-                    entry
-                        .deps
-                        .iter()
-                        .cloned()
-                        .chain(std::iter::once((sym, 0, entry.borrow_gen.get().0)))
-                        .collect(),
-                    span,
-                ));
-                (
-                    entry.val.quote(cxt.qenv()),
-                    Arc::new(
-                        (*entry.ty)
-                            .clone()
-                            .add_cap_level(cxt.level - entry.level)
-                            .as_cap(Cap::Imm),
-                    ),
-                )
-            }
-            VarResult::Other(term, ty) => (term, ty),
-        }
-    }
-    fn consume(self, cxt: &Cxt) -> (Term, Arc<Val>) {
+    fn access(self, cap: Cap, cxt: &Cxt) -> (Term, Arc<Val>) {
         match self {
             VarResult::Local(span, entry) => {
                 let is_owned = (*entry.ty).clone().glued().whnf(cxt).is_owned();
@@ -356,38 +296,56 @@ impl VarResult<'_> {
                                 color: Some(Doc::COLOR2),
                             }),
                         );
-                    } else {
+                    } else if cap == Cap::Own {
                         entry.invalidated.set(Some(span));
                     }
-                    entry.borrow_gen.with_mut(|x| *x = (x.0 + 1, span));
+                    if cap >= Cap::Mut {
+                        entry.borrow_gen.with_mut(|x| *x = (x.0 + 1, span));
+                    }
                 }
-                match &*entry.val {
+                let acap = if is_owned { cap } else { Cap::Imm };
+                let sym = match &*entry.val {
                     Val::Neutral(Head::Sym(sym), sp) if sp.is_empty() && entry.name == sym.0 => {
                         for (set, map) in &cxt.closure_stack {
                             if set.contains(sym) {
                                 map.with_mut(|map| match map.get_mut(sym) {
                                     None => {
-                                        map.insert(
-                                            *sym,
-                                            (span, if is_owned { Cap::Own } else { Cap::Imm }),
-                                        );
+                                        map.insert(*sym, (span, acap));
                                     }
-                                    Some((_, Cap::Own)) => (),
-                                    Some(c) if is_owned => {
-                                        *c = (span, Cap::Own);
+                                    Some((_, c)) if *c >= acap => (),
+                                    Some(c) => {
+                                        *c = (span, acap);
                                     }
-                                    _ => (),
                                 });
                             }
                         }
+                        Some(*sym)
                     }
-                    _ => (),
-                }
-                cxt.add_deps(Deps::from_var(entry.deps.clone(), span));
+                    _ => None,
+                };
+                let deps = match sym {
+                    Some(sym) if is_owned && acap < Cap::Own => Deps::from_var(
+                        entry
+                            .deps
+                            .iter()
+                            .cloned()
+                            .chain(std::iter::once((sym, 0, entry.borrow_gen.get().0)))
+                            .collect(),
+                        span,
+                    ),
+                    _ => Deps::from_var(entry.deps.clone(), span),
+                };
+                // TODO is this logic correct?
+                cxt.add_deps(deps.tap_mut(|x| x.demote(cxt.level - entry.level)));
                 (
                     entry.val.quote(cxt.qenv()),
                     // TODO keep arc ??
-                    Arc::new((*entry.ty).clone().add_cap_level(cxt.level - entry.level)),
+                    Arc::new(
+                        (*entry.ty)
+                            .clone()
+                            .add_cap_level(cxt.level - entry.level)
+                            .as_cap(if is_owned { acap } else { Cap::Own }),
+                    ),
                 )
             }
             VarResult::Other(term, ty) => (term, ty),
@@ -406,22 +364,37 @@ impl Deps {
     fn check(&self, cxt: &Cxt) {
         for (s, (span, l, b)) in &self.deps {
             if *l >= 0 {
-                let e = cxt.bindings.get(&s.0).unwrap();
-                assert_eq!(*e.val, Val::sym(*s));
-                if e.borrow_gen.get().0 > *b {
-                    cxt.errors.push(
-                        Error::simple(
-                            "this expression borrows "
+                if let Some(e) = cxt.bindings.get(&s.0) {
+                    if *e.val != Val::sym(*s) {
+                        cxt.errors.push(Error::simple(
+                            "internal error: trying to find "
                                 + s.0.pretty(&cxt.db)
-                                + " which has been mutated or consumed",
+                                + Doc::start(s.num())
+                                + " but got "
+                                + e.val.pretty(&cxt.db),
                             *span,
-                        )
-                        .with_secondary(Label {
-                            span: e.borrow_gen.get().1,
-                            message: s.0.pretty(&cxt.db) + " was mutated or consumed here",
-                            color: Some(Doc::COLOR2),
-                        }),
-                    );
+                        ));
+                    }
+                    if e.borrow_gen.get().0 > *b {
+                        cxt.errors.push(
+                            Error::simple(
+                                "this expression borrows "
+                                    + s.0.pretty(&cxt.db)
+                                    + " which has been mutated or consumed",
+                                *span,
+                            )
+                            .with_secondary(Label {
+                                span: e.borrow_gen.get().1,
+                                message: s.0.pretty(&cxt.db) + " was mutated or consumed here",
+                                color: Some(Doc::COLOR2),
+                            }),
+                        );
+                    }
+                } else {
+                    cxt.errors.push(Error::simple(
+                        "internal error: couldnt find " + s.0.pretty(&cxt.db),
+                        *span,
+                    ));
                 }
             }
         }
@@ -1118,9 +1091,9 @@ impl SPre {
     }
 
     fn infer(&self, cxt: &Cxt, should_insert_metas: bool) -> (Term, GVal) {
-        with_stack(|| self.infer_(cxt, should_insert_metas, false))
+        with_stack(|| self.infer_(cxt, should_insert_metas, Cap::Own))
     }
-    fn infer_(&self, cxt: &Cxt, mut should_insert_metas: bool, can_borrow: bool) -> (Term, GVal) {
+    fn infer_(&self, cxt: &Cxt, mut should_insert_metas: bool, borrow_as: Cap) -> (Term, GVal) {
         let (s, sty) = match &***self {
             Pre::Var(name) if cxt.db.name("_") == *name => {
                 // hole
@@ -1132,11 +1105,7 @@ impl SPre {
             }
             Pre::Var(name) => match cxt.lookup(S(*name, self.span())) {
                 Some(entry) => {
-                    let (term, ty) = if can_borrow && entry.ty().is_owned() {
-                        entry.borrow(cxt)
-                    } else {
-                        entry.consume(cxt)
-                    };
+                    let (term, ty) = entry.access(borrow_as, cxt);
                     (term, Arc::unwrap_or_clone(ty))
                 }
                 None => {
@@ -1151,10 +1120,10 @@ impl SPre {
                     Val::Error => (Val::Error, 0),
                     // TODO: calling `-1 (+1 t, +0 u) -> ()` with `(+0 t, +0 u)` should be fine, right?
                     // TODO: and also how does this affect the surplus of the result?
-                    Val::Fun(Pi(l, c), i2, _, aty, _, _) if i == i2 && fc >= *c => {
+                    Val::Fun(Pi(l, c), i2, _, aty, _, _) if i == i2 && fc >= c.cap() => {
                         ((**aty).clone(), *l)
                     }
-                    Val::Fun(Pi(_, c), _, _, _, _, _) if fc >= *c => {
+                    Val::Fun(Pi(_, c), _, _, _, _, _) if fc >= c.cap() => {
                         cxt.err(
                             "wrong function type: expected "
                                 + Doc::start(*i)
@@ -1167,10 +1136,10 @@ impl SPre {
                         fty = Val::Error.glued();
                         (Val::Error, 0)
                     }
-                    Val::Fun(Pi(_, Cap::Own), _, _, _, _, _) if fc == Cap::Imm => {
+                    Val::Fun(Pi(_, FCap::Own), _, _, _, _, _) if fc < Cap::Own => {
                         cxt.err(
                             "cannot call owned ~> function through "
-                                + Doc::keyword("imm")
+                                + Doc::keyword(fc)
                                 + " reference of type "
                                 + fty.small().pretty(&cxt.db),
                             fs.span(),
@@ -1210,7 +1179,7 @@ impl SPre {
                             *m,
                             spine,
                             Val::Fun(
-                                Pi(0, Cap::Imm),
+                                Pi(0, FCap::Imm),
                                 *i,
                                 s,
                                 Arc::new(m1.clone()),
@@ -1264,7 +1233,7 @@ impl SPre {
                         |acc, (s, ty)| {
                             Term::Fun(
                                 // use -0 imm for the uquant pis
-                                Pi(0, Cap::Imm),
+                                Pi(0, FCap::Imm),
                                 Impl,
                                 s,
                                 Box::new(ty.quote(cxt.qenv())),
@@ -1299,8 +1268,8 @@ impl SPre {
                     .into_iter()
                     .flatten()
                     .any(|(_, (_, v))| v == Cap::Own)
-                    .then_some(Cap::Own)
-                    .unwrap_or(Cap::Imm);
+                    .then_some(FCap::Own)
+                    .unwrap_or(FCap::Imm);
                 let rty = rty.small().quote(&cxt3.qenv());
                 let body = pat.compile(&[body], &cxt2);
                 let rty = pat.compile(&[rty], &cxt2);
@@ -1321,7 +1290,7 @@ impl SPre {
                             Term::Fun(Pi(0, cap), *i, s, Box::new(aty2), Arc::new(rty)),
                             |acc, (s, ty)| {
                                 Term::Fun(
-                                    Pi(0, Cap::Imm),
+                                    Pi(0, FCap::Imm),
                                     Impl,
                                     s,
                                     Box::new(ty.quote(cxt.qenv())),
@@ -1397,7 +1366,7 @@ impl SPre {
                     .flatten()
                     .find(|(_, (_, v))| *v == Cap::Own)
                     .unwrap_or((sym, (self.span(), Cap::Imm)));
-                if cap > c {
+                if cap > c.cap() {
                     cxt.errors.push(
                         Error::simple(
                             "lambda is expected to have capability "
@@ -1472,7 +1441,7 @@ impl SPre {
                     self.infer_(
                         cxt,
                         !matches!(ty.big(), Val::Fun(Pi(_, _), Impl, _, _, _, _)),
-                        matches!(ty.big(), Val::Cap(_, Cap::Imm, _)),
+                        ty.big().cap(),
                     )
                 });
                 sty.coerce(ty, r, self.span(), cxt);
@@ -1494,7 +1463,7 @@ impl GVal {
                         return;
                     }
                 }
-                (Val::Cap(0, Cap::Imm, ty), _sty) if !matches!(_sty, Val::Cap(_, _, _)) => {
+                (Val::Cap(0, _, ty), _sty) if !matches!(_sty, Val::Cap(_, _, _)) => {
                     if (**ty).clone().glued().unify(self.clone(), span, cxt) {
                         cxt.add_deps(r);
                         return;
@@ -1512,12 +1481,6 @@ impl GVal {
                     }
                 }
                 // promotion is available if we have enough cap-level surplus
-                (Val::Cap(l1, Cap::Own, ty), _) if r.try_promote(*l1) => {
-                    if (**ty).clone().glued().unify(self.clone(), span, cxt) {
-                        cxt.add_deps(r);
-                        return;
-                    }
-                }
                 (Val::Cap(l1, c1, ty), Val::Cap(l2, c2, sty))
                     if *l1 > *l2 && c2 >= c1 && r.try_promote(l1 - l2) =>
                 {
@@ -1526,6 +1489,14 @@ impl GVal {
                         .glued()
                         .unify((**sty).clone().glued(), span, cxt)
                     {
+                        cxt.add_deps(r);
+                        return;
+                    }
+                }
+                // TODO we can coerce to own or imm but not mut, that requires a reassignable lvalue???
+                (Val::Cap(l1, Cap::Imm | Cap::Own, ty), _) if r.try_promote(*l1) => {
+                    if (**ty).clone().glued().unify(self.clone(), span, cxt) {
+                        eprintln!("{} + {}", ty.pretty(&cxt.db), self.small().pretty(&cxt.db));
                         cxt.add_deps(r);
                         return;
                     }

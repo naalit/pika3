@@ -6,6 +6,11 @@ use std::sync::atomic::AtomicU32;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Sym(pub Name, u32);
+impl Sym {
+    pub fn num(self) -> u32 {
+        self.1
+    }
+}
 
 /// Meta ?d.0 is reserved for the type of `d`
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -88,6 +93,12 @@ impl Val {
         match self {
             Val::Cap(l, c, rest) => (*l, *c, rest),
             _ => (0, Cap::Own, self),
+        }
+    }
+    pub fn cap(&self) -> Cap {
+        match self {
+            Val::Cap(_, c, _) => *c,
+            _ => Cap::Own,
         }
     }
 }
@@ -628,8 +639,8 @@ impl Pretty for Term {
                     + " "
                     + Doc::intersperse((0..*n).map(|_| "&".into()), Doc::none())
                     + match c {
-                        Cap::Own => "~> ",
-                        Cap::Imm => "-> ",
+                        FCap::Own => "~> ",
+                        FCap::Imm => "-> ",
                     }
                     + body.pretty(db).nest(Prec::Pi))
                 .prec(Prec::Pi)
@@ -647,13 +658,15 @@ impl Pretty for Term {
             Term::Cap(l, c, x) => (Doc::intersperse(
                 (0..*l).map(|_| {
                     Doc::keyword(match c {
-                        Cap::Own => "own ",
                         Cap::Imm => "imm ",
+                        _ => "own ",
                     })
                 }),
                 Doc::none(),
             ) + (if *c == Cap::Imm && *l == 0 {
                 Doc::keyword("ref ")
+            } else if *c == Cap::Mut {
+                Doc::keyword("mut ")
             } else {
                 Doc::none()
             }) + x.pretty(db).nest(Prec::App))
