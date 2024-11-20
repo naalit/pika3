@@ -148,7 +148,7 @@ fn split_ty(
 
 #[derive(Clone)]
 enum IPat {
-    Var(Name, Option<Arc<SPre>>),
+    Var(bool, Name, Option<Arc<SPre>>),
     CPat(Option<Name>, CPat),
 }
 impl IPat {
@@ -182,7 +182,7 @@ impl IPat {
     fn name(&self) -> Option<Name> {
         match self {
             IPat::CPat(n, _) => *n,
-            IPat::Var(n, _) => Some(*n),
+            IPat::Var(_, n, _) => Some(*n),
         }
     }
 }
@@ -190,8 +190,8 @@ impl SPrePat {
     fn ipat(&self, db: &DB) -> S<IPat> {
         S(
             match &***self {
-                PrePat::Name(s) => IPat::Var(**s, None),
-                PrePat::Binder(s, s1) => IPat::Var(**s, Some(Arc::new(s1.clone()))),
+                PrePat::Name(m, s) => IPat::Var(*m, **s, None),
+                PrePat::Binder(m, s, s1) => IPat::Var(*m, **s, Some(Arc::new(s1.clone()))),
                 PrePat::Pair(icit, s, s1) => IPat::CPat(
                     None,
                     CPat {
@@ -205,7 +205,7 @@ impl SPrePat {
                         ],
                     },
                 ),
-                PrePat::Error => IPat::Var(db.name("_"), None),
+                PrePat::Error => IPat::Var(false, db.name("_"), None),
             },
             self.span(),
         )
@@ -215,10 +215,23 @@ impl SPrePat {
 #[derive(Clone)]
 struct PRow {
     cols: Vec<(Sym, Arc<Val>, S<IPat>)>,
-    assignments: Vec<(Name, Sym, Arc<Val>)>,
+    assignments: Vec<(bool, Name, Sym, Arc<Val>, bool)>,
     body: u32,
 }
 impl PRow {
+    // Avoid redundant bindings of the same symbol
+    // Soft bind = "we need this accessible for type reasons"; hard bind = "the user bound this to a name"
+    fn soft_bind(&mut self, s: Sym, ty: Arc<Val>, cxt: &Cxt) {
+        if !self.assignments.iter().any(|(_, _, s2, _, _)| s == *s2) {
+            let n = cxt.db.inaccessible(s.0);
+            self.assignments.push((false, n, s, ty, false));
+        }
+    }
+    fn hard_bind(&mut self, m: bool, n: Name, s: Sym, ty: Arc<Val>) {
+        self.assignments.push((m, n, s, ty, true));
+        self.assignments.retain(|(_, _, s2, _, b)| *b || s != *s2);
+    }
+
     fn remove_column(
         self: &PRow,
         var: Sym,
@@ -236,12 +249,12 @@ impl PRow {
             let mut s = self.clone();
             let (_, t, pat) = s.cols.remove(i);
             match pat.0 {
-                IPat::Var(n, None) => {
-                    s.assignments.push((n, var, t.clone()));
+                IPat::Var(m, n, None) => {
+                    s.hard_bind(m, n, var, t.clone());
 
                     Some(s)
                 }
-                IPat::Var(n, Some(paty)) => {
+                IPat::Var(m, n, Some(paty)) => {
                     let aty = paty.check(Val::Type, cxt).eval(cxt.env());
                     if !aty.clone().glued().unify((*t).clone().glued(), pat.1, cxt) {
                         cxt.err(
@@ -252,13 +265,13 @@ impl PRow {
                             paty.span(),
                         );
                     }
-                    s.assignments.push((n, var, t.clone()));
+                    s.hard_bind(m, n, var, t.clone());
 
                     Some(s)
                 }
                 IPat::CPat(n, pat) => {
                     if let Some(n) = n {
-                        s.assignments.push((n, var, t.clone()));
+                        s.hard_bind(false, n, var, t.clone());
                     }
                     if label == Some(pat.label) {
                         let mut j = i;
@@ -333,7 +346,7 @@ impl PTree {
 struct PBody {
     reached: bool,
     solved_locals: Vec<(Sym, Arc<Val>)>,
-    vars: Vec<(Name, Sym, Arc<Val>)>,
+    vars: Vec<(bool, Name, Sym, Arc<Val>)>,
 }
 struct PCxt {
     bodies: Vec<PBody>,
@@ -359,8 +372,9 @@ fn compile_rows(rows: &[PRow], pcxt: &mut PCxt, cxt: &Cxt) -> PTree {
                     .iter()
                     .zip(&row.assignments)
                     // TODO better span?
-                    .all(|((n1, _, t1), (n2, _, t2))| {
-                        *n1 == *n2
+                    .all(|((m1, n1, _, t1), (m2, n2, _, t2, _))| {
+                        m1 == m2
+                            && n1 == n2
                             && (**t1)
                                 .clone()
                                 .glued()
@@ -376,8 +390,8 @@ fn compile_rows(rows: &[PRow], pcxt: &mut PCxt, cxt: &Cxt) -> PTree {
                 vars: row
                     .assignments
                     .iter()
-                    .map(|(n, s, t)| {
-                        (*n, *s, {
+                    .map(|(m, n, s, t, _)| {
+                        (*m, *n, *s, {
                             // Needed to account for locals solved during pattern compilation
                             // TODO but those locals can be in the spine ??? do we even need this?
                             // Arc::new((**t).clone().glued().whnf(cxt).clone())
@@ -391,8 +405,8 @@ fn compile_rows(rows: &[PRow], pcxt: &mut PCxt, cxt: &Cxt) -> PTree {
             row.body,
             row.assignments
                 .iter()
-                .filter(|(_, s, _)| *s != pcxt.var)
-                .map(|(_, s, _)| *s)
+                .filter(|(_, _, s, _, _)| *s != pcxt.var)
+                .map(|(_, _, s, _, _)| *s)
                 .collect(),
             cxt.clone(),
         )
@@ -414,7 +428,7 @@ fn compile_rows(rows: &[PRow], pcxt: &mut PCxt, cxt: &Cxt) -> PTree {
             .flat_map(|x| &x.vars)
             .map(|n| {
                 match &**n {
-                    IPat::Var(n, _) => Some(*n),
+                    IPat::Var(_, n, _) => Some(*n),
                     IPat::CPat(n, _) => *n,
                 }
                 .filter(|n| *n != nempty)
@@ -441,15 +455,12 @@ fn compile_rows(rows: &[PRow], pcxt: &mut PCxt, cxt: &Cxt) -> PTree {
                     // We do need to add the implicit argument to the assignments for each row
                     let mut rows = rows.to_vec();
                     let (isym, ity) = ctors[0].var_tys[0].clone();
-                    let iname = cxt.db.inaccessible(isym.0);
                     let (vsym, vty) = ctors[0].var_tys[1].clone();
-                    let vname = cxt.db.inaccessible(vsym.0);
-                    // Because we're not calling remove_column(), they can't bind the sym we split on either, so we'll need to do that
-                    let rname = cxt.db.inaccessible(var.0);
                     for row in &mut rows {
-                        row.assignments.push((rname, *var, ty.clone()));
-                        row.assignments.push((iname, isym, ity.clone()));
-                        row.assignments.push((vname, vsym, vty.clone()));
+                        // Because we're not calling remove_column(), they can't bind the sym we split on either, so we'll need to do that
+                        row.soft_bind(*var, ty.clone(), &cxt);
+                        row.soft_bind(isym, ity.clone(), &cxt);
+                        row.soft_bind(vsym, vty.clone(), &cxt);
                         row.cols.iter_mut().for_each(|(s, t, _)| {
                             if s == var {
                                 *s = vsym;
@@ -519,12 +530,13 @@ pub(super) struct PMatch {
 impl PMatch {
     pub fn bind(&self, body: u32, cxt: &Cxt) -> Cxt {
         let mut cxt = cxt.clone();
-        for (name, sym, ty) in &self.pcxt.bodies[body as usize].vars {
+        for (m, name, sym, ty) in &self.pcxt.bodies[body as usize].vars {
             if *sym == self.pcxt.var {
-                cxt.bind_val(*name, Val::sym(*sym), ty.clone());
+                cxt.bind_existing_var(*name, *sym);
             } else {
                 cxt.bind_raw(*name, *sym, ty.clone());
             }
+            cxt.set_mutable(*sym, *m);
         }
         for (sym, val) in &self.pcxt.bodies[body as usize].solved_locals {
             // Make sure the solutions of any solved locals are actually in scope
@@ -554,7 +566,7 @@ impl PMatch {
             .zip(&self.body_syms)
             .rev()
         {
-            let body = vars.iter().rfold(body.clone(), |acc, (_, s, ty)| {
+            let body = vars.iter().rfold(body.clone(), |acc, (_, _, s, ty)| {
                 Term::Fun(Lam, Expl, *s, Box::new(ty.quote(cxt.qenv())), Arc::new(acc))
             });
             term = Term::App(
@@ -573,21 +585,24 @@ impl PMatch {
     }
 
     pub fn new(ty: Option<GVal>, branches: &[SPrePat], ocxt: &mut Cxt) -> (Sym, PMatch) {
-        let (name, ty) = branches
+        let (m, name, ty) = branches
             .first()
             .map(|p| match p.ipat(&ocxt.db).0 {
-                IPat::Var(n, None) => (
+                IPat::Var(m, n, None) => (
+                    m,
                     n,
                     ty.unwrap_or_else(|| {
                         ocxt.new_meta(Val::Type, MetaSource::TypeOf(n), p.span())
                             .glued()
                     }),
                 ),
-                IPat::Var(n, Some(paty)) => (
+                IPat::Var(m, n, Some(paty)) => (
+                    m,
                     n,
                     ty.unwrap_or_else(|| paty.check(Val::Type, &ocxt).eval(ocxt.env()).glued()),
                 ),
                 IPat::CPat(n, _) => (
+                    false,
                     n.unwrap_or(ocxt.db.name("_")),
                     ty.unwrap_or_else(|| {
                         ocxt.new_meta(
@@ -603,6 +618,7 @@ impl PMatch {
         let ty = Arc::new(ty.as_small());
 
         let var = ocxt.bind_(name, ty.clone());
+        ocxt.set_mutable(var, m);
         let mut cxt = ocxt.clone();
 
         let mut pcxt = PCxt {

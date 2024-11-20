@@ -234,11 +234,11 @@ def p35_imm : imm a -> imm a = x => x
 # def p36_borrow_e : a -> ref a = x => p35_imm x # unclear if this should error or not
 
 def p37_mut : mut a -> Type = x => U
-def p38_borrow_mut : a -> a = x => do
+def p38_borrow_mut : a -> a = mut x => do
   p37_mut x
   p37_mut x
   x
-# def p39_borrow_mut_e : a -> a = x => do
+# def p39_borrow_mut_e : a -> a = mut x => do
 #   let a = p37_mut x
 #   p37_mut x
 #   let b = a
@@ -247,3 +247,13 @@ def p38_borrow_mut : a -> a = x => do
 #   p37_mut x
 #   p37_mut x
 #   x
+# def p41_borrow_mut_e : a -> a = x => do
+#   p37_mut x
+#   p37_mut x
+#   x
+def p42_let_mut : a -> a = x => do
+  let mut y = x
+  p37_mut y
+  mut z = y # shortcut syntax
+  p37_mut z
+  z

@@ -14,8 +14,8 @@ pub type SPrePat = S<Box<PrePat>>;
 
 #[derive(Debug, Clone)]
 pub enum PrePat {
-    Name(SName),
-    Binder(SName, SPre),
+    Name(bool, SName),
+    Binder(bool, SName, SPre),
     Pair(Icit, SPrePat, SPrePat),
     Error,
 }
@@ -239,21 +239,37 @@ impl Parser {
     fn reparse_pattern(&mut self, param: &SPre) -> PrePat {
         match &***param {
             Pre::Binder(lhs, rhs) => match &***lhs {
-                Pre::Var(name) => PrePat::Binder(S(*name, lhs.span()), rhs.clone()),
+                Pre::Var(name) => PrePat::Binder(false, S(*name, lhs.span()), rhs.clone()),
                 _ => {
                     // TODO we probably do allow patterns here
-                    self.error("left-hand side of binder must be a simple name", lhs.span());
+                    self.error("left-hand side of binder must be a name", lhs.span());
                     PrePat::Error
                 }
             },
-            Pre::Var(name) => PrePat::Name(S(*name, param.span())),
+            Pre::Cap(0, Cap::Mut, p) => match &***p {
+                Pre::Var(name) => PrePat::Name(true, S(*name, param.span())),
+                Pre::Binder(lhs, rhs) => match &***lhs {
+                    Pre::Var(name) => PrePat::Binder(true, S(*name, lhs.span()), rhs.clone()),
+                    _ => {
+                        // TODO we probably do allow patterns here
+                        self.error("left-hand side of binder must be a name", lhs.span());
+                        PrePat::Error
+                    }
+                },
+                _ => {
+                    self.error("invalid pattern", param.span());
+                    PrePat::Error
+                }
+            },
+            Pre::Var(name) => PrePat::Name(false, S(*name, param.span())),
+            // TODO (mut a : T, mut b : T)
             Pre::Sigma(i, n1, a, n2, b) => {
                 let a = match n1 {
-                    Some(n) => S(Box::new(PrePat::Binder(*n, a.clone())), a.span()),
+                    Some(n) => S(Box::new(PrePat::Binder(false, *n, a.clone())), a.span()),
                     None => S(Box::new(self.reparse_pattern(a)), a.span()),
                 };
                 let b = match n2 {
-                    Some(n) => S(Box::new(PrePat::Binder(*n, b.clone())), b.span()),
+                    Some(n) => S(Box::new(PrePat::Binder(false, *n, b.clone())), b.span()),
                     None => S(Box::new(self.reparse_pattern(b)), b.span()),
                 };
                 PrePat::Pair(*i, a, b)
@@ -296,7 +312,7 @@ impl Parser {
                     s.expect(Tok::Indent);
                     let mut v = Vec::new();
                     while !s.maybe(Tok::Dedent) {
-                        if s.maybe(Tok::LetKw) {
+                        if s.maybe(Tok::LetKw) || s.peek() == Tok::MutKw {
                             let pat = s.spanned(|s| {
                                 let pat = s.fun(true);
                                 Box::new(s.reparse_pattern(&pat))

@@ -257,12 +257,13 @@ impl Val {
 #[derive(Clone)]
 struct VarEntry {
     name: Name,
-    val: Arc<Val>,
+    sym: Sym,
     ty: Arc<Val>,
     level: u32,
     invalidated: Ref<Option<Span>>,
     deps: VDeps,
     borrow_gen: Ref<(u32, Span)>,
+    mutable: bool,
 }
 enum VarResult<'a> {
     Local(Span, &'a VarEntry),
@@ -303,42 +304,46 @@ impl VarResult<'_> {
                         entry.borrow_gen.with_mut(|x| *x = (x.0 + 1, span));
                     }
                 }
+                if cap == Cap::Mut && !entry.mutable {
+                    cxt.err(
+                        "cannot borrow immutable variable "
+                            + entry.name.pretty(&cxt.db)
+                            + " as "
+                            + Doc::keyword("mut"),
+                        span,
+                    );
+                }
                 let acap = if is_owned { cap } else { Cap::Imm };
-                let sym = match &*entry.val {
-                    Val::Neutral(Head::Sym(sym), sp) if sp.is_empty() && entry.name == sym.0 => {
-                        for (set, map) in &cxt.closure_stack {
-                            if set.contains(sym) {
-                                map.with_mut(|map| match map.get_mut(sym) {
-                                    None => {
-                                        map.insert(*sym, (span, acap));
-                                    }
-                                    Some((_, c)) if *c >= acap => (),
-                                    Some(c) => {
-                                        *c = (span, acap);
-                                    }
-                                });
+                for (set, map) in &cxt.closure_stack {
+                    if set.contains(&entry.sym) {
+                        map.with_mut(|map| match map.get_mut(&entry.sym) {
+                            None => {
+                                map.insert(entry.sym, (span, acap));
                             }
-                        }
-                        Some(*sym)
+                            Some((_, c)) if *c >= acap => (),
+                            Some(c) => {
+                                *c = (span, acap);
+                            }
+                        });
                     }
-                    _ => None,
-                };
-                let deps = match sym {
-                    Some(sym) if is_owned && acap < Cap::Own => Deps::from_var(
+                }
+                let deps = if is_owned && acap < Cap::Own {
+                    Deps::from_var(
                         entry
                             .deps
                             .iter()
                             .cloned()
-                            .chain(std::iter::once((sym, 0, entry.borrow_gen.get().0)))
+                            .chain(std::iter::once((entry.sym, 0, entry.borrow_gen.get().0)))
                             .collect(),
                         span,
-                    ),
-                    _ => Deps::from_var(entry.deps.clone(), span),
+                    )
+                } else {
+                    Deps::from_var(entry.deps.clone(), span)
                 };
                 // TODO is this logic correct?
                 cxt.add_deps(deps.tap_mut(|x| x.demote(cxt.level - entry.level)));
                 (
-                    entry.val.quote(cxt.qenv()),
+                    Term::Head(Head::Sym(entry.sym)),
                     // TODO keep arc ??
                     Arc::new(
                         (*entry.ty)
@@ -364,17 +369,7 @@ impl Deps {
     fn check(&self, cxt: &Cxt) {
         for (s, (span, l, b)) in &self.deps {
             if *l >= 0 {
-                if let Some(e) = cxt.bindings.get(&s.0) {
-                    if *e.val != Val::sym(*s) {
-                        cxt.errors.push(Error::simple(
-                            "internal error: trying to find "
-                                + s.0.pretty(&cxt.db)
-                                + Doc::start(s.num())
-                                + " but got "
-                                + e.val.pretty(&cxt.db),
-                            *span,
-                        ));
-                    }
+                if let Some(e) = cxt.vars.get(&s) {
                     if e.borrow_gen.get().0 > *b {
                         cxt.errors.push(
                             Error::simple(
@@ -465,7 +460,8 @@ impl Deps {
 struct Cxt {
     db: DB,
     def: Def,
-    bindings: im::HashMap<Name, VarEntry>,
+    bindings: im::HashMap<Name, Sym>,
+    vars: im::HashMap<Sym, VarEntry>,
     metas: Ref<FxHashMap<Meta, MetaEntry>>,
     zonked_metas: Ref<FxHashMap<(Meta, bool), Val>>,
     env: SEnv,
@@ -504,6 +500,7 @@ impl Cxt {
             def: context,
             db,
             bindings: default(),
+            vars: default(),
             errors: env.qenv.errors.clone(),
             env,
             metas,
@@ -533,15 +530,7 @@ impl Cxt {
         self.uquant_stack.with_mut(|v| v.pop())
     }
     fn push_closure(&mut self, ignore: Sym) {
-        let hs = self
-            .bindings
-            .iter()
-            .filter_map(|(k, v)| match &*v.val {
-                Val::Neutral(Head::Sym(s), sp) if sp.is_empty() && s.0 == *k => Some(*s),
-                _ => None,
-            })
-            .filter(|x| *x != ignore)
-            .collect();
+        let hs = self.vars.keys().copied().filter(|x| *x != ignore).collect();
         self.closure_stack.push((Arc::new(hs), default()));
     }
     fn pop_closure(&mut self) -> Option<FxHashMap<Sym, (Span, Cap)>> {
@@ -561,6 +550,7 @@ impl Cxt {
         // first try locals
         self.bindings
             .get(&n.0)
+            .and_then(|s| self.vars.get(s))
             .map(|entry| VarResult::Local(n.span(), entry))
             .or_else(|| {
                 self.db.lookup_def_name(self.def, n.0).map(|(d, t)| {
@@ -628,43 +618,45 @@ impl Cxt {
         }
     }
     fn set_deps(&mut self, s: Sym, deps: VDeps) {
-        let e = self.bindings.get_mut(&s.0).unwrap();
-        if *e.val != Val::sym(s) {
-            eprintln!(
-                "warning: {} not {}",
-                s.0.pretty(&self.db),
-                e.val.pretty(&self.db)
-            );
-        }
+        let e = self.vars.get_mut(&s).unwrap();
         e.deps = deps;
     }
-    fn bind_val(&mut self, n: Name, v: Val, ty: impl Into<Arc<Val>>) {
-        self.bindings.insert(
-            n,
-            VarEntry {
-                name: n,
-                val: Arc::new(v),
-                invalidated: default(),
-                level: self.level,
-                ty: ty.into(),
-                deps: default(),
-                borrow_gen: (0, Span(0, 0)).into(),
-            },
-        );
+    fn set_mutable(&mut self, s: Sym, mutable: bool) {
+        let e = self.vars.get_mut(&s).unwrap();
+        if !mutable && e.mutable {
+            eprintln!(
+                "internal warning: un-mutable-ing {}.{}",
+                s.0.pretty(&self.db),
+                s.num()
+            )
+        }
+        e.mutable = mutable;
+    }
+    fn bind_existing_var(&mut self, n: Name, sym: Sym) {
+        self.bindings.insert(n, sym);
     }
     fn bind_raw(&mut self, name: Name, sym: Sym, ty: impl Into<Arc<Val>>) -> Sym {
         self.env.env.0.insert(sym, Arc::new(Val::sym(sym)));
-        self.bindings.insert(
-            name,
-            VarEntry {
-                name,
-                val: Arc::new(Val::sym(sym)),
-                invalidated: default(),
-                level: self.level,
-                ty: ty.into(),
-                deps: default(),
-                borrow_gen: (0, Span(0, 0)).into(),
-            },
+        self.bindings.insert(name, sym);
+        assert!(
+            self.vars
+                .insert(
+                    sym,
+                    VarEntry {
+                        name,
+                        sym,
+                        invalidated: default(),
+                        level: self.level,
+                        ty: ty.into(),
+                        deps: default(),
+                        borrow_gen: (0, Span(0, 0)).into(),
+                        mutable: false,
+                    },
+                )
+                .is_none(),
+            "sym {}.{} has already been bound in this cxt",
+            sym.0.pretty(&self.db),
+            sym.num(),
         );
         sym
     }
@@ -1020,7 +1012,7 @@ fn elab_block(block: &[PreStmt], last_: &SPre, ty: Option<GVal>, cxt1: &Cxt) -> 
                 let vsym = cxt.bind_(cxt.db.name("_"), xty.small().clone());
                 (vsym, deps, xty.as_small(), None, x)
             }
-            PreStmt::Let(pat, body) if matches!(&***pat, PrePat::Binder(_, _)) => {
+            PreStmt::Let(pat, body) if matches!(&***pat, PrePat::Binder(_, _, _)) => {
                 let cxt_start = cxt.clone();
                 let (sym, pat) = PMatch::new(None, &[pat.clone()], &mut cxt);
                 let aty = (*pat.ty).clone();
@@ -1493,10 +1485,8 @@ impl GVal {
                         return;
                     }
                 }
-                // TODO we can coerce to own or imm but not mut, that requires a reassignable lvalue???
-                (Val::Cap(l1, Cap::Imm | Cap::Own, ty), _) if r.try_promote(*l1) => {
+                (Val::Cap(l1, _, ty), _) if r.try_promote(*l1) => {
                     if (**ty).clone().glued().unify(self.clone(), span, cxt) {
-                        eprintln!("{} + {}", ty.pretty(&cxt.db), self.small().pretty(&cxt.db));
                         cxt.add_deps(r);
                         return;
                     }
