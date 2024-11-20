@@ -243,7 +243,6 @@ impl Val {
             Val::Fun(Sigma(_), _, s, a, _, _) => {
                 a.is_owned() || self.clone().app(Val::sym(*s)).is_owned()
             }
-            // TODO FnOnce equivalent
             Val::Fun(Pi(_, c), _, _, _, _, _) => *c == FCap::Own,
             Val::Fun { .. } => true,
             Val::Pair(_, _) => unreachable!(),
@@ -344,7 +343,6 @@ impl VarResult<'_> {
                 cxt.add_deps(deps.tap_mut(|x| x.demote(cxt.level - entry.level)));
                 (
                     Term::Head(Head::Sym(entry.sym)),
-                    // TODO keep arc ??
                     Arc::new(
                         (*entry.ty)
                             .clone()
@@ -578,11 +576,10 @@ impl Cxt {
                             v.last_mut().map(|v| {
                                 assert!(!v.iter().any(|(s, _)| s.0 == n.0));
                                 let s = self.scxt().bind(n.0);
-                                // TODO span for the name
                                 let ty = Arc::new(self.new_meta(
                                     Val::Type,
                                     MetaSource::TypeOf(n.0),
-                                    self.errors.span.span(),
+                                    n.span(),
                                 ));
                                 v.push((s, ty.clone()));
                                 (s, ty)
@@ -701,10 +698,8 @@ impl Cxt {
             .with_mut(|x| x.insert(m, MetaEntry::Unsolved(Arc::new(ty), S(source, span))));
         let v = Val::Neutral(
             Head::Meta(m),
-            self.env
-                .env
+            self.vars
                 .keys()
-                // TODO is this correct?
                 .map(|s| VElim::App(Expl, Arc::new(Val::sym(*s))))
                 .collect(),
         );

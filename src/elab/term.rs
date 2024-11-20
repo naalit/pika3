@@ -357,6 +357,12 @@ impl VElim {
 
             (x, Val::Neutral(s, vec)) => Val::Neutral(s, vec.tap_mut(|v| v.push(x))),
             (_, Val::Error) => Val::Error,
+
+            // Apply functions through caps (for pi types)
+            (s @ VElim::App(_, _), Val::Cap(_, _, v)) if matches!(*v, Val::Fun { .. }) => {
+                s.elim(Arc::unwrap_or_clone(v))
+            }
+
             (s, v) => {
                 // TODO how do we get the error out of here?
                 eprintln!("illegal elimination {:?}\non {:?}", s, v);
