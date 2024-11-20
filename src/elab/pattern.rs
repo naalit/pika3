@@ -63,6 +63,23 @@ fn split_ty(
     cxt: &mut Cxt,
 ) -> Option<Vec<PConsTy>> {
     match &ty.clone().glued().whnf(cxt) {
+        Val::Cap(l, c, t) => split_ty(var, t, rows, names, cxt).map(|v| {
+            v.into_iter()
+                .map(|PConsTy { label, var_tys }| PConsTy {
+                    label,
+                    var_tys: var_tys
+                        .into_iter()
+                        .map(|(s, t)| {
+                            (
+                                s,
+                                Arc::new(Arc::unwrap_or_clone(t).add_cap_level(*l).as_cap(*c)),
+                            )
+                        })
+                        .collect(),
+                })
+                .collect()
+        }),
+
         Val::Fun(Sigma(n2), i, n1, aty, _, _) => {
             // TODO better system for names accessible in types in patterns
             // let n1 = names.next().flatten().unwrap_or(cxt.db.inaccessible(*n1));

@@ -326,18 +326,31 @@ impl VarResult<'_> {
                         });
                     }
                 }
+                // Re-mutate all the mutable borrows in `entry.deps`
+                let deps = entry.deps.iter().cloned().map(|(s, l, g, m)| {
+                    if m {
+                        let g = cxt.vars.get(&s).unwrap().borrow_gen.with_mut(|x| {
+                            *x = (x.0 + 1, span);
+                            x.0
+                        });
+                        (s, l, g, m)
+                    } else {
+                        (s, l, g, m)
+                    }
+                });
                 let deps = if is_owned && acap < Cap::Own {
                     Deps::from_var(
-                        entry
-                            .deps
-                            .iter()
-                            .cloned()
-                            .chain(std::iter::once((entry.sym, 0, entry.borrow_gen.get().0)))
-                            .collect(),
+                        deps.chain(std::iter::once((
+                            entry.sym,
+                            0,
+                            entry.borrow_gen.get().0,
+                            acap == Cap::Mut,
+                        )))
+                        .collect(),
                         span,
                     )
                 } else {
-                    Deps::from_var(entry.deps.clone(), span)
+                    Deps::from_var(deps.collect(), span)
                 };
                 // TODO is this logic correct?
                 cxt.add_deps(deps.tap_mut(|x| x.demote(cxt.level - entry.level)));
@@ -356,16 +369,16 @@ impl VarResult<'_> {
     }
 }
 
-type VDeps = Vec<(Sym, i32, u32)>;
+type VDeps = Vec<(Sym, i32, u32, bool)>;
 #[derive(Default)]
 struct Deps {
     surplus: Option<u32>,
-    // (level, borrow generation)
-    deps: HashMap<Sym, (Span, i32, u32)>,
+    // (span, level, borrow generation, mutable)
+    deps: HashMap<Sym, (Span, i32, u32, bool)>,
 }
 impl Deps {
     fn check(&self, cxt: &Cxt) {
-        for (s, (span, l, b)) in &self.deps {
+        for (s, (span, l, b, _)) in &self.deps {
             if *l >= 0 {
                 if let Some(e) = cxt.vars.get(&s) {
                     if e.borrow_gen.get().0 > *b {
@@ -397,14 +410,15 @@ impl Deps {
             None => self.surplus = other.surplus,
             Some(r) => self.surplus = Some(other.surplus.map_or(r, |s| r.max(s))),
         }
-        for (s, (span, vl, vb)) in other.deps {
+        for (s, (span, vl, vb, vm)) in other.deps {
             match self.deps.get_mut(&s) {
                 None => {
-                    self.deps.insert(s, (span, vl, vb));
+                    self.deps.insert(s, (span, vl, vb, vm));
                 }
-                Some((_, l, b)) => {
+                Some((_, l, b, m)) => {
                     *l = vl.min(*l);
                     *b = vb.min(*b);
+                    *m |= vm;
                 }
             }
         }
@@ -416,7 +430,7 @@ impl Deps {
         if let Some(s) = &mut self.surplus {
             *s += by;
         }
-        for (_, (_, l, _)) in &mut self.deps {
+        for (_, (_, l, _, _)) in &mut self.deps {
             *l -= by as i32;
         }
     }
@@ -431,7 +445,7 @@ impl Deps {
                 return false;
             }
         }
-        for (_, (_, l, _)) in &mut self.deps {
+        for (_, (_, l, _, _)) in &mut self.deps {
             *l += by as i32;
         }
         true
@@ -439,8 +453,8 @@ impl Deps {
     fn to_var(self) -> VDeps {
         self.deps
             .into_iter()
-            .map(|(k, (_, vl, vb))| (k, vl, vb))
-            .filter(|(_, vl, _)| *vl >= 0)
+            .map(|(k, (_, vl, vb, vm))| (k, vl, vb, vm))
+            .filter(|(_, vl, _, _)| *vl >= 0)
             .collect()
     }
     fn from_var(d: VDeps, span: Span) -> Self {
@@ -448,7 +462,7 @@ impl Deps {
             surplus: Some(0),
             deps: d
                 .into_iter()
-                .map(|(k, vl, vb)| (k, (span, vl, vb)))
+                .map(|(k, vl, vb, vm)| (k, (span, vl, vb, vm)))
                 .collect(),
         }
     }
@@ -1257,6 +1271,19 @@ impl SPre {
                     .any(|(_, (_, v))| v == Cap::Own)
                     .then_some(FCap::Own)
                     .unwrap_or(FCap::Imm);
+                // non-unique closure return value can't have unique (mutable) dependencies
+                // TODO should we instead just make this a ~> closure? probably?
+                if cap == FCap::Imm {
+                    if let Some((s, (span, _, _, _))) =
+                        deps.deps.iter().find(|(_, (_, _, _, m))| *m)
+                    {
+                        cxt.err(
+                            "immutable function -> cannot return value that borrows mutable "
+                                + s.0.pretty(&cxt.db),
+                            *span,
+                        );
+                    }
+                }
                 let rty = rty.small().quote(&cxt3.qenv());
                 let body = pat.compile(&[body], &cxt2);
                 let rty = pat.compile(&[rty], &cxt2);
@@ -1353,6 +1380,18 @@ impl SPre {
                     .flatten()
                     .find(|(_, (_, v))| *v == Cap::Own)
                     .unwrap_or((sym, (self.span(), Cap::Imm)));
+                // non-unique closure return value can't have unique (mutable) dependencies
+                if c == FCap::Imm {
+                    if let Some((s, (span, _, _, _))) =
+                        deps.deps.iter().find(|(_, (_, _, _, m))| *m)
+                    {
+                        cxt.err(
+                            "immutable function -> cannot return value that borrows mutable "
+                                + s.0.pretty(&cxt.db),
+                            *span,
+                        );
+                    }
+                }
                 if cap > c.cap() {
                     cxt.errors.push(
                         Error::simple(

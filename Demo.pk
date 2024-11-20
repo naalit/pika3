@@ -257,3 +257,29 @@ def p42_let_mut : a -> a = x => do
   mut z = y # shortcut syntax
   p37_mut z
   z
+
+# def p43_ret_mut_e : a -> (U -> mut a) = mut x => _ => x
+# def p44_problems_e : a -> (mut a, mut a) = mut x => do
+#   let f = p43_ret_mut x
+#   f U, f U # problem: duplicating mut reference!
+
+# def p45_problems_e : a -> U = mut x => do
+#   mut (y : mut _) = x # TODO fix this syntax
+#   let z : ref _ = x
+#   p37_mut y # problem: mutating while borrowed!
+#   let w = z
+#   U
+
+def p46_problems : own a -> U = mut x => do
+  let y : ref (own _) = x
+  let z : ref _ = y
+  p37_mut x # problem: mutating while borrowed!
+  let w = z
+  U
+
+def p47_problems : (own a, U) -> U = mut x => do
+  let y : ref _ = x
+  let (z, _) = y
+  p37_mut x # problem: mutating while borrowed!
+  let w = z
+  U
