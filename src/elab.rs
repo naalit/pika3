@@ -1362,13 +1362,13 @@ impl SPre {
                 let c = *c;
                 let l = *l;
                 let mut cxt = cxt.clone();
+                cxt.level += l;
                 let (sym, pat) =
                     PMatch::new(Some((**aty2).clone().glued()), &[pat.clone()], &mut cxt);
                 let aty = aty2.quote(cxt.qenv());
 
                 let va = Val::Neutral(Head::Sym(sym), default());
                 // TODO why doesn't as_small() work here
-                cxt.level += l;
                 let rty = ty.as_big().app(va.clone()).add_cap_level(l);
                 cxt.push_closure(sym);
                 let mut cxt = pat.bind(0, &default(), &cxt);
