@@ -1037,8 +1037,9 @@ fn elab_block(block: &[PreStmt], last_: &SPre, ty: Option<GVal>, cxt1: &Cxt) -> 
         deps.check(&cxt);
         let t2 = t.quote(&cxt.qenv());
         if let Some(p) = &p {
-            cxt = p.bind(0, &cxt);
-            cxt.set_deps(vsym, deps.to_var());
+            let deps = deps.to_var();
+            cxt = p.bind(0, &deps, &cxt);
+            cxt.set_deps(vsym, deps);
         }
         v.push((vsym, t2, p, x));
     }
@@ -1260,7 +1261,7 @@ impl SPre {
                 let aty2 = aty.quote(cxt.qenv());
 
                 cxt2.push_closure(s);
-                let mut cxt3 = pat.bind(0, &cxt2);
+                let mut cxt3 = pat.bind(0, &default(), &cxt2);
                 // TODO should we do anything with this dependency?
                 let (deps, (body, rty)) = cxt.record_deps(|| body.infer(&cxt3, true));
                 deps.check(&cxt3);
@@ -1370,7 +1371,7 @@ impl SPre {
                 cxt.level += l;
                 let rty = ty.as_big().app(va.clone()).add_cap_level(l);
                 cxt.push_closure(sym);
-                let mut cxt = pat.bind(0, &cxt);
+                let mut cxt = pat.bind(0, &default(), &cxt);
                 // TODO should we do anything with this dependency?
                 let (deps, body) = cxt.record_deps(|| body.check(rty, &cxt));
                 deps.check(&cxt);
@@ -1495,13 +1496,22 @@ impl GVal {
                         return;
                     }
                 }
-                (Val::Cap(l1, c1, ty), Val::Cap(l2, c2, sty)) if *l1 <= *l2 && c2 >= c1 => {
+                (Val::Cap(l1, c1, ty), Val::Cap(l2, c2, sty))
+                    if *l1 <= *l2
+                        && c2 >= c1
+                        // +1 own t -> +0 imm t
+                        && (*l1 == 0 || *c1 != Cap::Imm || *c2 == Cap::Imm) =>
+                {
                     if (**ty)
                         .clone()
                         .glued()
                         .unify((**sty).clone().glued(), span, cxt)
                     {
                         r.demote(l2 - l1);
+                        if *c1 == Cap::Imm && *c2 != Cap::Imm {
+                            // +n own t -> +0 imm t, we don't want them to be able to promote to +n imm t or whatever
+                            r.surplus = Some(0);
+                        }
                         cxt.add_deps(r);
                         return;
                     }

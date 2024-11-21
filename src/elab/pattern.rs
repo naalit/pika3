@@ -72,7 +72,7 @@ fn split_ty(
                         .map(|(s, t)| {
                             (
                                 s,
-                                Arc::new(Arc::unwrap_or_clone(t).add_cap_level(*l).as_cap(*c)),
+                                Arc::new(Arc::unwrap_or_clone(t).as_cap(*c).add_cap_level(*l)),
                             )
                         })
                         .collect(),
@@ -545,7 +545,7 @@ pub(super) struct PMatch {
     pub ty: Arc<Val>,
 }
 impl PMatch {
-    pub fn bind(&self, body: u32, cxt: &Cxt) -> Cxt {
+    pub fn bind(&self, body: u32, deps: &VDeps, cxt: &Cxt) -> Cxt {
         let mut cxt = cxt.clone();
         for (m, name, sym, ty) in &self.pcxt.bodies[body as usize].vars {
             if *sym == self.pcxt.var {
@@ -554,6 +554,7 @@ impl PMatch {
                 cxt.bind_raw(*name, *sym, ty.clone());
             }
             cxt.set_mutable(*sym, *m);
+            cxt.set_deps(*sym, deps.clone());
         }
         for (sym, val) in &self.pcxt.bodies[body as usize].solved_locals {
             // Make sure the solutions of any solved locals are actually in scope

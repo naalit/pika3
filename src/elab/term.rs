@@ -85,6 +85,9 @@ impl Val {
             return self;
         }
         match self {
+            // +0 imm (+1 own t) --> +0 imm t, not +1 imm t - required for getting rid of borrows appropriately
+            Val::Cap(_, Cap::Own | Cap::Mut, rest) if c == Cap::Imm => Val::Cap(0, Cap::Imm, rest),
+            // TODO +0 mut (+1 own t) ?
             Val::Cap(l, e, rest) => Val::Cap(l, c.min(e), rest),
             _ => Val::Cap(0, c, Arc::new(self)),
         }
@@ -126,10 +129,7 @@ impl Term {
                 body.clone(),
                 Arc::new(env.clone()),
             ),
-            Term::Cap(l, c, x) => match x.eval(env) {
-                Val::Cap(l2, c2, x) => Val::Cap(*l + l2, (*c).min(c2), x),
-                x => Val::Cap(*l, *c, Arc::new(x)),
-            },
+            Term::Cap(l, c, x) => x.eval(env).as_cap(*c).add_cap_level(*l),
             Term::Pair(a, b) => Val::Pair(Arc::new(a.eval(env)), Arc::new(b.eval(env))),
             Term::Error => Val::Error,
             Term::Type => Val::Type,

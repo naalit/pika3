@@ -270,16 +270,16 @@ def p42_let_mut : a -> a = x => do
 #   let w = z
 #   U
 
-def p46_problems : own a -> U = mut x => do
-  let y : ref (own _) = x
-  let z : ref _ = y
-  p37_mut x # problem: mutating while borrowed!
-  let w = z
-  U
+# def p46_problems_e : own a -> U = mut x => do
+#   let y : ref (own _) = x
+#   let z : ref _ = y
+#   p37_mut x # problem: mutating while borrowed!
+#   let w = z
+#   U
 
-def p47_problems : (own a, U) -> U = mut x => do
-  let y : ref _ = x
-  let (z, _) = y
-  p37_mut x # problem: mutating while borrowed!
-  let w = z
-  U
+# def p47_problems_e : (own a, U) -> U = mut x => do
+#   let y : ref _ = x
+#   let (z, _) = y
+#   p37_mut x # problem: mutating while borrowed!
+#   let w = z
+#   U
