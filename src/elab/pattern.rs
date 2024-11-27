@@ -204,11 +204,20 @@ impl IPat {
     }
 }
 impl SPrePat {
-    fn ipat(&self, db: &DB) -> S<IPat> {
+    fn ipat(&self, cxt: &Cxt) -> S<IPat> {
         S(
             match &***self {
                 PrePat::Name(m, s) => IPat::Var(*m, **s, None),
-                PrePat::Binder(m, s, s1) => IPat::Var(*m, **s, Some(Arc::new(s1.clone()))),
+                PrePat::Binder(p, s1) => match *p.ipat(cxt) {
+                    IPat::Var(m, s, None) => IPat::Var(m, s, Some(Arc::new(s1.clone()))),
+                    _ => {
+                        cxt.err(
+                            "binder pattern currently requires a name on left-hand side",
+                            p.span(),
+                        );
+                        IPat::Var(false, cxt.db.name("_"), None)
+                    }
+                },
                 PrePat::Pair(icit, s, s1) => IPat::CPat(
                     None,
                     CPat {
@@ -217,12 +226,12 @@ impl SPrePat {
                         // This is a sigma type, we need to make sure we have the first value accessible since it might be relevant for the type of the second
                         // I'm also making the second value accessible so that our local-solving-based reversible pattern matching thing works
                         vars: vec![
-                            s.ipat(db).map(|x| x.ensure_named(db)),
-                            s1.ipat(db).map(|x| x.ensure_named(db)),
+                            s.ipat(cxt).map(|x| x.ensure_named(&cxt.db)),
+                            s1.ipat(cxt).map(|x| x.ensure_named(&cxt.db)),
                         ],
                     },
                 ),
-                PrePat::Error => IPat::Var(false, db.name("_"), None),
+                PrePat::Error => IPat::Var(false, cxt.db.name("_"), None),
             },
             self.span(),
         )
@@ -605,7 +614,7 @@ impl PMatch {
     pub fn new(ty: Option<GVal>, branches: &[SPrePat], ocxt: &mut Cxt) -> (Sym, PMatch) {
         let (m, name, ty) = branches
             .first()
-            .map(|p| match p.ipat(&ocxt.db).0 {
+            .map(|p| match p.ipat(ocxt).0 {
                 IPat::Var(m, n, None) => (
                     m,
                     n,
@@ -664,7 +673,7 @@ impl PMatch {
             .iter()
             .enumerate()
             .map(|(i, p)| {
-                let ipat = p.ipat(&cxt.db);
+                let ipat = p.ipat(&cxt);
                 PRow {
                     cols: vec![(var, ty.clone(), ipat)],
                     assignments: default(),

@@ -15,7 +15,7 @@ pub type SPrePat = S<Box<PrePat>>;
 #[derive(Debug, Clone)]
 pub enum PrePat {
     Name(bool, SName),
-    Binder(bool, SName, SPre),
+    Binder(SPrePat, SPre),
     Pair(Icit, SPrePat, SPrePat),
     Error,
 }
@@ -64,7 +64,7 @@ struct Parser {
     starts: Vec<u32>,
     pos: usize,
     pos_non_trivia: usize,
-    in_indent: bool,
+    indent_stack: Vec<bool>,
     errors: Vec<Error>,
     // once we emit a parse error on a given token, we don't emit errors for subsequent expect()s that fail on the same token
     this_tok_err: bool,
@@ -80,7 +80,7 @@ impl Parser {
             starts: r.start,
             pos: 0,
             pos_non_trivia: 0,
-            in_indent: false,
+            indent_stack: Vec::new(),
             errors: r
                 .errors
                 .into_iter()
@@ -116,14 +116,15 @@ impl Parser {
     fn skip_trivia(&mut self, skip_newline: bool) {
         loop {
             if self.peek().is_trivia()
-                || ((skip_newline || self.in_indent) && self.peek() == Tok::Newline)
+                || ((skip_newline || self.indent_stack.last().iter().any(|x| **x))
+                    && self.peek() == Tok::Newline)
             {
                 self.next_raw();
-            } else if self.peek() == Tok::Indent && !self.in_indent {
-                self.in_indent = true;
+            } else if self.peek() == Tok::Indent {
+                self.indent_stack.push(true);
                 self.next_raw();
-            } else if self.peek() == Tok::Dedent && self.in_indent {
-                self.in_indent = false;
+            } else if self.peek() == Tok::Dedent && !self.indent_stack.is_empty() {
+                self.indent_stack.pop();
                 self.next_raw();
             } else {
                 break;
@@ -176,6 +177,9 @@ impl Parser {
         self.db.name(self.tok_rope().to_string().trim())
     }
     fn error(&mut self, e: impl Into<Doc>, span: Span) {
+        if self.this_tok_err {
+            return;
+        }
         let message = Doc::start("parse error: ").chain(e.into());
         self.this_tok_err = true;
         self.errors.push(Error {
@@ -201,7 +205,7 @@ impl Parser {
         }
     }
     fn expect(&mut self, t: Tok) {
-        if !self.maybe(t) && self.this_tok_err {
+        if !self.maybe(t) {
             self.error(
                 &format!("expected {}, found {}", t, self.peek()),
                 self.tok_span(),
@@ -236,26 +240,14 @@ impl Parser {
             _ => (None, param),
         }
     }
-    fn reparse_pattern(&mut self, param: &SPre) -> PrePat {
+    fn reparse_pattern(&mut self, param: &SPre, message: &Doc) -> PrePat {
         match &***param {
-            Pre::Binder(lhs, rhs) => match &***lhs {
-                Pre::Var(name) => PrePat::Binder(false, S(*name, lhs.span()), rhs.clone()),
-                _ => {
-                    // TODO we probably do allow patterns here
-                    self.error("left-hand side of binder must be a name", lhs.span());
-                    PrePat::Error
-                }
-            },
+            Pre::Binder(lhs, rhs) => PrePat::Binder(
+                S(Box::new(self.reparse_pattern(lhs, message)), lhs.span()),
+                rhs.clone(),
+            ),
             Pre::Cap(0, Cap::Mut, p) => match &***p {
                 Pre::Var(name) => PrePat::Name(true, S(*name, param.span())),
-                Pre::Binder(lhs, rhs) => match &***lhs {
-                    Pre::Var(name) => PrePat::Binder(true, S(*name, lhs.span()), rhs.clone()),
-                    _ => {
-                        // TODO we probably do allow patterns here
-                        self.error("left-hand side of binder must be a name", lhs.span());
-                        PrePat::Error
-                    }
-                },
                 _ => {
                     self.error("invalid pattern", param.span());
                     PrePat::Error
@@ -265,17 +257,29 @@ impl Parser {
             // TODO (mut a : T, mut b : T)
             Pre::Sigma(i, n1, a, n2, b) => {
                 let a = match n1 {
-                    Some(n) => S(Box::new(PrePat::Binder(false, *n, a.clone())), a.span()),
-                    None => S(Box::new(self.reparse_pattern(a)), a.span()),
+                    Some(n) => S(
+                        Box::new(PrePat::Binder(
+                            S(Box::new(PrePat::Name(false, *n)), n.span()),
+                            a.clone(),
+                        )),
+                        a.span(),
+                    ),
+                    None => S(Box::new(self.reparse_pattern(a, message)), a.span()),
                 };
                 let b = match n2 {
-                    Some(n) => S(Box::new(PrePat::Binder(false, *n, b.clone())), b.span()),
-                    None => S(Box::new(self.reparse_pattern(b)), b.span()),
+                    Some(n) => S(
+                        Box::new(PrePat::Binder(
+                            S(Box::new(PrePat::Name(false, *n)), n.span()),
+                            b.clone(),
+                        )),
+                        b.span(),
+                    ),
+                    None => S(Box::new(self.reparse_pattern(b, message)), b.span()),
                 };
                 PrePat::Pair(*i, a, b)
             }
             _ => {
-                self.error("invalid pattern", param.span());
+                self.error(message, param.span());
                 PrePat::Error
             }
         }
@@ -307,15 +311,19 @@ impl Parser {
                 Tok::DoKw => {
                     s.next_raw();
                     s.skip_trivia_();
-                    let in_indent = s.in_indent;
-                    s.in_indent = false;
-                    s.expect(Tok::Indent);
+                    if s.maybe(Tok::Indent) {
+                        s.indent_stack.push(false);
+                    }
+                    let r = s.indent_stack.len();
                     let mut v = Vec::new();
-                    while !s.maybe(Tok::Dedent) {
+                    loop {
                         if s.maybe(Tok::LetKw) || s.peek() == Tok::MutKw {
                             let pat = s.spanned(|s| {
                                 let pat = s.fun(true);
-                                Box::new(s.reparse_pattern(&pat))
+                                Box::new(s.reparse_pattern(
+                                    &pat,
+                                    &Doc::start("expected pattern after `let`/`mut` in block"),
+                                ))
                             });
                             s.expect(Tok::Equals);
                             let body = s.term();
@@ -324,12 +332,10 @@ impl Parser {
                             let body = s.term();
                             v.push(PreStmt::Expr(body));
                         }
-                        if !s.maybe(Tok::Newline) {
-                            s.expect(Tok::Dedent);
+                        if s.indent_stack.len() < r || !s.maybe(Tok::Newline) {
                             break;
                         }
                     }
-                    s.in_indent = in_indent;
                     s.skip_trivia(false);
                     let last = v
                         .pop()
@@ -450,7 +456,12 @@ impl Parser {
         } else if self.maybe(Tok::WideArrow) {
             // lambda
             let rhs = self.fun(true); // TODO do we allow `x => x, x`?
-            let pat = S(Box::new(self.reparse_pattern(&lhs)), lhs.span());
+            let pat = S(
+                Box::new(
+                    self.reparse_pattern(&lhs, &Doc::start("expected pattern in lambda argument")),
+                ),
+                lhs.span(),
+            );
             S(
                 Box::new(Pre::Lam(icit, pat, rhs)),
                 Span(start, self.pos_right()),

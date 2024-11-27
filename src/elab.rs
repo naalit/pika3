@@ -1046,7 +1046,7 @@ fn elab_block(block: &[PreStmt], last_: &SPre, ty: Option<GVal>, cxt1: &Cxt) -> 
                 let vsym = cxt.bind_(cxt.db.name("_"), xty.small().clone());
                 (vsym, deps, xty.as_small(), None, x)
             }
-            PreStmt::Let(pat, body) if matches!(&***pat, PrePat::Binder(_, _, _)) => {
+            PreStmt::Let(pat, body) if matches!(&***pat, PrePat::Binder(_, _)) => {
                 let cxt_start = cxt.clone();
                 let (sym, pat) = PMatch::new(None, &[pat.clone()], &mut cxt);
                 let aty = (*pat.ty).clone();

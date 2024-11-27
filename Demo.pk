@@ -265,7 +265,7 @@ def p42_let_mut : a -> a = x => do
 #   f U, f U # problem: duplicating mut reference!
 
 # def p45_problems_e : a -> U = mut x => do
-#   mut (y : mut _) = x # TODO fix this syntax
+#   mut y : mut _ = x
 #   let z : ref _ = x
 #   p37_mut y # problem: mutating while borrowed!
 #   let w = z
@@ -296,6 +296,6 @@ def p42_let_mut : a -> a = x => do
 def _store : (mut a, own mut a) &-> U = _ => U
 def p49_store_and_ret : mut a -> (own mut a &-> mut a) = mut x => do
   mut y = x
-  (mut z) => do
+  (mut z => do
     _store (y, z)
-    z
+    z)
