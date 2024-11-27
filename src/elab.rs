@@ -260,7 +260,7 @@ struct VarEntry {
     ty: Arc<Val>,
     level: u32,
     invalidated: Ref<Option<Span>>,
-    deps: VDeps,
+    deps: Ref<VDeps>,
     borrow_gen: Ref<(u32, Span)>,
     mutable: bool,
 }
@@ -327,33 +327,40 @@ impl VarResult<'_> {
                     }
                 }
                 // Re-mutate all the mutable borrows in `entry.deps`
-                let deps = entry.deps.iter().cloned().map(|(s, l, g, m)| {
-                    if m {
-                        let g = cxt.vars.get(&s).unwrap().borrow_gen.with_mut(|x| {
-                            *x = (x.0 + 1, span);
-                            x.0
-                        });
-                        (s, l, g, m)
+                entry.deps.with(|edeps| {
+                    let deps = edeps.iter().cloned().map(|(s, l, g, m)| {
+                        if m {
+                            let g = cxt.vars.get(&s).unwrap().borrow_gen.with_mut(|x| {
+                                // don't suppress borrow errors though
+                                if x.0 == g {
+                                    *x = (x.0 + 1, span);
+                                    x.0
+                                } else {
+                                    g
+                                }
+                            });
+                            (s, l, g, m)
+                        } else {
+                            (s, l, g, m)
+                        }
+                    });
+                    let deps = if is_owned && acap < Cap::Own {
+                        Deps::from_var(
+                            deps.chain(std::iter::once((
+                                entry.sym,
+                                0,
+                                entry.borrow_gen.get().0,
+                                acap == Cap::Mut,
+                            )))
+                            .collect(),
+                            span,
+                        )
                     } else {
-                        (s, l, g, m)
-                    }
+                        Deps::from_var(deps.collect(), span)
+                    };
+                    // TODO is this logic correct?
+                    cxt.add_deps(deps.tap_mut(|x| x.demote(cxt.level - entry.level)));
                 });
-                let deps = if is_owned && acap < Cap::Own {
-                    Deps::from_var(
-                        deps.chain(std::iter::once((
-                            entry.sym,
-                            0,
-                            entry.borrow_gen.get().0,
-                            acap == Cap::Mut,
-                        )))
-                        .collect(),
-                        span,
-                    )
-                } else {
-                    Deps::from_var(deps.collect(), span)
-                };
-                // TODO is this logic correct?
-                cxt.add_deps(deps.tap_mut(|x| x.demote(cxt.level - entry.level)));
                 (
                     Term::Head(Head::Sym(entry.sym)),
                     Arc::new(
@@ -370,11 +377,11 @@ impl VarResult<'_> {
 }
 
 type VDeps = Vec<(Sym, i32, u32, bool)>;
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Deps {
     surplus: Option<u32>,
     // (span, level, borrow generation, mutable)
-    deps: HashMap<Sym, (Span, i32, u32, bool)>,
+    deps: FxHashMap<Sym, (Span, i32, u32, bool)>,
 }
 impl Deps {
     fn check(&self, cxt: &Cxt) {
@@ -416,11 +423,18 @@ impl Deps {
                     self.deps.insert(s, (span, vl, vb, vm));
                 }
                 Some((_, l, b, m)) => {
-                    *l = vl.min(*l);
+                    *l = vl.max(*l);
                     *b = vb.min(*b);
                     *m |= vm;
                 }
             }
+        }
+    }
+    fn force_adjust(&mut self, by: i32) {
+        if by > 0 {
+            self.force_promote(by as u32);
+        } else {
+            self.demote((-by) as u32);
         }
     }
     fn demote(&mut self, by: u32) {
@@ -449,6 +463,13 @@ impl Deps {
             *l += by as i32;
         }
         true
+    }
+    fn force_promote(&mut self, by: u32) {
+        if by != 0 {
+            for (_, (_, l, _, _)) in &mut self.deps {
+                *l += by as i32;
+            }
+        }
     }
     fn to_var(self) -> VDeps {
         self.deps
@@ -628,9 +649,13 @@ impl Cxt {
             panic!("call can_solve first")
         }
     }
-    fn set_deps(&mut self, s: Sym, deps: VDeps) {
-        let e = self.vars.get_mut(&s).unwrap();
-        e.deps = deps;
+    fn get_deps(&self, s: Sym) -> VDeps {
+        let e = self.vars.get(&s).unwrap();
+        e.deps.with(Clone::clone)
+    }
+    fn set_deps(&self, s: Sym, deps: VDeps) {
+        let e = self.vars.get(&s).unwrap();
+        e.deps.set(deps);
     }
     fn set_mutable(&mut self, s: Sym, mutable: bool) {
         let e = self.vars.get_mut(&s).unwrap();
@@ -1116,7 +1141,7 @@ impl SPre {
                 }
             },
             Pre::App(fs, x, i) => {
-                let (mut f, mut fty) = fs.infer(cxt, *i == Expl);
+                let (fr, (mut f, mut fty)) = cxt.record_deps(|| fs.infer(cxt, *i == Expl));
                 let (_, fc, vfty) = fty.whnf(cxt).uncap();
                 let (aty, l) = match vfty {
                     Val::Error => (Val::Error, 0),
@@ -1205,6 +1230,20 @@ impl SPre {
                 };
                 let (mut r, x) = cxt.record_deps(|| x.check(aty, cxt));
                 r.demote(l);
+                r.add(fr);
+                for (s, (span, lvl, _, m)) in &r.deps {
+                    if *m {
+                        // if we depend on `mut x`, then all the other dependencies get added to `x`'s dependencies
+                        let mut deps = Deps::from_var(cxt.get_deps(*s), *span);
+                        let mut r2 = r.clone();
+                        // it doesn't depend on itself tho
+                        r2.deps.remove(s);
+                        // we want to adjust so that `lvl = 0`
+                        r2.force_adjust(-(*lvl as i32));
+                        deps.add(r2);
+                        cxt.set_deps(*s, deps.to_var());
+                    }
+                }
                 cxt.add_deps(r);
                 let vx = x.eval(cxt.env());
                 (
@@ -1256,6 +1295,7 @@ impl SPre {
                     cxt.push_uquant();
                 }
                 let mut cxt2 = cxt.clone();
+                let before_syms: FxHashSet<_> = cxt.vars.keys().copied().collect();
                 let (s, pat) = PMatch::new(None, &[pat.clone()], &mut cxt2);
                 let aty = pat.ty.clone();
                 let aty2 = aty.quote(cxt.qenv());
@@ -1272,11 +1312,13 @@ impl SPre {
                     .any(|(_, (_, v))| v == Cap::Own)
                     .then_some(FCap::Own)
                     .unwrap_or(FCap::Imm);
-                // non-unique closure return value can't have unique (mutable) dependencies
+                // non-unique closure return value can't have unique (mutable) dependencies (from outside the closure)
                 // TODO should we instead just make this a ~> closure? probably?
                 if cap == FCap::Imm {
-                    if let Some((s, (span, _, _, _))) =
-                        deps.deps.iter().find(|(_, (_, _, _, m))| *m)
+                    if let Some((s, (span, _, _, _))) = deps
+                        .deps
+                        .iter()
+                        .find(|(s, (_, _, _, m))| *m && before_syms.contains(s))
                     {
                         cxt.err(
                             "immutable function -> cannot return value that borrows mutable "
@@ -1363,6 +1405,7 @@ impl SPre {
                 let l = *l;
                 let mut cxt = cxt.clone();
                 cxt.level += l;
+                let before_syms: FxHashSet<_> = cxt.vars.keys().copied().collect();
                 let (sym, pat) =
                     PMatch::new(Some((**aty2).clone().glued()), &[pat.clone()], &mut cxt);
                 let aty = aty2.quote(cxt.qenv());
@@ -1381,10 +1424,12 @@ impl SPre {
                     .flatten()
                     .find(|(_, (_, v))| *v == Cap::Own)
                     .unwrap_or((sym, (self.span(), Cap::Imm)));
-                // non-unique closure return value can't have unique (mutable) dependencies
+                // non-unique closure return value can't have unique (mutable) dependencies (from outside the closure)
                 if c == FCap::Imm {
-                    if let Some((s, (span, _, _, _))) =
-                        deps.deps.iter().find(|(_, (_, _, _, m))| *m)
+                    if let Some((s, (span, _, _, _))) = deps
+                        .deps
+                        .iter()
+                        .find(|(s, (_, _, _, m))| *m && before_syms.contains(s))
                     {
                         cxt.err(
                             "immutable function -> cannot return value that borrows mutable "
@@ -1499,8 +1544,8 @@ impl GVal {
                 (Val::Cap(l1, c1, ty), Val::Cap(l2, c2, sty))
                     if *l1 <= *l2
                         && c2 >= c1
-                        // +1 own t -> +0 imm t
-                        && (*l1 == 0 || *c1 != Cap::Imm || *c2 == Cap::Imm) =>
+                        // +1 own t -> +0 (imm | mut) t
+                        && (*l1 == 0 || *c1 == Cap::Own || *c2 != Cap::Own) =>
                 {
                     if (**ty)
                         .clone()
@@ -1508,8 +1553,8 @@ impl GVal {
                         .unify((**sty).clone().glued(), span, cxt)
                     {
                         r.demote(l2 - l1);
-                        if *c1 == Cap::Imm && *c2 != Cap::Imm {
-                            // +n own t -> +0 imm t, we don't want them to be able to promote to +n imm t or whatever
+                        if *c1 != Cap::Own && *c2 == Cap::Own {
+                            // +n own t -> +0 (imm | mut) t, we don't want them to be able to promote to +n imm t or whatever
                             r.surplus = Some(0);
                         }
                         cxt.add_deps(r);

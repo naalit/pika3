@@ -86,8 +86,10 @@ impl Val {
         }
         match self {
             // +0 imm (+1 own t) --> +0 imm t, not +1 imm t - required for getting rid of borrows appropriately
-            Val::Cap(_, Cap::Own | Cap::Mut, rest) if c == Cap::Imm => Val::Cap(0, Cap::Imm, rest),
-            // TODO +0 mut (+1 own t) ?
+            Val::Cap(_, Cap::Own, rest) if c == Cap::Imm => Val::Cap(0, Cap::Imm, rest),
+            // `mut` is the same as `imm` in this respect
+            Val::Cap(_, Cap::Own, rest) if c == Cap::Mut => Val::Cap(0, Cap::Mut, rest),
+            // own (mut | imm) and mut imm / imm mut are normal (keep levels)
             Val::Cap(l, e, rest) => Val::Cap(l, c.min(e), rest),
             _ => Val::Cap(0, c, Arc::new(self)),
         }

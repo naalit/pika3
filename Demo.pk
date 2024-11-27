@@ -234,6 +234,7 @@ def p35_imm : imm a -> imm a = x => x
 # def p36_borrow_e : a -> ref a = x => p35_imm x # unclear if this should error or not
 
 def p37_mut : mut a -> Type = x => U
+def p37_mut_ : mut a -> mut a = mut x => x
 def p38_borrow_mut : a -> a = mut x => do
   p37_mut x
   p37_mut x
@@ -283,3 +284,18 @@ def p42_let_mut : a -> a = x => do
 #   p37_mut x # problem: mutating while borrowed!
 #   let w = z
 #   U
+
+# def __store : mut a -> mut a -> U = _ => _ => U
+# def p48_store_and_ret_e : mut a -> (mut a -> mut a) = mut x => do
+#   mut y = x
+#   (mut z) => do
+#     __store y z # should make y depend on z, which means we can no longer return z since y is captured
+#     z # but that's not how we implement this restriction - this is an error bc z depends on y. not sure if that means there are loopholes but it's def possible
+
+# here we can't make `z` depend on `y` (we can make `y` depend on `z` though, probably - TODO this is likely a problem)
+def _store : (mut a, own mut a) &-> U = _ => U
+def p49_store_and_ret : mut a -> (own mut a &-> mut a) = mut x => do
+  mut y = x
+  (mut z) => do
+    _store (y, z)
+    z
