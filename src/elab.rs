@@ -322,7 +322,11 @@ impl VarResult<'_> {
                         span,
                     );
                 }
-                let acap = if is_owned { cap } else { Cap::Imm };
+                let acap = if is_owned || cap == Cap::Mut {
+                    cap
+                } else {
+                    Cap::Imm
+                };
                 for (set, map) in &cxt.closure_stack {
                     if set.contains(&entry.sym) {
                         map.with_mut(|map| match map.get_mut(&entry.sym) {
@@ -377,7 +381,11 @@ impl VarResult<'_> {
                         (*entry.ty)
                             .clone()
                             .add_cap_level(cxt.level - entry.level)
-                            .as_cap(if is_owned { acap } else { Cap::Own }),
+                            .as_cap(if is_owned || acap == Cap::Mut {
+                                acap
+                            } else {
+                                Cap::Own
+                            }),
                     ),
                 )
             }
