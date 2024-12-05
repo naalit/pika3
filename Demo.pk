@@ -299,3 +299,10 @@ def p49_store_and_ret : mut a -> (own mut a &-> mut a) = mut x => do
   (mut z => do
     _store (y, z)
     z)
+
+# def p50_mutable_type : (a : Type) -> a -> a = mut a => x => do
+#   a = Type
+#   let y : a = x
+#   y
+
+def p51_assignment : (mut a, a) -> a = (mut p, x) => (p = x)

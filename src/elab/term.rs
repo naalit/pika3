@@ -36,6 +36,8 @@ pub enum Term {
     Fun(Class, Icit, Sym, Box<Term>, Arc<Term>),
     Pair(Box<Term>, Box<Term>),
     Cap(u32, Cap, Box<Term>),
+    Assign(Box<Term>, Box<Term>),
+    Unknown,
     Error,
     Type,
 }
@@ -64,6 +66,7 @@ pub enum Val {
     Fun(Class, Icit, Sym, Arc<Val>, Arc<Term>, Arc<Env>),
     Pair(Arc<Val>, Arc<Val>),
     Cap(u32, Cap, Arc<Val>),
+    Unknown,
     Error,
     Type,
 }
@@ -133,6 +136,8 @@ impl Term {
             ),
             Term::Cap(l, c, x) => x.eval(env).as_cap(*c).add_cap_level(*l),
             Term::Pair(a, b) => Val::Pair(Arc::new(a.eval(env)), Arc::new(b.eval(env))),
+            Term::Assign(_, _) => panic!("L0-evaluating term with mutation"),
+            Term::Unknown => Val::Unknown,
             Term::Error => Val::Error,
             Term::Type => Val::Type,
         })
@@ -209,6 +214,8 @@ impl Term {
             }
             Term::Cap(l, c, x) => Term::Cap(*l, *c, Box::new(x.subst(env)?)),
             Term::Pair(a, b) => Term::Pair(Box::new(a.subst(env)?), Box::new(b.subst(env)?)),
+            Term::Assign(a, b) => Term::Assign(Box::new(a.subst(env)?), Box::new(b.subst(env)?)),
+            Term::Unknown => Term::Unknown,
             Term::Error => Term::Error,
             Term::Type => Term::Type,
         })
@@ -260,6 +267,7 @@ impl Val {
             }
             Val::Cap(l, c, x) => Term::Cap(*l, *c, Box::new(x.quote_(env)?)),
             Val::Pair(a, b) => Term::Pair(Box::new(a.quote_(env)?), Box::new(b.quote_(env)?)),
+            Val::Unknown => Term::Unknown,
             Val::Error => Term::Error,
             Val::Type => Term::Type,
         })
@@ -290,6 +298,7 @@ impl Term {
                 term1.zonk_(cxt, qenv, beta_reduce);
                 if beta_reduce && solved_meta {
                     // we should be able to eval in an empty environment since we dont need to rename
+                    // TODO need to respect L0-evaluability !?
                     *self = self.eval(&default()).quote(&qenv);
                     return true;
                 }
@@ -298,14 +307,14 @@ impl Term {
                 aty.zonk_(cxt, qenv, beta_reduce);
                 Arc::make_mut(body).zonk_(cxt, &qenv, beta_reduce);
             }
-            Term::Pair(a, b) => {
+            Term::Pair(a, b) | Term::Assign(a, b) => {
                 a.zonk_(cxt, qenv, beta_reduce);
                 b.zonk_(cxt, qenv, beta_reduce);
             }
             Term::Cap(_, _, x) => {
                 x.zonk_(cxt, qenv, beta_reduce);
             }
-            Term::Head(_) | Term::Error | Term::Type => (),
+            Term::Head(_) | Term::Error | Term::Type | Term::Unknown => (),
         }
         false
     }
@@ -490,7 +499,10 @@ impl Val {
                 if let Some(val) = match h {
                     Head::Def(d) => {
                         if let Ok(elab) = cxt.db.elab.def_value(*d, &cxt.db) {
-                            elab.def.body.clone()
+                            elab.def
+                                .can_eval
+                                .then(|| elab.def.body.map(|x| Arc::new(x.eval(cxt.env()))))
+                                .flatten()
                         } else {
                             None
                         }
@@ -663,6 +675,9 @@ impl Pretty for Term {
                 (a.pretty(db).nest(Prec::Pi) + ", " + b.pretty(db).nest(Prec::Pair))
                     .prec(Prec::Pair)
             }
+            Term::Assign(a, b) => {
+                (a.pretty(db).nest(Prec::Pi) + " = " + b.pretty(db).nest(Prec::Pi)).prec(Prec::Term)
+            }
             Term::Cap(l, c, x) => (Doc::intersperse(
                 (0..*l).map(|_| {
                     Doc::keyword(match c {
@@ -679,6 +694,7 @@ impl Pretty for Term {
                 Doc::none()
             }) + x.pretty(db).nest(Prec::App))
             .prec(Prec::App),
+            Term::Unknown => Doc::keyword("??"),
             Term::Error => Doc::keyword("error"),
             Term::Type => Doc::start("Type"),
         }

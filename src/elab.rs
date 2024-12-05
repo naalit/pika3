@@ -15,7 +15,8 @@ use crate::parser::{Pre, PrePat, PreStmt, SPre, SPrePat};
 pub struct DefElab {
     pub name: SName,
     pub ty: Arc<Val>,
-    pub body: Option<Arc<Val>>,
+    pub body: Option<Arc<Term>>,
+    pub can_eval: bool,
 }
 
 #[derive(Debug)]
@@ -133,7 +134,11 @@ pub fn elab_def(def: Def, db: &DB) -> Option<DefElabResult> {
     eprintln!("[elab def {}]", def.pretty(db));
 
     let cxt = Cxt::new(def, AbsSpan(file, pre.name.span()), db.clone());
-    let ty = pre.0.ty.as_ref().map(|ty| ty.check(Val::Type, &cxt));
+    let ty = pre
+        .0
+        .ty
+        .as_ref()
+        .map(|ty| cxt.as_eval(|| ty.check(Val::Type, &cxt)));
     let solved_ty = match &ty {
         Some(ty) => {
             let ty = ty.eval(cxt.env()).zonk(&cxt, true);
@@ -187,7 +192,8 @@ pub fn elab_def(def: Def, db: &DB) -> Option<DefElabResult> {
         def: DefElab {
             name: pre.name,
             ty: Arc::new(ty),
-            body: body.map(|x| Arc::new(x.eval(&cxt.env()))),
+            body: body.map(|x| Arc::new(x)),
+            can_eval: cxt.can_eval.take().is_none(),
         },
         unsolved_metas: cxt.metas.with(|m| {
             m.iter()
@@ -247,6 +253,7 @@ impl Val {
             Val::Fun { .. } => true,
             Val::Pair(_, _) => unreachable!(),
             Val::Cap(_, c, t) => *c != Cap::Imm && t.is_owned(),
+            Val::Unknown => true,
             Val::Error => false,
             Val::Type => false,
         }
@@ -302,6 +309,9 @@ impl VarResult<'_> {
                     if cap >= Cap::Mut {
                         entry.borrow_gen.with_mut(|x| *x = (x.0 + 1, span));
                     }
+                }
+                if entry.mutable && cxt.can_eval.with(Option::is_none) {
+                    cxt.can_eval.set(Some(span));
                 }
                 if cap == Cap::Mut && !entry.mutable {
                     cxt.err(
@@ -501,6 +511,7 @@ struct Cxt {
     uquant_stack: Ref<Vec<Vec<(Sym, Arc<Val>)>>>,
     closure_stack: Vec<(Arc<FxHashSet<Sym>>, Ref<FxHashMap<Sym, (Span, Cap)>>)>,
     current_deps: Ref<Deps>,
+    can_eval: Ref<Option<Span>>,
     level: u32,
     errors: Errors,
 }
@@ -540,6 +551,7 @@ impl Cxt {
             uquant_stack: default(),
             closure_stack: default(),
             current_deps: default(),
+            can_eval: default(),
             level: 0,
             zonked_metas: default(),
         }
@@ -568,6 +580,19 @@ impl Cxt {
     }
     fn pop_closure(&mut self) -> Option<FxHashMap<Sym, (Span, Cap)>> {
         self.closure_stack.pop().map(|(_, x)| x.take())
+    }
+    fn as_eval<R>(&self, f: impl FnOnce() -> R) -> R {
+        let old = self.can_eval.take();
+        let r = f();
+        if let Some(span) = self.can_eval.set(old) {
+            self.err("cannot access mutable variables in types", span);
+        }
+        r
+    }
+    fn maybe_as_eval<R>(&self, f: impl FnOnce() -> R) -> (bool, R) {
+        let old = self.can_eval.take();
+        let r = f();
+        (self.can_eval.set(old).is_none(), r)
     }
 
     fn add_deps(&self, deps: Deps) {
@@ -1228,7 +1253,8 @@ impl SPre {
                         (Val::Error, 0)
                     }
                 };
-                let (mut r, x) = cxt.record_deps(|| x.check(aty, cxt));
+                let (mut r, (can_eval, x)) =
+                    cxt.record_deps(|| cxt.maybe_as_eval(|| x.check(aty, cxt)));
                 r.demote(l);
                 r.add(fr);
                 for (s, (span, lvl, _, m)) in &r.deps {
@@ -1245,7 +1271,11 @@ impl SPre {
                     }
                 }
                 cxt.add_deps(r);
-                let vx = x.eval(cxt.env());
+                let vx = if can_eval {
+                    x.eval(cxt.env())
+                } else {
+                    Val::Unknown
+                };
                 (
                     Term::App(Box::new(f), TElim::App(*i, Box::new(x))),
                     fty.as_small().app(vx),
@@ -1256,7 +1286,7 @@ impl SPre {
                 if q {
                     cxt.push_uquant();
                 }
-                let aty = paty.check(Val::Type, cxt);
+                let aty = cxt.as_eval(|| paty.check(Val::Type, cxt));
                 let vaty = aty.eval(cxt.env());
                 let (s, cxt) = cxt.bind(*n, vaty.clone());
                 // TODO do we apply the local promotion while checking the pi return type?
@@ -1377,6 +1407,16 @@ impl SPre {
                     ),
                 )
             }
+            Pre::Assign(a, b) => {
+                let (a, aty) = a.infer_(cxt, true, Cap::Mut);
+                let ity = match aty.big() {
+                    Val::Cap(l, Cap::Mut, a) => (**a).clone().add_cap_level(*l),
+                    _ => unreachable!("hopefully?"),
+                };
+                let b = b.check(ity.clone(), cxt);
+                // returns the *previous* value
+                (Term::Assign(Box::new(a), Box::new(b)), ity)
+            }
             Pre::Cap(l, c, x) => {
                 let x = x.check(Val::Type, cxt);
                 (Term::Cap(*l, *c, Box::new(x)), Val::Type)
@@ -1466,15 +1506,19 @@ impl SPre {
             (Pre::Sigma(i, n1, aty, n2, body), Val::Type) => {
                 let n1 = n1.map(|x| *x).unwrap_or(cxt.db.name("_"));
                 let n2 = n2.map(|x| *x).unwrap_or(cxt.db.name("_"));
-                let aty = aty.check(Val::Type, cxt);
+                let aty = cxt.as_eval(|| aty.check(Val::Type, cxt));
                 let vaty = aty.eval(cxt.env());
                 let (s, cxt) = cxt.bind(n1, vaty);
                 let body = body.check(Val::Type, &cxt);
                 Term::Fun(Sigma(n2), *i, s, Box::new(aty), Arc::new(body))
             }
             (Pre::Sigma(i, None, a, None, b), Val::Fun(Sigma(_), i2, _, aty, _, _)) if i == i2 => {
-                let a = a.check((**aty).clone(), cxt);
-                let va = a.eval(&cxt.env());
+                let (can_eval, a) = cxt.maybe_as_eval(|| a.check((**aty).clone(), cxt));
+                let va = if can_eval {
+                    a.eval(&cxt.env())
+                } else {
+                    Val::Unknown
+                };
                 let rty = ty.as_small().app(va);
                 let b = b.check(rty, cxt);
                 Term::Pair(Box::new(a), Box::new(b))

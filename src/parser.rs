@@ -35,6 +35,7 @@ pub enum Pre {
     Lam(Icit, SPrePat, SPre),
     Do(Vec<PreStmt>, SPre),
     Cap(u32, Cap, SPre),
+    Assign(SPre, SPre),
     Error,
 }
 pub type SPre = S<Box<Pre>>;
@@ -480,12 +481,19 @@ impl Parser {
         }
     }
     fn term(&mut self) -> SPre {
-        self.fun(true)
+        let a = self.fun(true);
+        if self.maybe(Tok::Equals) {
+            let b = self.term();
+            let span = Span(a.span().0, b.span().1);
+            S(Box::new(Pre::Assign(a, b)), span)
+        } else {
+            a
+        }
     }
     fn def(&mut self) -> PreDef {
         self.expect(Tok::DefKw);
         let name = self.spanned(Self::name);
-        let ty = self.maybe(Tok::Colon).then(|| self.term());
+        let ty = self.maybe(Tok::Colon).then(|| self.fun(true));
         let value = self.maybe(Tok::Equals).then(|| self.term());
         PreDef { name, ty, value }
     }

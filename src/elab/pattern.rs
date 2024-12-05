@@ -281,7 +281,7 @@ impl PRow {
                     Some(s)
                 }
                 IPat::Var(m, n, Some(paty)) => {
-                    let aty = paty.check(Val::Type, cxt).eval(cxt.env());
+                    let aty = cxt.as_eval(|| paty.check(Val::Type, cxt)).eval(cxt.env());
                     if !aty.clone().glued().unify((*t).clone().glued(), pat.1, cxt) {
                         cxt.err(
                             Doc::start("mismatched types: pattern has type ")
@@ -626,7 +626,11 @@ impl PMatch {
                 IPat::Var(m, n, Some(paty)) => (
                     m,
                     n,
-                    ty.unwrap_or_else(|| paty.check(Val::Type, &ocxt).eval(ocxt.env()).glued()),
+                    ty.unwrap_or_else(|| {
+                        ocxt.as_eval(|| paty.check(Val::Type, &ocxt))
+                            .eval(ocxt.env())
+                            .glued()
+                    }),
                 ),
                 IPat::CPat(n, _) => (
                     false,
