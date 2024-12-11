@@ -7,8 +7,8 @@ def q : (a: Type) -> a -> a = _ => x => x
 
 # Church equality and naturals
 
-def Eq : {a : Type} -> a -> a -> Type = {a} => x => y => (P : a -> Type) -> P x -> P y
-def refl : {a : Type} -> {x : a} -> Eq x x = P => px => px
+def Eq : {a : Type} -> ref a -> ref a -> Type = {a} => x => y => (P : ref a -> Type) -> P x -> P y
+def refl : {a : Type} -> {x : ref a} -> Eq x x = P => px => px
 
 def Nat : Type = (a : Type) -> (a -> a) -> a -> a
 def zero : Nat = _ => f => x => x
@@ -45,7 +45,7 @@ def c6k : Eq m6k m6kb = refl
 def Pair : Type -> Type -> Type
   = A => B => (P : Type) -> (A -> B -> P) -> P
 
-def dup : {A:Type} -> A -> Pair A A
+def dup : {A:Type} -> ref A -> Pair (ref A) (ref A)
   = a => P => p => p a a
 
 def id : {A:Type} -> A -> A
@@ -91,12 +91,12 @@ def id : {A:Type} -> A -> A
 #   x1
 
 def Vec : Type -> Nat -> Type
- = A => n => (V : Nat -> Type) -> ({n:_} -> A -> V n -> V (suc n)) -> V zero -> V n
+ = A => n => (V : Nat -> Type) ~> ({n:_} -> A -> V n -> V (suc n)) ~> V zero ~> V n
 
 def nil : {A:Type} -> Vec A zero
  = V => c => n => n
 
-def cons : {A:Type} -> {n:Nat} -> A -> Vec A n -> Vec A (suc n)
+def cons : {A:Type} -> {n:Nat} -> A -> Vec A n ~> Vec A (suc n)
  = a => v => V => c => n => c a (v V c n)
 
 def U = Type

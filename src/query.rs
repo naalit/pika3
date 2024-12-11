@@ -179,7 +179,7 @@ impl DB {
         }
     }
 
-    pub fn init_crate(&mut self, name: Name, path: File) -> Def {
+    pub fn intern_crate(&mut self, name: Name, path: File) -> Def {
         self.crate_roots.insert(path, name);
         self.idefs.intern(&DefLoc::Crate(name))
     }

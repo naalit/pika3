@@ -102,7 +102,8 @@ impl Parser {
         let t = self.peek();
         if t != Tok::Eof {
             self.pos += 1;
-            if !t.is_trivia() {
+            // Significant whitespace shouldn't actually be included in spans
+            if !(t.is_trivia() || t == Tok::Indent || t == Tok::Newline || t == Tok::Dedent) {
                 self.pos_non_trivia = self.pos;
             }
             self.this_tok_err = false;

@@ -1,0 +1,322 @@
+# comment
+def q : (a: Type) -> a -> a = _ => x => x
+
+# Church equality and naturals
+
+def Eq : {a : Type} -> ref a -> ref a -> Type = {a} => x => y => (P : ref a -> Type) -> P x -> P y
+def refl : {a : Type} -> {x : ref a} -> Eq x x = P => px => px
+
+def Nat : Type = (a : Type) -> (a -> a) -> a -> a
+def zero : Nat = _ => f => x => x
+def one : Nat = _ => f => x => f x
+def suc : Nat -> Nat = z => a => f => x => f (z a f x)
+def add : Nat -> Nat -> Nat = m => n => a => f => x => m a f (n a f x)
+def mul : Nat -> Nat -> Nat = m => n => a => f => x => m a (n a f) x
+
+# Benchmarks for conversion checking
+def m2 = suc one
+def m5 = add one (add m2 m2)
+def m10 = add m5 m5
+def m10b = mul m5 m2
+def m100 = mul m10 m10
+def m100b = mul m10b m10b
+def m1k = mul m100 m10
+def m1kb = mul m100b m10b
+def m2k = mul m2 m1k
+def m2kb = add m1kb m1kb
+def m5k = mul m1k m5
+def m5kb = mul m1kb m5
+def m5kc = add m1k (mul m2k m2)
+def m6k = add m5k m1k
+def m6kb = add m5k m1k
+# def m6kb = add m5kb m1kb
+
+def c10 : Eq m10 m10b = refl
+def c100 : Eq m100 m100b = refl
+
+# eta-expansion
+def e : (f : Type -> Type) -> Eq (x => f x) f = f => refl
+
+# meta tests
+def c10b : Eq m10 m10b = refl
+def q1 : (a : _) -> (b : _) -> a -> b ~> _ = _ => _ => x => y => x
+def q2 : (a : _) -> (b : _) -> a -> b -> _ = _ => _ => x => y => y
+
+# testing for meta scope errors
+def a1 : _ = _
+def a2 : (a : Type) -> a = a => a1
+
+# implicit parameters
+def i1 = {Type} -> {b: Type} -> b -> b
+def i2 : i1 -> Nat = f => f {Nat} {Nat} one
+def i3 : i1 -> Nat = f => f {Type} one # we can't find a solution for the first implicit parameter here, it needs to be explicit
+def i4 : {a : Type} -> a -> a = x => x
+
+# inferred lambdas
+def l1 = n => mul n m2
+def l2 = x => y => x -> y
+
+def Pair : Type -> Type -> Type
+  = A => B => (P : Type) -> (A -> B -> P) -> P
+
+def dup : {A:Type} -> ref A -> Pair (ref A) (ref A)
+  = a => P => p => p a a
+
+def id : {A:Type} -> A -> A
+ = x => x
+
+def letTest = do
+  let four = add m2 m2
+  let five : Nat = suc four
+  mul four five
+# -> (λfour. (λfive. mul four five) (suc four)) (add m2 m2)
+
+# testing type scope errors
+def illegal = do
+  let x : Type = Type
+  let p : Eq x x = refl
+  p
+
+def Vec : Type -> Nat -> Type
+ = A => n => (V : Nat -> Type) ~> ({n:_} -> A -> V n -> V (suc n)) ~> V zero ~> V n
+
+def nil : {A:Type} -> Vec A zero
+ = V => c => n => n
+
+def cons : {A:Type} -> {n:Nat} -> A -> Vec A n ~> Vec A (suc n)
+ = a => v => V => c => n => c a (v V c n)
+
+def U = Type
+
+def vecTest
+  =
+  (cons U (cons U (cons U (cons U (cons U (cons U (cons U
+  (cons U (cons U (cons U (cons U (cons U nil))))))))))))
+
+
+def pair : (a: Type, a) = (Type -> Type, x => x)
+def ipair : {a:Type}, a = (x: Type) => x
+def ppair : (Type, Type) = Type, Type
+def spair : Type = Type, Type
+def sigma = (a : Type, a, a -> a)
+def tnat = {a : Type} -> (a -> a, a) -> a
+# next step: pattern matching on tuples i.e. `def p : (a: Type, a) -> a = (_, x) => x`
+def p5 : (Type, Type), Type = (Type, Type), Type
+def pnat = (a: Type, a -> a, a) -> a
+def nnat = pnat ((Type -> Type), (x => x), (x => x))
+
+def p : (a: Type, a) -> a = (_, x) => x
+
+def fst : {a:_, b:_} -> (a, b) -> a = (x, _) => x
+def snd : {a:_, b:_} -> (a, b) -> b = (_, x) => x
+
+def third : {a:_, b:_, c: _} -> (a, b, c) -> c = (_, _, x) => x
+
+def p6 = snd (fst p5)
+def p7 : Nat = third (m2, m10, m100b)
+
+def pzero : pnat = (_, _, x) => x
+def psuc : pnat -> pnat = n => (_, f, x) => f (n (_, f, x))
+def padd : (pnat, pnat) -> pnat = (m, n) => (_, f, x) => m (_, f, n (_, f, x))
+def pmul : (pnat, pnat) -> pnat = (m, n) => (_, f, x) => m (_, (x => n (_, f, x)), x)
+def pm1 = psuc pzero
+def pm2 = padd (pm1, pm1)
+def pm5 = padd (pm1, pmul (pm2, pm2))
+def pm10 = pmul (pm2, pm5)
+def pm100 = pmul (pm10, pm10)
+def pm100b = pmul (pm2, pmul (pm2, pmul (pm5, pm5)))
+def cpm100 : Eq pm100 pm100b = refl
+
+def imatch0_e : ({Type}, Type) -> Type = (a, b) => b
+def imatch1_e : (Type, Type) -> Type = ({a}, b) => b
+def imatch2 : ({Type}, Type) -> Type = ({a}, b) => b
+def imatch3 : ({Type}, Type, Type) -> Type = (a, b) => b
+def imatch4 : ({a: Type}, a, a) -> a = (_, x) => x
+def imatch5 : ({a: Type}, a) -> a = x => x
+def imatch6 : (Type, {a: Type}, a) -> a = (_, x) => x
+def icoerce : {a: Type} -> a -> ({a: Type}, a) = x => x
+def it2 = do
+  let {a}, _ = icoerce psuc
+  a
+def it3 : ({a: Type}, a) = do
+  let {_}, b = icoerce psuc
+  b
+def pm1b : it2 = pm1
+
+def pinfer = (a, b: a) => b
+def p_nomatch : (Type, Type) -> (Type, Type) = x => x
+
+def universal : a -> a = x => x
+def universal2 = (f : {a:_} -> a -> a) => f pinfer
+def universal3 : (a -> a) -> a -> a = f => x => x
+def universal4 : (a -> a) -> (a -> a) = f => f
+def universal5 : (a -> a, a) -> a = (f, x) => f x
+def universal6 = (x : a) => x
+def universal7 = (f : a -> a) => (x : a) => f x
+def make_pair : a -> b ~> (a, b) = a => b => (a, b)
+
+def recursive : a -> a = x => recursive x
+def takes_fun : a -> (a -> a) ~> a = x => f => f x
+def ttttest = (x : Nat) => takes_fun x
+def recursive_inferred = (x : Nat) => takes_fun x recursive_inferred
+def recursive_inferred_2 = (x : Nat) => recursive_inferred_2 x # we can't actually infer the return type here
+
+def third_i : (a, b, c) -> c = (_, _, x) => x
+
+def unclear = x => x
+def solve1 = unclear one
+def solve2 = unclear Type
+
+# mutual recursion! the first definition knows the argument type, the second knows the return type
+def mutual1 = (x: Nat) => mutual2 x
+def mutual2 = y => mutual1 y -> Type
+
+def t = own Nat
+def p9 : t -> t = x => x
+def p10 : own Nat -> own Nat = x => x
+def p11_demotion : own Nat -> Nat = x => x
+def p12_demotion : own own Nat -> own Nat = x => x
+def p13_promotion_e : Nat -> own Nat = x => x
+def p14_promotion_e : own Nat -> own own Nat = x => x
+def p15 = (x : own Nat, y : Nat) => add x y
+def p16_ambient : (own Nat, own Nat) -> own Nat = (x, y) => add x y
+def p17_type : own Type = Type
+def p18_ambient_e : (own Nat, own Nat) -> own own Nat = (x, y) => add x y
+def p19_minus_one : own Nat &-> Nat = x => x
+def p20_minus_one_e : Nat &-> Nat = x => x
+
+def with_fun : ((U ~> U) &~> r) -> r = f => f (x => x)
+def p21_good =
+  with_fun (f => do
+    let f2 = with_fun
+      (g => do
+        let (f2, g2) = (f, g)
+        g2 U
+        f2
+      )
+    f2 U
+    U
+  )
+def p22_bad_e =
+  with_fun (f => do
+    let f2 = with_fun
+      (g => do
+        let (f2, g2) = (f, g)
+        f2 U
+        g2 # not allowed to escape this with_fun call!
+      )
+    f2 U
+    U
+  )
+
+def p23_dup_e : a -> (a, a) = x => (x, x)
+def p24_dup_type : Type -> (Type, Type) = x => (x, x)
+def p25_dupf : (a -> a) -> (a -> a, a -> a) = x => (x, x)
+def p26_dupf_e : (a ~> a) -> (a ~> a, a ~> a) = x => (x, x)
+def p27_dupf_e = do
+  let f : Type ~> Type = x => x
+  (f, f)
+def p28_callf_e : ref (a ~> a) -> a -> a = f => x => f x
+def p29_curry_e : (a ~> a) -> a -> a = f => x => f x
+
+def p30_imm : ref a &-> Type = _ => Type
+def p31_borrow : a -> a = x => do
+  let y = p30_imm x
+  x
+def p32_borrow : a -> (a, Type) = x => do
+  let y = p30_imm x
+  (x, y)
+def p33_imm : ref a -> Type = _ => Type
+def p34_borrow_e : a -> (a, Type) = x => do
+  let y = p33_imm x
+  (x, y)
+def p35_imm : imm a -> imm a = x => x
+def p36_borrow_e : a -> ref a = x => p35_imm x # unclear if this should error or not
+
+def p37_mut : mut a -> Type = x => U
+def p37_mut_ : mut a -> mut a = mut x => x
+def p38_borrow_mut : a -> a = mut x => do
+  p37_mut x
+  p37_mut x
+  x
+def p39_borrow_mut_e : a -> a = mut x => do
+  let a = p37_mut x
+  p37_mut x
+  let b = a
+  x
+def p40_borrow_mut_e : ref a -> ref a = x => do
+  p37_mut x
+  p37_mut x
+  x
+def p41_borrow_mut_e : a -> a = x => do
+  p37_mut x
+  p37_mut x
+  x
+def p42_let_mut : a -> a = x => do
+  let mut y = x
+  p37_mut y
+  mut z = y # shortcut syntax
+  p37_mut z
+  z
+
+def p43_ret_mut_e : a -> (U -> mut a) = mut x => _ => x
+def p44_problems : a -> (mut a, mut a) = mut x => do
+  let f = p43_ret_mut_e x
+  f U, f U # problem: duplicating mut reference!
+
+def p45_problems_e : a -> U = mut x => do
+  mut y : mut _ = x
+  let z : ref _ = x
+  p37_mut y # problem: mutating while borrowed!
+  let w = z
+  U
+
+def p46_problems_e : own a -> U = mut x => do
+  let y : ref (own _) = x
+  let z : ref _ = y
+  p37_mut x # problem: mutating while borrowed!
+  let w = z
+  U
+
+def p47_problems_e : (own a, U) -> U = mut x => do
+  let y : ref _ = x
+  let (z, _) = y
+  p37_mut x # problem: mutating while borrowed!
+  let w = z
+  U
+
+def __store : mut a -> mut a -> U = _ => _ => U
+def p48_store_and_ret_e : mut a -> (mut a -> mut a) = mut x => do
+  mut y = x
+  (mut z) => do
+    __store y z # should make y depend on z, which means we can no longer return z since y is captured
+    z # but that's not how we implement this restriction - this is an error bc z depends on y. not sure if that means there are loopholes but it's def possible
+
+# here we can't make `z` depend on `y` (we can make `y` depend on `z` though, probably - TODO this is likely a problem)
+def _store : (mut a, own mut a) &-> U = _ => U
+def p49_store_and_ret : mut a -> (own mut a &-> mut a) = mut x => do
+  mut y = x
+  (mut z => do
+    _store (y, z)
+    z)
+
+def p50_mutable_type : (a : Type) -> a -> a = mut a => x => do
+  a = Type
+  let y : a = x
+  y
+
+def p51_assignment : (mut a, a) -> a = (mut p, x) => (p = x)
+
+def Data = U ~> U # an arbitrary owned type for testing
+def borrow = (x: ref Data) => U
+def move = (x: Data) => U
+
+# this is an error message demo from pika2
+# in pika2 all the annotations listed here appear in the error
+# TODO replicate that? it might be a lot of info though
+def fail1 : Data -> ref Data = x => do
+    let y: ref Data = x # x is borrowed here
+    let z = y
+    let w = z # w depends on x through z
+    move x # x is moved here
+    w # error: w depends on x which has been moved

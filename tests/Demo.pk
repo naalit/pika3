@@ -306,3 +306,17 @@ def p49_store_and_ret : mut a -> (own mut a &-> mut a) = mut x => do
 #   y
 
 def p51_assignment : (mut a, a) -> a = (mut p, x) => (p = x)
+
+def Data = U ~> U # an arbitrary owned type for testing
+def borrow = (x: ref Data) => U
+def move = (x: Data) => U
+
+# this is an error message demo from pika2
+# in pika2 all the annotations listed here appear in the error
+# TODO replicate that? it might be a lot of info though
+# def fail1 : Data -> ref Data = x => do
+#     let y: ref Data = x # x is borrowed here
+#     let z = y
+#     let w = z # w depends on x through z
+#     move x # x is moved here
+#     w # error: w depends on x which has been moved
