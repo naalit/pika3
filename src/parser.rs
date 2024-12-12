@@ -494,8 +494,58 @@ impl Parser {
     fn def(&mut self) -> PreDef {
         self.expect(Tok::DefKw);
         let name = self.spanned(Self::name);
-        let ty = self.maybe(Tok::Colon).then(|| self.fun(true));
-        let value = self.maybe(Tok::Equals).then(|| self.term());
+        let args: Vec<_> = std::iter::from_fn(|| {
+            self.peek()
+                .starts_atom()
+                .then(|| (Expl, self.atom()))
+                .or_else(|| {
+                    self.maybe(Tok::SOpen).then(|| {
+                        let a = self.atom();
+                        self.expect(Tok::SClose);
+                        (Impl, a)
+                    })
+                })
+        })
+        .collect();
+        let ty = self
+            .maybe(Tok::Colon)
+            .then(|| self.fun(true))
+            .map(|mut ty| {
+                for (icit, arg) in args.iter().rev() {
+                    let span = Span(arg.span().0, ty.span().1);
+                    let (name, aty) = self.reparse_pi_param(arg.clone());
+                    ty = S(
+                        Box::new(Pre::Pi(
+                            *icit,
+                            name.as_deref().copied().unwrap_or(self.db.name("_")),
+                            // TODO how do we specify these on function definitions?
+                            0,
+                            FCap::Imm,
+                            aty,
+                            ty,
+                        )),
+                        span,
+                    );
+                }
+                ty
+            });
+        let value = self
+            .maybe(Tok::Equals)
+            .then(|| self.term())
+            .map(|mut value| {
+                for (icit, arg) in args.into_iter().rev() {
+                    let span = Span(arg.span().0, value.span().1);
+                    let arg = S(
+                        Box::new(self.reparse_pattern(
+                            &arg,
+                            &Doc::start("expected pattern in function argument"),
+                        )),
+                        arg.span(),
+                    );
+                    value = S(Box::new(Pre::Lam(icit, arg, value)), span);
+                }
+                value
+            });
         PreDef { name, ty, value }
     }
 
