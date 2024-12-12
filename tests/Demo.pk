@@ -323,4 +323,5 @@ def move = (x: Data) => U
 
 def p52_fun_syntax (x : Data) : Data = x
 def p53_fun_curry (x : Data) (y : Data) : Data = y # these are all ->; this is okay here bc we don't actually capture x
-def p54_fun_infer x = move x
+def p54_fun_infer x = move x # TODO if we add : U, that should be correct but in fact causes an error because of reparse_pi_param()
+def p55_fun_impl {x : Data} = x

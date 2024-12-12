@@ -1438,7 +1438,7 @@ impl SPre {
             Pre::Error => (Term::Error, Val::Error),
         };
         let sty = sty.glued();
-        if should_insert_metas {
+        if should_insert_metas && !matches!(s, Term::Fun(Lam, Impl, _, _, _)) {
             insert_metas(s, sty, cxt, self.span())
         } else {
             (s, sty)

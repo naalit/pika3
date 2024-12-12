@@ -495,16 +495,13 @@ impl Parser {
         self.expect(Tok::DefKw);
         let name = self.spanned(Self::name);
         let args: Vec<_> = std::iter::from_fn(|| {
-            self.peek()
-                .starts_atom()
-                .then(|| (Expl, self.atom()))
-                .or_else(|| {
-                    self.maybe(Tok::SOpen).then(|| {
-                        let a = self.atom();
-                        self.expect(Tok::SClose);
-                        (Impl, a)
-                    })
+            self.maybe(Tok::COpen)
+                .then(|| {
+                    let a = self.term();
+                    self.expect(Tok::CClose);
+                    (Impl, a)
                 })
+                .or_else(|| self.peek().starts_atom().then(|| (Expl, self.atom())))
         })
         .collect();
         let ty = self
