@@ -36,6 +36,8 @@ pub enum Pre {
     Do(Vec<PreStmt>, SPre),
     Cap(u32, Cap, SPre),
     Assign(SPre, SPre),
+    // x.f y
+    Dot(SPre, SName, Option<SPre>),
     Error,
 }
 pub type SPre = S<Box<Pre>>;
@@ -391,20 +393,36 @@ impl Parser {
         let mut a = self.atom();
         // make sure we don't get in an infinite loop - stop looking for atoms if we don't consume any input
         let mut last = start;
-        while self.peek().starts_atom() && last != self.pos() {
+        while (self.peek().starts_atom() || self.peek() == Tok::Dot) && last != self.pos() {
             last = self.pos();
-            if self.maybe(Tok::COpen) {
+            let dot = self.maybe(Tok::Dot).then(|| self.spanned(|s| s.name()));
+            let (icit, arg) = if self.maybe(Tok::COpen) {
                 let term = self.term();
                 self.expect(Tok::CClose);
+                (Impl, term)
+            } else if !self.peek().starts_atom() && dot.is_some() {
+                let dot = dot.unwrap();
                 a = S(
-                    Box::new(Pre::App(a, term, Impl)),
+                    Box::new(Pre::Dot(a, dot, None)),
                     Span(start, self.pos_right()),
                 );
+                continue;
             } else {
-                a = S(
-                    Box::new(Pre::App(a, self.atom(), Expl)),
-                    Span(start, self.pos_right()),
-                );
+                (Expl, self.atom())
+            };
+            match dot {
+                None => {
+                    a = S(
+                        Box::new(Pre::App(a, arg, icit)),
+                        Span(start, self.pos_right()),
+                    )
+                }
+                Some(n) => {
+                    a = S(
+                        Box::new(Pre::Dot(a, n, Some(arg))),
+                        Span(start, self.pos_right()),
+                    )
+                }
             }
         }
         a

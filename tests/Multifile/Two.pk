@@ -1,0 +1,6 @@
+def Nat = (a -> a, a) -> a
+
+def suc : Nat -> Nat
+  = n => (f, x) => f (n (f, x))
+
+def two : Nat = suc (One.one)

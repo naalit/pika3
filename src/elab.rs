@@ -4,7 +4,7 @@ mod term;
 use pattern::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use term::*;
-pub use term::{Term, Val};
+pub use term::{Builtin, Head, Term, Val};
 
 use crate::common::*;
 use crate::parser::{Pre, PrePat, PreStmt, SPre, SPrePat};
@@ -121,7 +121,7 @@ pub fn elab_module(file: File, def: Def, db: &DB) -> ModuleElabResult {
 }
 
 pub fn elab_def(def: Def, db: &DB) -> Option<DefElabResult> {
-    let (file, file_def) = db.def_file(def);
+    let (file, file_def) = db.def_file(def)?;
     let def_loc = db.idefs.get(def);
     if def_loc.parent() != Some(file_def) {
         // TODO how do child defs even work in this system?
@@ -1414,6 +1414,57 @@ impl SPre {
                         Arc::new(cxt.env().clone()),
                     ),
                 )
+            }
+            // temporary desugaring (eventually we do need the larger structure for method syntax)
+            Pre::Dot(lhs, dot, Some(rhs)) => {
+                return S(
+                    Box::new(Pre::App(
+                        S(Box::new(Pre::Dot(lhs.clone(), *dot, None)), self.span()),
+                        rhs.clone(),
+                        Expl,
+                    )),
+                    self.span(),
+                )
+                .infer_(cxt, should_insert_metas, borrow_as)
+            }
+            Pre::Dot(lhs, dot, None) => {
+                let lspan = lhs.span();
+                let (lhs, mut lty) = lhs.infer(cxt, true);
+                match lty.whnf(cxt) {
+                    Val::Neutral(Head::Builtin(Builtin::Module), v) if v.is_empty() => {
+                        // TODO l0-evaluation considerations
+                        match lhs.eval(cxt.env()) {
+                            Val::Neutral(Head::Def(d), v) if v.is_empty() => {
+                                let child = cxt.db.idefs.intern(&DefLoc::Child(d, **dot));
+                                match cxt.db.elab.def_type(child, &cxt.db) {
+                                    Ok(t) => (Term::Head(Head::Def(child)), (*t).clone()),
+                                    Err(crate::query::DefElabError::NotFound) => {
+                                        cxt.err(
+                                            "module "
+                                                + lhs.pretty(&cxt.db)
+                                                + " has no member "
+                                                + dot.pretty(&cxt.db),
+                                            lspan,
+                                        );
+                                        (Term::Error, Val::Error)
+                                    }
+                                    Err(crate::query::DefElabError::Recursive) => (
+                                        Term::Head(Head::Def(child)),
+                                        Val::Neutral(Head::Meta(Meta(child, 0)), default()),
+                                    ),
+                                }
+                            }
+                            l => panic!("{:?}", l),
+                        }
+                    }
+                    t => {
+                        cxt.err(
+                            "value of type " + t.pretty(&cxt.db) + " does not have members",
+                            lspan,
+                        );
+                        (Term::Error, Val::Error)
+                    }
+                }
             }
             Pre::Assign(a, b) => {
                 let (a, aty) = a.infer_(cxt, true, Cap::Mut);

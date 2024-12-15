@@ -22,10 +22,23 @@ impl Pretty for Meta {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Builtin {
+    Module,
+}
+impl std::fmt::Display for Builtin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Builtin::Module => write!(f, "Module"),
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Head {
     Sym(Sym),
     Def(Def),
     Meta(Meta),
+    Builtin(Builtin),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -123,8 +136,7 @@ impl Term {
     pub fn eval(&self, env: &Env) -> Val {
         with_stack(|| match self {
             Term::Head(Head::Sym(s)) => env.get(s).map(|x| (**x).clone()).unwrap_or(Val::sym(*s)),
-            Term::Head(Head::Def(d)) => Val::Neutral(Head::Def(*d), default()),
-            Term::Head(Head::Meta(m)) => Val::Neutral(Head::Meta(*m), default()),
+            Term::Head(h) => Val::Neutral(*h, default()),
             Term::App(f, x) => x.eval(env).elim(f.eval(env)),
             Term::Fun(c, i, s, aty, body) => Val::Fun(
                 *c,
@@ -199,8 +211,7 @@ impl Term {
     fn subst(&self, env: &SEnv) -> Result<Term, Sym> {
         Ok(match self {
             Term::Head(Head::Sym(s)) => env.get(*s).quote_(&env.qenv)?,
-            Term::Head(Head::Def(d)) => Term::Head(Head::Def(*d)),
-            Term::Head(Head::Meta(m)) => Term::Head(Head::Meta(*m)),
+            Term::Head(h) => Term::Head(*h),
             Term::App(f, x) => Term::App(Box::new(f.subst(env)?), x.subst(env)?),
             Term::Fun(c, i, s, aty, body) => {
                 let (s, env2) = env.bind(*s);
@@ -509,6 +520,8 @@ impl Val {
                     }
                     Head::Sym(s) => cxt.local_val(*s),
                     Head::Meta(m) => cxt.meta_val(*m),
+                    // TODO resolve applicable builtins
+                    Head::Builtin(_) => None,
                 } {
                     Some(
                         match &*val {
@@ -616,6 +629,7 @@ impl Pretty for Term {
             Term::Head(Head::Sym(s)) => Doc::start(db.get(s.0)), // + &*format!("@{}", s.1),
             Term::Head(Head::Def(d)) => db.idefs.get(*d).name().pretty(db),
             Term::Head(Head::Meta(m)) => m.pretty(db),
+            Term::Head(Head::Builtin(b)) => Doc::start(b),
             // TODO we probably want to show implicit and explicit application differently, but that requires threading icits through neutral spines...
             Term::App(f, TElim::App(i, x)) => (f.pretty(db).nest(Prec::App)
                 + " "

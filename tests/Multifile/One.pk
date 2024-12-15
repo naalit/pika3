@@ -1,0 +1,3 @@
+def one : Two.Nat = (f, x) => f x
+
+def three : Two.Nat = Two.suc (Two.two)

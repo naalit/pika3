@@ -13,9 +13,15 @@ use pretty::IntoStyle;
 
 use crate::common::*;
 
+#[derive(Copy, Clone)]
+pub struct ElabModule {
+    pub file: File,
+    pub def: Def,
+}
 #[derive(Clone)]
 pub struct ElabResult {
-    pub files: Vec<File>,
+    pub files: Vec<ElabModule>,
+    pub crate_def: Def,
     pub db: DB,
 }
 pub struct ElabError {
@@ -33,42 +39,86 @@ impl ElabResult {
         self.files
             .iter()
             .copied()
-            .flat_map(|file| {
-                let name = self.db.ifiles.get(file).name();
-                let mdef = self.db.intern_crate(self.db.name(&name), file);
-                elab::elab_module(file, mdef, &self.db)
+            .flat_map(|m| {
+                elab::elab_module(m.file, m.def, &self.db)
                     .errors
                     .into_iter()
-                    .map(move |err| ElabError { err, file })
+                    .map(move |err| ElabError { err, file: m.file })
             })
             .collect()
     }
 }
 
-pub fn elab_files(filenames: &[PathBuf]) -> Result<ElabResult, (PathBuf, std::io::Error)> {
+/// Finds the smallest directory that is a parent of all the given paths.
+/// Returns `None` if the input is empty or no common parent exists.
+fn find_crate_root(paths: &[PathBuf]) -> Option<PathBuf> {
+    if paths.is_empty() {
+        return None;
+    }
+
+    // Start with the first path as the initial "common prefix"
+    let mut common_path = paths[0].clone();
+
+    for path in &paths[1..] {
+        while !path.starts_with(&common_path) {
+            // Remove the last component of `common_path` to backtrack
+            if !common_path.pop() {
+                // If we can't pop anymore, there's no common directory
+                return None;
+            }
+        }
+    }
+
+    Some(common_path)
+}
+
+pub fn elab_files(filenames: &[PathBuf]) -> Result<ElabResult, (Option<PathBuf>, std::io::Error)> {
     let mut db = DB::default();
+    let crate_root =
+        find_crate_root(filenames).ok_or((None, std::io::Error::other("no crate root found")))?;
+    eprintln!("crate root: {}", crate_root.display());
+    let root_file = db
+        .ifiles
+        .intern(&FileLoc::File(crate_root.canonicalize().unwrap()));
+    let crate_def = db.intern_crate(db.name(&db.ifiles.get(root_file).name()), root_file);
     let mut files = Vec::new();
     for file_name in filenames {
         let (input, input_s) = {
-            let mut file = std::fs::File::open(&file_name).map_err(|e| (file_name.clone(), e))?;
+            let mut file =
+                std::fs::File::open(&file_name).map_err(|e| (file_name.clone().into(), e))?;
             let mut input = String::new();
             file.read_to_string(&mut input)
-                .map_err(|e| (file_name.clone(), e))?;
+                .map_err(|e| (file_name.clone().into(), e))?;
             (input.rope(), input)
         };
 
         let file = db.ifiles.intern(&FileLoc::File(
             std::path::Path::new(&file_name).canonicalize().unwrap(),
         ));
-        let name = db.ifiles.get(file).name();
-        // Need to establish a crate root for the file
-        // TODO crates with multiple files...
-        db.intern_crate(db.name(&name), file);
-        db.set_file_source(file, input.clone(), Some(input_s.into()));
-        files.push(file);
+        let def = file_name
+            .components()
+            .skip(crate_root.components().count())
+            .fold(crate_def, |acc, component| {
+                db.idefs.intern(&DefLoc::Child(
+                    acc,
+                    // TODO better handling of multiple . in file names
+                    db.name(
+                        &component
+                            .as_os_str()
+                            .to_string_lossy()
+                            .trim_end_matches(".pk"),
+                    ),
+                ))
+            });
+        db.set_file_source(def, file, input.clone(), Some(input_s.into()));
+        files.push(ElabModule { file, def });
     }
 
-    Ok(ElabResult { files, db })
+    Ok(ElabResult {
+        files,
+        db,
+        crate_def,
+    })
 }
 
 pub fn driver(config: Config) {
@@ -81,20 +131,28 @@ pub fn driver(config: Config) {
         std::process::exit(1)
     }
 
-    let mut r = elab_files(&config.files).unwrap_or_else(|(file, _)| {
-        Doc::none()
-            .add("Error", ariadne::Color::Red)
-            .add(": File not found: '", ())
-            .add(file.display(), ariadne::Color::Cyan)
-            .add("'", ())
-            .emit_stderr();
-        std::process::exit(1)
+    let mut r = elab_files(&config.files).unwrap_or_else(|(file, err)| match file {
+        Some(file) => {
+            Doc::none()
+                .add("Error", ariadne::Color::Red)
+                .add(": File not found: '", ())
+                .add(file.display(), ariadne::Color::Cyan)
+                .add("'", ())
+                .emit_stderr();
+            std::process::exit(1)
+        }
+        None => {
+            Doc::none()
+                .add("Error", ariadne::Color::Red)
+                .add(": ", ())
+                .add(err, ariadne::Color::Cyan)
+                .emit_stderr();
+            std::process::exit(1)
+        }
     });
 
-    for file in r.files.clone() {
-        let name = r.db.ifiles.get(file).name();
-        let mdef = r.db.intern_crate(r.db.name(&name), file);
-        let module = elab::elab_module(file, mdef, &r.db);
+    for m in r.files.clone() {
+        let module = elab::elab_module(m.file, m.def, &r.db);
         for i in &module.module.defs {
             (Doc::keyword("val ") + i.name.pretty(&r.db) + " : " + i.ty.pretty(&r.db))
                 // + " = "

@@ -43,3 +43,8 @@ fn demo() {
 fn demo_errors() {
     test(&["DemoErr.pk"]).num_errors(42);
 }
+
+#[test]
+fn multifile() {
+    test(&["Multifile/One.pk", "Multifile/Two.pk"]).succeeds();
+}

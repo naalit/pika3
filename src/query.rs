@@ -50,7 +50,7 @@ use std::{
 
 use crate::{
     common::*,
-    elab::{DefElabResult, Val},
+    elab::{Builtin, DefElabResult, Head, Val},
     parser::ParseResult,
 };
 
@@ -169,11 +169,11 @@ impl DB {
         self.name(&s)
     }
 
-    pub fn def_file(&self, def: Def) -> (File, Def) {
+    pub fn def_file(&self, def: Def) -> Option<(File, Def)> {
         match self.def_file.get(&def) {
-            Some(f) => (*f, def),
+            Some(f) => Some((*f, def)),
             None => match self.idefs.get(def) {
-                DefLoc::Crate(n) => panic!("no root file for crate {}", self.get(n)),
+                DefLoc::Crate(_) => None,
                 DefLoc::Child(d, _) => self.def_file(d),
             },
         }
@@ -203,7 +203,7 @@ impl DB {
         }
     }
 
-    pub fn set_file_source(&mut self, f: File, rope: Rope, str: Option<Str>) {
+    pub fn set_file_source(&mut self, def: Def, f: File, rope: Rope, str: Option<Str>) {
         if self
             .files
             .insert(
@@ -215,28 +215,6 @@ impl DB {
             )
             .is_none()
         {
-            // we just added this file, so we need to establish its root Def
-            // this only depends on the path so we only have to do this when a file is first added
-            let mut file = f;
-            let mut v = Vec::new();
-            let crate_root = loop {
-                match self.crate_roots.get(&file) {
-                    Some(c) => break c,
-                    None => match self.ifiles.get(file).parent() {
-                        Some(f2) => {
-                            v.push(self.name(&self.ifiles.get(file).name()));
-                            file = self.ifiles.intern(&f2);
-                            continue;
-                        }
-                        None => panic!("file {} is not in any crate", self.ifiles.get(f)),
-                    },
-                }
-            };
-            let def = v
-                .into_iter()
-                .fold(self.idefs.intern(&DefLoc::Crate(*crate_root)), |acc, x| {
-                    self.idefs.intern(&DefLoc::Child(acc, x))
-                });
             self.def_file.insert(def, f);
         }
         let parsed = crate::parser::parse(rope, self);
@@ -396,7 +374,7 @@ impl ElabCache {
 
     fn invalidate_file(&self, f: File, db: &DB) {
         self.cache
-            .with_mut(|m| m.retain(|k, _| db.def_file(*k).0 != f))
+            .with_mut(|m| m.retain(|k, _| db.def_file(*k).map_or(true, |x| x.0 != f)))
     }
 
     pub fn def_value(&self, key: Def, db: &DB) -> Result<DefElabResult, DefElabError> {
@@ -419,6 +397,12 @@ impl ElabCache {
         self.maybe_recompute(key.clone(), db);
         self.cache
             .with(|c| c.get(&key).map(|e| e.result.def.ty.clone()))
+            .or_else(|| {
+                db.def_file
+                    .keys()
+                    .any(|k| *k == key)
+                    .then(|| Arc::new(Val::Neutral(Head::Builtin(Builtin::Module), default())))
+            })
             .ok_or(DefElabError::NotFound)
     }
 }
