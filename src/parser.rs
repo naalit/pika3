@@ -365,19 +365,13 @@ impl Parser {
     }
     fn app(&mut self) -> SPre {
         let start = self.pos();
-        if self.maybe(Tok::OwnKw) {
+        if self.maybe(Tok::BitAnd) {
             let rest = self.app();
             return S(
                 Box::new(Pre::Cap(1, Cap::Own, rest)),
                 Span(start, self.pos_right()),
             );
         } else if self.maybe(Tok::ImmKw) {
-            let rest = self.app();
-            return S(
-                Box::new(Pre::Cap(1, Cap::Imm, rest)),
-                Span(start, self.pos_right()),
-            );
-        } else if self.maybe(Tok::RefKw) {
             let rest = self.app();
             return S(
                 Box::new(Pre::Cap(0, Cap::Imm, rest)),
