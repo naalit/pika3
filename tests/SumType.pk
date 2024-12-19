@@ -1,0 +1,9 @@
+type Option a of
+  None
+  Some a
+
+type Pair a b of New (a, b)
+
+#def fst : Pair a b -> a = Pair.New (x, _) => x
+def t : Option (Type -> Type) = Option.None
+def p = Pair.New (Type, t)

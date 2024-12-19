@@ -48,3 +48,8 @@ fn demo_errors() {
 fn multifile() {
     test(&["Multifile/One.pk", "Multifile/Two.pk"]).succeeds();
 }
+
+#[test]
+fn sum_type() {
+    test(&["SumType.pk"]).succeeds();
+}

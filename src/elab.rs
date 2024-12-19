@@ -7,7 +7,7 @@ use term::*;
 pub use term::{Builtin, Head, Term, Val};
 
 use crate::common::*;
-use crate::parser::{Pre, PrePat, PreStmt, SPre, SPrePat};
+use crate::parser::{Pre, PreDef, PrePat, PreStmt, SPre, SPrePat};
 
 // -- entry point (per-file elab query) --
 
@@ -17,6 +17,7 @@ pub struct DefElab {
     pub ty: Arc<Val>,
     pub body: Option<Arc<Term>>,
     pub can_eval: bool,
+    pub children: Vec<(Def, DefElab)>,
 }
 
 #[derive(Debug)]
@@ -47,7 +48,7 @@ pub fn elab_module(file: File, def: Def, db: &DB) -> ModuleElabResult {
     // Avoid making a meta for the type
     root_cxt.metas.take();
     for i in &parsed.defs {
-        let def = db.idefs.intern(&DefLoc::Child(def, *i.name));
+        let def = db.idefs.intern(&DefLoc::Child(def, *i.name()));
         if let Ok(elab) = db.elab.def_value(def, db) {
             let span = elab.def.name.span();
             defs.push(elab.def);
@@ -124,77 +125,185 @@ pub fn elab_def(def: Def, db: &DB) -> Option<DefElabResult> {
     let (file, file_def) = db.def_file(def)?;
     let def_loc = db.idefs.get(def);
     if def_loc.parent() != Some(file_def) {
-        // TODO how do child defs even work in this system?
-        return None;
+        // The parent will have elaborated child defs, so find that and return it
+        let elab = db.elab.def_value(def_loc.parent()?, db).ok()?;
+        let (_, elab) = elab.def.children.iter().find(|(d, _)| *d == def)?;
+        return Some(DefElabResult {
+            def: elab.clone(),
+            unsolved_metas: default(),
+            solved_metas: default(),
+            errors: default(),
+        });
     }
     let name = def_loc.name();
     let parsed = db.file_ast(file);
-    let pre = parsed.defs.iter().find(|d| *d.name == name)?;
+    let pre = parsed.defs.iter().find(|d| *d.name() == name)?;
 
     eprintln!("[elab def {}]", def.pretty(db));
 
-    let cxt = Cxt::new(def, AbsSpan(file, pre.name.span()), db.clone());
-    let ty = pre
-        .0
-        .ty
-        .as_ref()
-        .map(|ty| cxt.as_eval(|| ty.check(Val::Type, &cxt)));
-    let solved_ty = match &ty {
-        Some(ty) => {
-            let ty = ty.eval(cxt.env()).zonk(&cxt, true);
-            cxt.solve_meta(Meta(def, 0), &vec![], ty, Some(pre.name.span()));
-            true
+    let mut cxt = Cxt::new(def, AbsSpan(file, pre.name().span()), db.clone());
+    let def_elab = match &**pre {
+        PreDef::Val { name, ty, value } => {
+            let ty = ty
+                .as_ref()
+                .map(|ty| cxt.as_eval(|| ty.check(Val::Type, &cxt)));
+            let solved_ty = match &ty {
+                Some(ty) => {
+                    let ty = ty.eval(cxt.env()).zonk(&cxt, true);
+                    cxt.solve_meta(Meta(def, 0), &vec![], ty, Some(name.span()));
+                    true
+                }
+                None => false,
+            };
+            let (mut body, ty) = if let Some((val, ty)) = value.as_ref().map(|val| match &ty {
+                Some(ty) => {
+                    let vty = ty.eval(&cxt.env());
+                    (val.check(vty.clone(), &cxt), vty)
+                }
+                None => val.infer(&cxt, true).pipe(|(x, y)| (x, y.as_small())),
+            }) {
+                (Some(val), ty)
+            } else if let Some(ty) = ty {
+                (None, ty.eval(&cxt.env()))
+            } else {
+                (None, Val::Error)
+            };
+            if body.is_none() {
+                cxt.err(
+                    "definition does not have a body: `"
+                        + name.pretty(db)
+                        + "` of type "
+                        + ty.pretty(db),
+                    name.span(),
+                );
+            }
+
+            cxt.current_deps.take().check(&cxt);
+
+            body.as_mut().map(|x| x.zonk(&cxt, false));
+            let ty = ty.zonk(&cxt, true);
+            if !solved_ty {
+                let ety = Val::Neutral(Head::Meta(Meta(def, 0)), default()).zonk(&cxt, true);
+                if !ty
+                    .clone()
+                    .glued()
+                    .unify(ety.clone().glued(), name.span(), &cxt)
+                {
+                    cxt.err(
+                        "definition body has type "
+                            + ty.pretty(&cxt.db)
+                            + " but definition was previously inferred to have type "
+                            + ety.pretty(&cxt.db),
+                        name.span(),
+                    );
+                }
+            }
+
+            DefElab {
+                name: *name,
+                ty: Arc::new(ty),
+                body: body.map(|x| Arc::new(x)),
+                can_eval: cxt.can_eval.take().is_none(),
+                children: Vec::new(),
+            }
         }
-        None => false,
+        PreDef::Type {
+            name,
+            args,
+            variants,
+        } => {
+            let before_cxt = cxt.clone();
+            let m: Vec<_> = args
+                .iter()
+                .map(|(icit, arg)| (*icit, PMatch::new(None, &[arg.clone()], &mut cxt)))
+                .collect();
+            let ty = m
+                .iter()
+                .rfold(Term::Type, |acc, (i, (s, m))| {
+                    let aty = m.ty.quote(cxt.qenv());
+                    let body = m.compile(&[acc], &cxt);
+                    Term::Fun(Pi(0, FCap::Imm), *i, *s, Box::new(aty), Arc::new(body))
+                })
+                .eval(cxt.env())
+                .zonk(&cxt, true);
+            cxt.solve_meta(Meta(def, 0), &vec![], ty.clone(), Some(name.span()));
+
+            let mut children = Vec::new();
+            for (vname, vargs, vty) in variants {
+                let vty = match vty {
+                    Some(vty) => {
+                        if vargs.is_some() {
+                            cxt.err(
+                                "parameters to constructor should come after :",
+                                vargs.as_ref().unwrap().1.span(),
+                            );
+                        }
+                        // TODO check for correct return type
+                        vty.check(Val::Type, &before_cxt)
+                    }
+                    None => {
+                        let mut cxt = cxt.clone();
+                        for (_, (_, m)) in &m {
+                            cxt = m.bind(0, &default(), &cxt);
+                        }
+                        let rty = m
+                            .iter()
+                            .fold(Term::Head(Head::Def(def)), |acc, (i, (s, _))| {
+                                Term::App(
+                                    Box::new(acc),
+                                    TElim::App(*i, Box::new(Term::Head(Head::Sym(*s)))),
+                                )
+                            });
+                        let vty = vargs.as_ref().map_or(rty.clone(), |(i, paty)| {
+                            let aty = cxt.as_eval(|| paty.check(Val::Type, &cxt));
+                            let vaty = aty.eval(cxt.env());
+                            let (s, cxt) = cxt.bind(db.name("_"), vaty.clone());
+                            let body = pat_bind_type(
+                                &paty,
+                                Val::Neutral(Head::Sym(s), default()),
+                                &vaty,
+                                &cxt,
+                                |_| rty,
+                            );
+                            Term::Fun(Pi(0, FCap::Imm), *i, s, Box::new(aty), Arc::new(body))
+                        });
+                        m.iter().rfold(vty, |acc, (_, (s, m))| {
+                            let aty = m.ty.quote(cxt.qenv());
+                            let body = m.compile(&[acc], &cxt);
+                            Term::Fun(Pi(0, FCap::Imm), Impl, *s, Box::new(aty), Arc::new(body))
+                        })
+                    }
+                };
+                let vty = vty.eval(cxt.env()).zonk(&cxt, true);
+                children.push((
+                    // TODO error on duplicate names
+                    db.idefs.intern(&DefLoc::Child(def, **vname)),
+                    DefElab {
+                        name: *vname,
+                        ty: Arc::new(vty),
+                        body: None,
+                        can_eval: false,
+                        children: default(),
+                    },
+                ));
+            }
+            let ty = ty.zonk(&cxt, true);
+            // Re-zonk metas in variant types to make sure we get them all
+            for (_, elab) in &mut children {
+                elab.ty = Arc::new(elab.ty.zonk(&cxt, true));
+            }
+
+            DefElab {
+                name: *name,
+                ty: Arc::new(ty),
+                body: None,
+                can_eval: false,
+                children,
+            }
+        }
     };
-    let (mut body, ty) = if let Some((val, ty)) = pre.0.value.as_ref().map(|val| match &ty {
-        Some(ty) => {
-            let vty = ty.eval(&cxt.env());
-            (val.check(vty.clone(), &cxt), vty)
-        }
-        None => val.infer(&cxt, true).pipe(|(x, y)| (x, y.as_small())),
-    }) {
-        (Some(val), ty)
-    } else if let Some(ty) = ty {
-        (None, ty.eval(&cxt.env()))
-    } else {
-        (None, Val::Error)
-    };
-    if body.is_none() {
-        cxt.err(
-            "definition does not have a body: `" + name.pretty(db) + "` of type " + ty.pretty(db),
-            pre.name.span(),
-        );
-    }
-
-    cxt.current_deps.take().check(&cxt);
-
-    body.as_mut().map(|x| x.zonk(&cxt, false));
-    let ty = ty.zonk(&cxt, true);
-    if !solved_ty {
-        let ety = Val::Neutral(Head::Meta(Meta(def, 0)), default()).zonk(&cxt, true);
-        if !ty
-            .clone()
-            .glued()
-            .unify(ety.clone().glued(), pre.name.span(), &cxt)
-        {
-            cxt.err(
-                "definition body has type "
-                    + ty.pretty(&cxt.db)
-                    + " but definition was previously inferred to have type "
-                    + ety.pretty(&cxt.db),
-                pre.name.span(),
-            );
-        }
-    }
-
     Some(DefElabResult {
-        def: DefElab {
-            name: pre.name,
-            ty: Arc::new(ty),
-            body: body.map(|x| Arc::new(x)),
-            can_eval: cxt.can_eval.take().is_none(),
-        },
+        def: def_elab,
         unsolved_metas: cxt.metas.with(|m| {
             m.iter()
                 .filter_map(|(m, v)| match v {
@@ -1430,39 +1539,44 @@ impl SPre {
             Pre::Dot(lhs, dot, None) => {
                 let lspan = lhs.span();
                 let (lhs, mut lty) = lhs.infer(cxt, true);
-                match lty.whnf(cxt) {
-                    Val::Neutral(Head::Builtin(Builtin::Module), v) if v.is_empty() => {
-                        // TODO l0-evaluation considerations
-                        match lhs.eval(cxt.env()) {
-                            Val::Neutral(Head::Def(d), v) if v.is_empty() => {
-                                let child = cxt.db.idefs.intern(&DefLoc::Child(d, **dot));
-                                match cxt.db.elab.def_type(child, &cxt.db) {
-                                    Ok(t) => (Term::Head(Head::Def(child)), (*t).clone()),
-                                    Err(crate::query::DefElabError::NotFound) => {
-                                        cxt.err(
-                                            "module "
-                                                + lhs.pretty(&cxt.db)
-                                                + " has no member "
-                                                + dot.pretty(&cxt.db),
-                                            lspan,
-                                        );
-                                        (Term::Error, Val::Error)
-                                    }
-                                    Err(crate::query::DefElabError::Recursive) => (
-                                        Term::Head(Head::Def(child)),
-                                        Val::Neutral(Head::Meta(Meta(child, 0)), default()),
-                                    ),
-                                }
+                // TODO this is messy
+                let mut r = None;
+                match lhs.eval(cxt.env()) {
+                    Val::Neutral(Head::Def(d), v) if v.is_empty() => {
+                        let child = cxt.db.idefs.intern(&DefLoc::Child(d, **dot));
+                        match cxt.db.elab.def_type(child, &cxt.db) {
+                            Ok(t) => r = Some((Term::Head(Head::Def(child)), (*t).clone())),
+                            Err(crate::query::DefElabError::NotFound) => {
+                                cxt.err(
+                                    "definition "
+                                        + lhs.pretty(&cxt.db)
+                                        + " has no member "
+                                        + dot.pretty(&cxt.db),
+                                    lspan,
+                                );
+                                r = Some((Term::Error, Val::Error));
                             }
-                            l => panic!("{:?}", l),
+                            Err(crate::query::DefElabError::Recursive) => {
+                                r = Some((
+                                    Term::Head(Head::Def(child)),
+                                    Val::Neutral(Head::Meta(Meta(child, 0)), default()),
+                                ))
+                            }
                         }
                     }
-                    t => {
-                        cxt.err(
-                            "value of type " + t.pretty(&cxt.db) + " does not have members",
-                            lspan,
-                        );
-                        (Term::Error, Val::Error)
+                    _ => (),
+                }
+                if let Some(r) = r {
+                    r
+                } else {
+                    match lty.whnf(cxt) {
+                        t => {
+                            cxt.err(
+                                "value of type " + t.pretty(&cxt.db) + " does not have members",
+                                lspan,
+                            );
+                            (Term::Error, Val::Error)
+                        }
                     }
                 }
             }

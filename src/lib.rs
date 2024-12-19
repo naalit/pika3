@@ -9,6 +9,7 @@ mod query;
 use std::{io::Read, path::PathBuf};
 
 use args::Config;
+use elab::DefElab;
 use pretty::IntoStyle;
 
 use crate::common::*;
@@ -121,6 +122,17 @@ pub fn elab_files(filenames: &[PathBuf]) -> Result<ElabResult, (Option<PathBuf>,
     })
 }
 
+fn pretty_def(e: &DefElab, db: &DB) -> Doc {
+    let mut doc = Doc::keyword("val ") + e.name.pretty(&db) + " : " + e.ty.pretty(&db);
+    // + " = "
+    // + e.body.as_ref().map_or("".into(), |x| x.pretty(&db));
+
+    for (_, i) in &e.children {
+        doc = doc.hardline() + pretty_def(i, db);
+    }
+    doc.indent()
+}
+
 pub fn driver(config: Config) {
     // CLI driver
     if config.files.is_empty() {
@@ -154,10 +166,7 @@ pub fn driver(config: Config) {
     for m in r.files.clone() {
         let module = elab::elab_module(m.file, m.def, &r.db);
         for i in &module.module.defs {
-            (Doc::keyword("val ") + i.name.pretty(&r.db) + " : " + i.ty.pretty(&r.db))
-                // + " = "
-                // + i.body.as_ref().map_or("".into(), |x| x.pretty(&db)))
-                .emit_stderr();
+            pretty_def(i, &r.db).emit_stderr();
         }
     }
 

@@ -5,10 +5,26 @@ use crate::lexer::*;
 // but for now:
 // `def f : t = ...`
 #[derive(Debug)]
-pub struct PreDef {
-    pub name: SName,
-    pub ty: Option<SPre>,
-    pub value: Option<SPre>,
+pub enum PreDef {
+    Val {
+        name: SName,
+        ty: Option<SPre>,
+        value: Option<SPre>,
+    },
+    Type {
+        name: SName,
+        args: Vec<(Icit, SPrePat)>,
+        // (name, args, return type)
+        variants: Vec<(SName, Option<(Icit, SPre)>, Option<SPre>)>,
+    },
+}
+impl PreDef {
+    pub fn name(&self) -> SName {
+        match self {
+            PreDef::Val { name, .. } => *name,
+            PreDef::Type { name, .. } => *name,
+        }
+    }
 }
 pub type SPrePat = S<Box<PrePat>>;
 
@@ -504,6 +520,86 @@ impl Parser {
         }
     }
     fn def(&mut self) -> PreDef {
+        if self.maybe(Tok::TypeKw) {
+            let name = self.spanned(Self::name);
+            let args: Vec<_> = std::iter::from_fn(|| {
+                self.maybe(Tok::COpen)
+                    .then(|| {
+                        let a = self.term();
+                        self.expect(Tok::CClose);
+                        (Impl, a)
+                    })
+                    .or_else(|| self.peek().starts_atom().then(|| (Expl, self.atom())))
+                    .map(|(i, p)| {
+                        (
+                            i,
+                            S(
+                                Box::new(self.reparse_pattern(
+                                    &p,
+                                    &Doc::start("expected pattern in type parameters"),
+                                )),
+                                p.span(),
+                            ),
+                        )
+                    })
+            })
+            .collect();
+            let plen = self.indent_stack.len();
+            self.expect(Tok::OfKw);
+            if self.indent_stack.len() > plen {
+                *self.indent_stack.last_mut().unwrap() = false;
+            }
+            let ilen = self.indent_stack.len();
+            let mut variants = Vec::new();
+            while self.indent_stack.len() == ilen {
+                let name = self.spanned(Self::name);
+                // TODO this is messy
+                let args: Vec<_> = std::iter::from_fn(|| {
+                    self.maybe(Tok::COpen)
+                        .then(|| {
+                            let a = self.term();
+                            self.expect(Tok::CClose);
+                            (Impl, a)
+                        })
+                        .or_else(|| self.peek().starts_atom().then(|| (Expl, self.atom())))
+                })
+                .collect();
+                let ty = self
+                    .maybe(Tok::Colon)
+                    .then(|| self.fun(true))
+                    .map(|mut ty| {
+                        for (icit, arg) in args.iter().rev() {
+                            let span = Span(arg.span().0, ty.span().1);
+                            let (name, aty) = self.reparse_pi_param(arg.clone());
+                            ty = S(
+                                Box::new(Pre::Pi(
+                                    *icit,
+                                    name.as_deref().copied().unwrap_or(self.db.name("_")),
+                                    0,
+                                    FCap::Imm,
+                                    aty,
+                                    ty,
+                                )),
+                                span,
+                            );
+                        }
+                        ty
+                    });
+                variants.push((name, args.first().cloned(), ty));
+                if ilen == plen {
+                    break;
+                }
+                if self.indent_stack.len() == ilen {
+                    self.expect(Tok::Newline);
+                }
+            }
+            return PreDef::Type {
+                name,
+                args,
+                variants,
+            };
+        }
+
         self.expect(Tok::DefKw);
         let name = self.spanned(Self::name);
         let args: Vec<_> = std::iter::from_fn(|| {
@@ -555,7 +651,7 @@ impl Parser {
                 }
                 value
             });
-        PreDef { name, ty, value }
+        PreDef::Val { name, ty, value }
     }
 
     fn defs(&mut self) -> Vec<S<PreDef>> {
