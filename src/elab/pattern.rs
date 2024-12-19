@@ -46,13 +46,15 @@ pub fn pat_bind_type(
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum PCons {
     Pair(Icit),
-    // Cons(Name),
+    Cons(Def),
     // ... literals ...
 }
 #[derive(Clone, PartialEq)]
 struct PConsTy {
     label: PCons,
     var_tys: Vec<(Sym, Arc<Val>)>,
+    // TODO actually integrate these into the cxt
+    solved_locals: Vec<(Sym, Arc<Val>)>,
 }
 
 fn split_ty(
@@ -65,18 +67,25 @@ fn split_ty(
     match &ty.clone().glued().whnf(cxt) {
         Val::Cap(l, c, t) => split_ty(var, t, rows, names, cxt).map(|v| {
             v.into_iter()
-                .map(|PConsTy { label, var_tys }| PConsTy {
-                    label,
-                    var_tys: var_tys
-                        .into_iter()
-                        .map(|(s, t)| {
-                            (
-                                s,
-                                Arc::new(Arc::unwrap_or_clone(t).as_cap(*c).add_cap_level(*l)),
-                            )
-                        })
-                        .collect(),
-                })
+                .map(
+                    |PConsTy {
+                         label,
+                         var_tys,
+                         solved_locals,
+                     }| PConsTy {
+                        label,
+                        var_tys: var_tys
+                            .into_iter()
+                            .map(|(s, t)| {
+                                (
+                                    s,
+                                    Arc::new(Arc::unwrap_or_clone(t).as_cap(*c).add_cap_level(*l)),
+                                )
+                            })
+                            .collect(),
+                        solved_locals,
+                    },
+                )
                 .collect()
         }),
 
@@ -88,6 +97,7 @@ fn split_ty(
             let bty = ty.clone().app(Val::Neutral(Head::Sym(s1), default()));
             let s2 = cxt.bind_(*n2, bty.clone());
             // now, we know this is reversible, so we can tell the compiler that
+            // we *could* add this to `solved_locals` instead, but since this pattern is irrefutable, this is okay
             if cxt.can_solve(var) {
                 cxt.solve_local(
                     var,
@@ -97,11 +107,92 @@ fn split_ty(
             Some(vec![PConsTy {
                 label: PCons::Pair(*i),
                 var_tys: vec![(s1, aty.clone()), (s2, Arc::new(bty))],
+                solved_locals: default(),
             }])
         }
 
-        // For GADTs, we do the unification here
-        // We'll need to add fields for solved locals etc to the PCons though
+        Val::Neutral(Head::Def(d), _) => match cxt.db.elab.def_value(*d, &cxt.db) {
+            Ok(DefElabResult {
+                def:
+                    DefElab {
+                        body: Some(DefBody::Type(ctors)),
+                        ..
+                    },
+                ..
+            }) => Some(
+                ctors
+                    .into_iter()
+                    .filter_map(|cons| {
+                        let mut cty = cxt
+                            .db
+                            .elab
+                            .def_type(cons, &cxt.db)
+                            .map(Arc::unwrap_or_clone)
+                            .unwrap_or(Val::Error);
+                        let mut var_tys = Vec::new();
+                        let mut metas = Vec::new();
+                        loop {
+                            match &cty {
+                                Val::Fun(Pi(_, _), Impl, s, t, _, _) => {
+                                    let s1 = cxt.bind_(cxt.db.inaccessible(s.0), t.clone());
+                                    var_tys.push((s1, t.clone()));
+                                    let mv = cxt.new_meta(
+                                        (**t).clone(),
+                                        MetaSource::ImpArg(s.0),
+                                        cxt.errors.span.span(),
+                                    );
+                                    let (m, s) = match mv.clone() {
+                                        Val::Neutral(Head::Meta(m), s) => (m, s),
+                                        _ => unreachable!(),
+                                    };
+                                    cty = cty.app(mv);
+                                    metas.push(Some((m, s)));
+                                }
+                                Val::Fun(Pi(_, _), Expl, s, t, _, _) => {
+                                    let s1 = cxt.bind_(cxt.db.inaccessible(s.0), t.clone());
+                                    var_tys.push((s1, t.clone()));
+                                    cty = cty.app(Val::sym(s1));
+                                    metas.push(None);
+                                }
+                                _ => break,
+                            }
+                        }
+                        if !cty
+                            .glued()
+                            .unify(ty.clone().glued(), cxt.errors.span.span(), cxt)
+                        {
+                            eprintln!(
+                                "ruling out cons {} for type {}",
+                                cons.pretty(&cxt.db),
+                                ty.pretty(&cxt.db)
+                            );
+                            None
+                        } else {
+                            let solved_locals = var_tys
+                                .iter()
+                                .zip(metas)
+                                .filter_map(|((s, _), m)| {
+                                    m.and_then(|(m, sp)| {
+                                        Some(sp.into_iter().fold(
+                                            cxt.meta_val(m).map(Arc::unwrap_or_clone)?,
+                                            |v, e| e.elim(v),
+                                        ))
+                                    })
+                                    .map(|v| (*s, Arc::new(v)))
+                                })
+                                .collect();
+                            Some(PConsTy {
+                                label: PCons::Cons(cons),
+                                var_tys,
+                                solved_locals,
+                            })
+                        }
+                    })
+                    .collect(),
+            ),
+            _ => None,
+        },
+
         Val::Neutral(Head::Meta(m), spine) => match rows
             .iter()
             .flat_map(|r| &r.cols)
@@ -231,6 +322,42 @@ impl SPrePat {
                         ],
                     },
                 ),
+                PrePat::Cons(s, arg) => {
+                    let (c, mut cty) = s.infer(cxt, false);
+                    let mut vars = Vec::new();
+                    while let Val::Fun(Pi(_, _), Impl, n, _, _, _) = cty.whnf(cxt) {
+                        if !matches!(arg, Some((Impl, _))) {
+                            vars.push(S(
+                                IPat::Var(false, cxt.db.inaccessible(n.0), None),
+                                s.span(),
+                            ));
+                            // This argument shouldn't matter, this type doesn't leave here
+                            cty = cty.as_big().app(Val::Unknown).glued();
+                        } else {
+                            break;
+                        }
+                    }
+                    if let Some((_, arg)) = arg {
+                        vars.push(arg.ipat(cxt))
+                    }
+                    match c.eval(cxt.env()).glued().whnf(cxt) {
+                        Val::Neutral(Head::Def(d), v) if v.is_empty() => IPat::CPat(
+                            None,
+                            CPat {
+                                span: self.span(),
+                                label: PCons::Cons(*d),
+                                vars,
+                            },
+                        ),
+                        v => {
+                            cxt.err(
+                                "expected data constructor in pattern, found " + v.pretty(&cxt.db),
+                                s.span(),
+                            );
+                            IPat::Var(false, cxt.db.name("_"), None)
+                        }
+                    }
+                }
                 PrePat::Error => IPat::Var(false, cxt.db.name("_"), None),
             },
             self.span(),

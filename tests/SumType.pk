@@ -4,6 +4,12 @@ type Option a of
 
 type Pair a b of New (a, b)
 
-#def fst : Pair a b -> a = Pair.New (x, _) => x
+def fst : Pair a b -> a = Pair.New (x, _) => x
+def snd : Pair a b -> b = Pair.New (_, x) => x
 def t : Option (Type -> Type) = Option.None
 def p = Pair.New (Type, t)
+# def nonexhaustive_e : Option a -> a = Option.Some x => x
+
+# def or_default (self : Option a, default : a) : a = self case
+#   Option.None => default
+#   Option.Some x => x

@@ -11,11 +11,17 @@ use crate::parser::{Pre, PreDef, PrePat, PreStmt, SPre, SPrePat};
 
 // -- entry point (per-file elab query) --
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum DefBody {
+    Val(Arc<Term>),
+    Type(Vec<Def>),
+}
+
 #[derive(Clone, Debug)]
 pub struct DefElab {
     pub name: SName,
     pub ty: Arc<Val>,
-    pub body: Option<Arc<Term>>,
+    pub body: Option<DefBody>,
     pub can_eval: bool,
     pub children: Vec<(Def, DefElab)>,
 }
@@ -202,7 +208,7 @@ pub fn elab_def(def: Def, db: &DB) -> Option<DefElabResult> {
             DefElab {
                 name: *name,
                 ty: Arc::new(ty),
-                body: body.map(|x| Arc::new(x)),
+                body: body.map(|x| DefBody::Val(Arc::new(x))),
                 can_eval: cxt.can_eval.take().is_none(),
                 children: Vec::new(),
             }
@@ -296,7 +302,7 @@ pub fn elab_def(def: Def, db: &DB) -> Option<DefElabResult> {
             DefElab {
                 name: *name,
                 ty: Arc::new(ty),
-                body: None,
+                body: Some(DefBody::Type(children.iter().map(|(x, _)| *x).collect())),
                 can_eval: false,
                 children,
             }
@@ -1525,12 +1531,12 @@ impl SPre {
                 )
             }
             // temporary desugaring (eventually we do need the larger structure for method syntax)
-            Pre::Dot(lhs, dot, Some(rhs)) => {
+            Pre::Dot(lhs, dot, Some((icit, rhs))) => {
                 return S(
                     Box::new(Pre::App(
                         S(Box::new(Pre::Dot(lhs.clone(), *dot, None)), self.span()),
                         rhs.clone(),
-                        Expl,
+                        *icit,
                     )),
                     self.span(),
                 )

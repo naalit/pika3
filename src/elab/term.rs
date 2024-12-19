@@ -512,7 +512,12 @@ impl Val {
                         if let Ok(elab) = cxt.db.elab.def_value(*d, &cxt.db) {
                             elab.def
                                 .can_eval
-                                .then(|| elab.def.body.map(|x| Arc::new(x.eval(cxt.env()))))
+                                .then(|| {
+                                    elab.def.body.and_then(|x| match x {
+                                        DefBody::Val(x) => Some(Arc::new(x.eval(cxt.env()))),
+                                        DefBody::Type(_) => None,
+                                    })
+                                })
                                 .flatten()
                         } else {
                             None
@@ -652,6 +657,10 @@ impl Pretty for Term {
                                     + v[1].0.pretty(db)
                                     + " => "
                                     + t.pretty(db)
+                            }
+                            PCons::Cons(d) => {
+                                d.pretty(db)
+                                    + v.first().map_or(Doc::none(), |x| " " + x.0.pretty(db))
                             }
                         })
                         .chain(fallback.iter().map(|x| "_ => " + x.pretty(db))),

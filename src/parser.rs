@@ -33,6 +33,7 @@ pub enum PrePat {
     Name(bool, SName),
     Binder(SPrePat, SPre),
     Pair(Icit, SPrePat, SPrePat),
+    Cons(SPre, Option<(Icit, SPrePat)>),
     Error,
 }
 #[derive(Debug, Clone)]
@@ -53,7 +54,7 @@ pub enum Pre {
     Cap(u32, Cap, SPre),
     Assign(SPre, SPre),
     // x.f y
-    Dot(SPre, SName, Option<SPre>),
+    Dot(SPre, SName, Option<(Icit, SPre)>),
     Error,
 }
 pub type SPre = S<Box<Pre>>;
@@ -298,6 +299,19 @@ impl Parser {
                 };
                 PrePat::Pair(*i, a, b)
             }
+            Pre::App(f, x, icit) => {
+                let x = S(Box::new(self.reparse_pattern(x, message)), x.span());
+                PrePat::Cons(f.clone(), Some((*icit, x)))
+            }
+            Pre::Dot(x, m, arg) => {
+                let x = S(Box::new(Pre::Dot(x.clone(), *m, None)), x.span());
+                if let Some((icit, arg)) = arg {
+                    let arg = S(Box::new(self.reparse_pattern(arg, message)), arg.span());
+                    PrePat::Cons(x, Some((*icit, arg)))
+                } else {
+                    PrePat::Cons(x, None)
+                }
+            }
             _ => {
                 self.error(message, param.span());
                 PrePat::Error
@@ -429,7 +443,7 @@ impl Parser {
                 }
                 Some(n) => {
                     a = S(
-                        Box::new(Pre::Dot(a, n, Some(arg))),
+                        Box::new(Pre::Dot(a, n, Some((icit, arg)))),
                         Span(start, self.pos_right()),
                     )
                 }
