@@ -53,7 +53,6 @@ pub enum PCons {
 struct PConsTy {
     label: PCons,
     var_tys: Vec<(Sym, Arc<Val>)>,
-    // TODO actually integrate these into the cxt
     solved_locals: Vec<(Sym, Arc<Val>)>,
 }
 
@@ -497,6 +496,7 @@ impl PTree {
 }
 
 struct PBody {
+    span: Span,
     reached: bool,
     solved_locals: Vec<(Sym, Arc<Val>)>,
     vars: Vec<(bool, Name, Sym, Arc<Val>)>,
@@ -520,7 +520,7 @@ fn compile_rows(rows: &[PRow], pcxt: &mut PCxt, cxt: &Cxt) -> PTree {
         if pcxt.bodies[row.body as usize].reached {
             // check for matching bindings
             if pcxt.bodies[row.body as usize].vars.len() != row.assignments.len()
-                || pcxt.bodies[row.body as usize]
+                || !pcxt.bodies[row.body as usize]
                     .vars
                     .iter()
                     .zip(&row.assignments)
@@ -534,10 +534,31 @@ fn compile_rows(rows: &[PRow], pcxt: &mut PCxt, cxt: &Cxt) -> PTree {
                                 .unify((**t2).clone().glued(), pcxt.span, cxt)
                     })
             {
-                panic!("mismatched bindings for body {}", row.body)
+                cxt.err(
+                    "mismatched bindings for match branch: ["
+                        + Doc::intersperse(
+                            pcxt.bodies[row.body as usize]
+                                .vars
+                                .iter()
+                                .map(|(_, n, _, t)| {
+                                    n.pretty(&cxt.db) + ": " + t.zonk(cxt, true).pretty(&cxt.db)
+                                }),
+                            Doc::start(", "),
+                        )
+                        + "] vs ["
+                        + Doc::intersperse(
+                            row.assignments.iter().map(|(_, n, _, t, _)| {
+                                n.pretty(&cxt.db) + ": " + t.zonk(cxt, true).pretty(&cxt.db)
+                            }),
+                            Doc::start(", "),
+                        )
+                        + "]",
+                    pcxt.bodies[row.body as usize].span,
+                );
             }
         } else {
             pcxt.bodies[row.body as usize] = PBody {
+                span: pcxt.bodies[row.body as usize].span,
                 reached: true,
                 solved_locals: cxt.solved_locals(),
                 vars: row
@@ -649,6 +670,10 @@ fn compile_rows(rows: &[PRow], pcxt: &mut PCxt, cxt: &Cxt) -> PTree {
                             vrows.push(row);
                         }
                     }
+                    let mut cxt = cxt.clone();
+                    for (s, val) in ctor.solved_locals {
+                        cxt.solve_local(s, val);
+                    }
                     let t = compile_rows(&vrows, pcxt, &cxt);
                     v.push((ctor.label, ctor.var_tys, t));
                 }
@@ -681,6 +706,10 @@ pub(super) struct PMatch {
     pub ty: Arc<Val>,
 }
 impl PMatch {
+    pub fn reached(&self, body: u32) -> bool {
+        self.pcxt.bodies[body as usize].reached
+    }
+
     pub fn bind(&self, body: u32, deps: &VDeps, cxt: &Cxt) -> Cxt {
         let mut cxt = cxt.clone();
         for (m, name, sym, ty) in &self.pcxt.bodies[body as usize].vars {
@@ -738,7 +767,12 @@ impl PMatch {
         term
     }
 
-    pub fn new(ty: Option<GVal>, branches: &[SPrePat], ocxt: &mut Cxt) -> (Sym, PMatch) {
+    pub fn new(
+        ty: Option<GVal>,
+        branches: &[SPrePat],
+        span: Option<Span>,
+        ocxt: &mut Cxt,
+    ) -> (Sym, PMatch) {
         let (m, name, ty) = branches
             .first()
             .map(|p| match p.ipat(ocxt).0 {
@@ -782,14 +816,15 @@ impl PMatch {
         let mut pcxt = PCxt {
             bodies: branches
                 .iter()
-                .map(|_| PBody {
+                .map(|x| PBody {
+                    span: x.span(),
                     reached: false,
                     solved_locals: default(),
                     vars: default(),
                 })
                 .collect(),
             var,
-            span: branches[0].span(),
+            span: span.unwrap_or(branches[0].span()),
             has_error: false,
         };
 

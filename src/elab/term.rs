@@ -646,25 +646,23 @@ impl Pretty for Term {
                     db,
                 ))
             .prec(Prec::App),
-            Term::App(x, TElim::Match(v, fallback)) => (x.pretty(db).space()
-                + Doc::keyword("match").space()
+            Term::App(x, TElim::Match(v, fallback)) if v.len() <= 1 => (x.pretty(db).space()
+                + Doc::keyword("case").space()
                 + Doc::intersperse(
                     v.iter()
-                        .map(|(l, v, t)| match l {
-                            PCons::Pair(i) => {
-                                pretty_binder(db.name("_"), *i, Prec::Term, v[0].0.pretty(db), db)
-                                    + ", "
-                                    + v[1].0.pretty(db)
-                                    + " => "
-                                    + t.pretty(db)
-                            }
-                            PCons::Cons(d) => {
-                                d.pretty(db)
-                                    + v.first().map_or(Doc::none(), |x| " " + x.0.pretty(db))
-                            }
-                        })
+                        .map(|(l, v, t)| pretty_branch(db, l, v, t))
                         .chain(fallback.iter().map(|x| "_ => " + x.pretty(db))),
                     Doc::start(";").brk(),
+                ))
+            .indent()
+            .prec(Prec::Term),
+            Term::App(x, TElim::Match(v, fallback)) => (x.pretty(db).space()
+                + Doc::keyword("case").hardline()
+                + Doc::intersperse(
+                    v.iter()
+                        .map(|(l, v, t)| pretty_branch(db, l, v, t))
+                        .chain(fallback.iter().map(|x| "_ => " + x.pretty(db))),
+                    Doc::none().hardline(),
                 ))
             .indent()
             .prec(Prec::Term),
@@ -720,6 +718,24 @@ impl Pretty for Term {
             Term::Unknown => Doc::keyword("??"),
             Term::Error => Doc::keyword("error"),
             Term::Type => Doc::start("Type"),
+        }
+    }
+}
+
+fn pretty_branch(db: &DB, l: &PCons, v: &Vec<Sym>, t: &Arc<Term>) -> Doc {
+    match l {
+        PCons::Pair(i) => {
+            pretty_binder(db.name("_"), *i, Prec::Term, v[0].0.pretty(db), db)
+                + ", "
+                + v[1].0.pretty(db)
+                + " => "
+                + t.pretty(db)
+        }
+        PCons::Cons(d) => {
+            db.idefs.get(*d).name().pretty(db)
+                + Doc::intersperse(v.iter().map(|x| " " + x.0.pretty(db)), Doc::none())
+                + " => "
+                + t.pretty(db)
         }
     }
 }

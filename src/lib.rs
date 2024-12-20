@@ -125,7 +125,10 @@ pub fn elab_files(filenames: &[PathBuf]) -> Result<ElabResult, (Option<PathBuf>,
 fn pretty_def(e: &DefElab, db: &DB) -> Doc {
     let mut doc = Doc::keyword("val ") + e.name.pretty(&db) + " : " + e.ty.pretty(&db);
     // + " = "
-    // + e.body.as_ref().map_or("".into(), |x| x.pretty(&db));
+    // + e.body.as_ref().map_or("".into(), |x| match x {
+    //     elab::DefBody::Val(x) => x.pretty(&db),
+    //     elab::DefBody::Type(_) => Doc::start("<datatype>"),
+    // });
 
     for (_, i) in &e.children {
         doc = doc.hardline() + pretty_def(i, db);

@@ -55,6 +55,7 @@ pub enum Pre {
     Assign(SPre, SPre),
     // x.f y
     Dot(SPre, SName, Option<(Icit, SPre)>),
+    Case(SPre, Vec<(SPrePat, SPre)>),
     Error,
 }
 pub type SPre = S<Box<Pre>>;
@@ -240,6 +241,40 @@ impl Parser {
         S(r, Span(start, self.pos_right()))
     }
 
+    /// Captures an indent after the current token
+    fn push_indent(&mut self, tok: Option<Tok>) -> Option<usize> {
+        let plen = self.indent_stack.len();
+        if let Some(tok) = tok {
+            self.expect(tok);
+        } else {
+            self.next();
+        }
+        let ilen = self.indent_stack.len();
+        (ilen > plen).then(|| {
+            *self.indent_stack.last_mut().unwrap() = false;
+            plen
+        })
+    }
+    /// Returns `true` if the given indent hasn't ended.
+    /// Also returns `true` if there was no indent (`p` is `None`)
+    fn has_indent(&mut self, p: Option<usize>) -> bool {
+        if let Some(plen) = p {
+            self.indent_stack.len() > plen
+        } else {
+            true
+        }
+    }
+    fn pop_indent(&mut self, p: Option<usize>) {
+        if let Some(plen) = p {
+            if self.indent_stack.len() > plen {
+                self.error("expected dedent", self.tok_span());
+                while self.indent_stack.len() > plen {
+                    self.next();
+                }
+            }
+        }
+    }
+
     // reparsing
 
     fn reparse_pi_param(&mut self, param: SPre) -> (Option<SName>, SPre) {
@@ -417,8 +452,35 @@ impl Parser {
         let mut a = self.atom();
         // make sure we don't get in an infinite loop - stop looking for atoms if we don't consume any input
         let mut last = start;
-        while (self.peek().starts_atom() || self.peek() == Tok::Dot) && last != self.pos() {
+        while (self.peek().starts_atom() || self.peek() == Tok::Dot || self.peek() == Tok::CaseKw)
+            && last != self.pos()
+        {
             last = self.pos();
+            if self.peek() == Tok::CaseKw {
+                let p = self.push_indent(Some(Tok::CaseKw));
+                let mut v = Vec::new();
+                while self.has_indent(p) {
+                    let pat = self.app();
+                    let pat = S(
+                        Box::new(self.reparse_pattern(
+                            &pat,
+                            &Doc::start("expected pattern in `case` branch"),
+                        )),
+                        pat.span(),
+                    );
+                    self.expect(Tok::WideArrow);
+                    let body = self.term();
+                    if p.is_none() {
+                        break;
+                    }
+                    v.push((pat, body));
+                    if self.has_indent(p) {
+                        self.expect(Tok::Newline);
+                    }
+                }
+                a = S(Box::new(Pre::Case(a, v)), Span(start, self.pos_right()));
+                continue;
+            }
             let dot = self.maybe(Tok::Dot).then(|| self.spanned(|s| s.name()));
             let (icit, arg) = if self.maybe(Tok::COpen) {
                 let term = self.term();
@@ -558,31 +620,23 @@ impl Parser {
                     })
             })
             .collect();
-            let plen = self.indent_stack.len();
-            self.expect(Tok::OfKw);
-            if self.indent_stack.len() > plen {
-                *self.indent_stack.last_mut().unwrap() = false;
-            }
-            let ilen = self.indent_stack.len();
+            let plen = self.push_indent(Some(Tok::OfKw));
             let mut variants = Vec::new();
-            while self.indent_stack.len() == ilen {
+            while self.has_indent(plen) {
                 let name = self.spanned(Self::name);
-                // TODO this is messy
-                let args: Vec<_> = std::iter::from_fn(|| {
-                    self.maybe(Tok::COpen)
-                        .then(|| {
-                            let a = self.term();
-                            self.expect(Tok::CClose);
-                            (Impl, a)
-                        })
-                        .or_else(|| self.peek().starts_atom().then(|| (Expl, self.atom())))
-                })
-                .collect();
+                let arg = self
+                    .maybe(Tok::COpen)
+                    .then(|| {
+                        let a = self.term();
+                        self.expect(Tok::CClose);
+                        (Impl, a)
+                    })
+                    .or_else(|| self.peek().starts_atom().then(|| (Expl, self.atom())));
                 let ty = self
                     .maybe(Tok::Colon)
                     .then(|| self.fun(true))
                     .map(|mut ty| {
-                        for (icit, arg) in args.iter().rev() {
+                        if let Some((icit, arg)) = &arg {
                             let span = Span(arg.span().0, ty.span().1);
                             let (name, aty) = self.reparse_pi_param(arg.clone());
                             ty = S(
@@ -599,11 +653,11 @@ impl Parser {
                         }
                         ty
                     });
-                variants.push((name, args.first().cloned(), ty));
-                if ilen == plen {
+                variants.push((name, arg, ty));
+                if plen.is_none() {
                     break;
                 }
-                if self.indent_stack.len() == ilen {
+                if self.has_indent(plen) {
                     self.expect(Tok::Newline);
                 }
             }
@@ -624,14 +678,30 @@ impl Parser {
                     (Impl, a)
                 })
                 .or_else(|| self.peek().starts_atom().then(|| (Expl, self.atom())))
+                .map(|(i, p)| {
+                    (
+                        i,
+                        S(
+                            Box::new(self.reparse_pattern(
+                                &p,
+                                &Doc::start("expected pattern in function argument"),
+                            )),
+                            p.span(),
+                        ),
+                    )
+                })
         })
         .collect();
         let ty = self
             .maybe(Tok::Colon)
             .then(|| self.fun(true))
+            .or_else(|| {
+                (!args.is_empty()).then(|| S(Box::new(Pre::Var(self.db.name("_"))), name.span()))
+            })
             .map(|mut ty| {
                 for (icit, arg) in args.iter().rev() {
                     let span = Span(arg.span().0, ty.span().1);
+                    let arg = arg.extract_ty(&self.db);
                     let (name, aty) = self.reparse_pi_param(arg.clone());
                     ty = S(
                         Box::new(Pre::Pi(
@@ -654,13 +724,6 @@ impl Parser {
             .map(|mut value| {
                 for (icit, arg) in args.into_iter().rev() {
                     let span = Span(arg.span().0, value.span().1);
-                    let arg = S(
-                        Box::new(self.reparse_pattern(
-                            &arg,
-                            &Doc::start("expected pattern in function argument"),
-                        )),
-                        arg.span(),
-                    );
                     value = S(Box::new(Pre::Lam(icit, arg, value)), span);
                 }
                 value
@@ -691,6 +754,57 @@ impl Parser {
             last = self.pos();
         }
         v
+    }
+}
+
+impl SPrePat {
+    pub fn extract_ty(&self, db: &DB) -> SPre {
+        S(
+            Box::new(match &***self {
+                PrePat::Name(_, s) => Pre::Binder(
+                    S(Box::new(Pre::Var(**s)), s.span()),
+                    S(Box::new(Pre::Var(db.name("_"))), s.span()),
+                ),
+                PrePat::Binder(s, s1) => {
+                    let s = s.extract_ty(db);
+                    match &**s {
+                        // Hopefully we're not ignoring anything important!
+                        Pre::Binder(x, _) => Pre::Binder(x.clone(), s1.clone()),
+                        _ => Pre::Binder(s, s1.clone()),
+                    }
+                }
+                PrePat::Pair(icit, a, b) => {
+                    let mut a = a.extract_ty(db);
+                    let n1 = match &**a {
+                        Pre::Binder(x, y) => match &***x {
+                            Pre::Var(n) => {
+                                let n = S(*n, x.span());
+                                a = y.clone();
+                                Some(n)
+                            }
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    let mut b = b.extract_ty(db);
+                    let n2 = match &**b {
+                        Pre::Binder(x, y) => match &***x {
+                            Pre::Var(n) => {
+                                let n = S(*n, x.span());
+                                b = y.clone();
+                                Some(n)
+                            }
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    Pre::Sigma(*icit, n1, a, n2, b)
+                }
+                PrePat::Cons(s, _) => todo!(),
+                PrePat::Error => Pre::Error,
+            }),
+            self.span(),
+        )
     }
 }
 

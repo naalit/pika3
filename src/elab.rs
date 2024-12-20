@@ -221,7 +221,7 @@ pub fn elab_def(def: Def, db: &DB) -> Option<DefElabResult> {
             let before_cxt = cxt.clone();
             let m: Vec<_> = args
                 .iter()
-                .map(|(icit, arg)| (*icit, PMatch::new(None, &[arg.clone()], &mut cxt)))
+                .map(|(icit, arg)| (*icit, PMatch::new(None, &[arg.clone()], None, &mut cxt)))
                 .collect();
             let ty = m
                 .iter()
@@ -755,15 +755,15 @@ impl Cxt {
                             .map(|(s, v)| (*s, v.clone()))
                     })
                     .or_else(|| {
+                        if self.uquant_stack.with(|v| v.is_empty()) {
+                            return None;
+                        }
+                        let ty =
+                            Arc::new(self.new_meta(Val::Type, MetaSource::TypeOf(n.0), n.span()));
                         self.uquant_stack.with_mut(|v| {
                             v.last_mut().map(|v| {
                                 assert!(!v.iter().any(|(s, _)| s.0 == n.0));
                                 let s = self.scxt().bind(n.0);
-                                let ty = Arc::new(self.new_meta(
-                                    Val::Type,
-                                    MetaSource::TypeOf(n.0),
-                                    n.span(),
-                                ));
                                 v.push((s, ty.clone()));
                                 (s, ty)
                             })
@@ -887,7 +887,15 @@ impl Cxt {
             Head::Meta(m),
             self.vars
                 .keys()
-                .map(|s| VElim::App(Expl, Arc::new(Val::sym(*s))))
+                .copied()
+                .chain(self.uquant_stack.with(|v| {
+                    v.iter()
+                        .flatten()
+                        .map(|(s, _)| s)
+                        .copied()
+                        .collect::<Vec<_>>()
+                }))
+                .map(|s| VElim::App(Expl, Arc::new(Val::sym(s))))
                 .collect(),
         );
         v
@@ -1196,14 +1204,14 @@ fn elab_block(block: &[PreStmt], last_: &SPre, ty: Option<GVal>, cxt1: &Cxt) -> 
             }
             PreStmt::Let(pat, body) if matches!(&***pat, PrePat::Binder(_, _)) => {
                 let cxt_start = cxt.clone();
-                let (sym, pat) = PMatch::new(None, &[pat.clone()], &mut cxt);
+                let (sym, pat) = PMatch::new(None, &[pat.clone()], None, &mut cxt);
                 let aty = (*pat.ty).clone();
                 let (deps, body) = cxt.record_deps(|| body.check(aty.clone(), &cxt_start));
                 (sym, deps, aty, Some(pat), body)
             }
             PreStmt::Let(pat, body) => {
                 let (deps, (body, aty)) = cxt.record_deps(|| body.infer(&cxt, true));
-                let (sym, pat) = PMatch::new(Some(aty.clone()), &[pat.clone()], &mut cxt);
+                let (sym, pat) = PMatch::new(Some(aty.clone()), &[pat.clone()], None, &mut cxt);
                 (sym, deps, aty.as_small(), Some(pat), body)
             }
         };
@@ -1449,7 +1457,7 @@ impl SPre {
                 }
                 let mut cxt2 = cxt.clone();
                 let before_syms: FxHashSet<_> = cxt.vars.keys().copied().collect();
-                let (s, pat) = PMatch::new(None, &[pat.clone()], &mut cxt2);
+                let (s, pat) = PMatch::new(None, &[pat.clone()], None, &mut cxt2);
                 let aty = pat.ty.clone();
                 let aty2 = aty.quote(cxt.qenv());
 
@@ -1586,6 +1594,31 @@ impl SPre {
                     }
                 }
             }
+            Pre::Case(x, branches) => {
+                let span = x.span();
+                let (xdeps, (x, xty)) = cxt.record_deps(|| x.infer(cxt, true));
+                let pats: Vec<_> = branches.iter().map(|(a, _)| a.clone()).collect();
+                let mut cxt = cxt.clone();
+                let (s, p) = PMatch::new(Some(xty), &pats, Some(span), &mut cxt);
+                let xdeps = xdeps.to_var();
+                let rty = cxt.new_meta(Val::Type, MetaSource::Hole, self.span());
+                let mut bodies = Vec::new();
+                for (i, (_, v)) in branches.iter().enumerate() {
+                    if !p.reached(i as u32) {
+                        // Really, this should probably be a warning, but that would require checking the body anyway for other type errors
+                        // Which is not super easy to do with the current pattern matching system, so we're leaving this for now
+                        cxt.err("unreachable match branch", v.span());
+                        bodies.push(Term::Error);
+                    } else {
+                        let cxt = p.bind(i as u32, &xdeps, &cxt);
+                        let v = v.check(rty.clone(), &cxt);
+                        bodies.push(v);
+                    }
+                }
+                let t = p.compile(&bodies, &cxt);
+                let t = Term::Fun(Lam, Expl, s, Box::new(p.ty.quote(cxt.qenv())), Arc::new(t));
+                (Term::App(Box::new(t), TElim::App(Expl, Box::new(x))), rty)
+            }
             Pre::Assign(a, b) => {
                 let (a, aty) = a.infer_(cxt, true, Cap::Mut);
                 let ity = match aty.big() {
@@ -1625,8 +1658,12 @@ impl SPre {
                 let mut cxt = cxt.clone();
                 cxt.level += l;
                 let before_syms: FxHashSet<_> = cxt.vars.keys().copied().collect();
-                let (sym, pat) =
-                    PMatch::new(Some((**aty2).clone().glued()), &[pat.clone()], &mut cxt);
+                let (sym, pat) = PMatch::new(
+                    Some((**aty2).clone().glued()),
+                    &[pat.clone()],
+                    None,
+                    &mut cxt,
+                );
                 let aty = aty2.quote(cxt.qenv());
 
                 let va = Val::Neutral(Head::Sym(sym), default());
@@ -1709,7 +1746,8 @@ impl SPre {
                 let l = *l;
                 let aty2 = aty.quote(cxt.qenv());
                 // don't let them access the name in the term (shadowing existing names would be unintuitive)
-                let n = cxt.db.inaccessible(n.0);
+                // TODO that should be true but we're having problems with uquant in fun-definition syntax
+                let n = n.0; //cxt.db.inaccessible(n.0);
                 let mut cxt = cxt.clone();
                 cxt.level += l;
                 let (sym, cxt) = cxt.bind(n, aty.clone());

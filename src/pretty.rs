@@ -126,9 +126,11 @@ impl Doc {
 
         for i in self.data {
             match i {
-                // TODO potentially switch to newline if necessary
-                DocEntry::Break => buf.push(' '),
-                DocEntry::Newline => {
+                // switch to newline if necessary to maintain 80 character line length
+                DocEntry::Break if buf.lines().last().map_or(true, |x| x.len() < 80) => {
+                    buf.push(' ')
+                }
+                DocEntry::Break | DocEntry::Newline => {
                     buf.push('\n');
                     for _ in 0..indent {
                         buf.push(' ');
