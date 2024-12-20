@@ -717,7 +717,7 @@ impl Pretty for Term {
 fn pretty_branch(db: &DB, l: &PCons, v: &Vec<Sym>, t: &Arc<Term>) -> Doc {
     match l {
         PCons::Pair(i) => {
-            pretty_binder(db.name("_"), *i, Prec::Term, v[0].0.pretty(db), db)
+            pretty_binder(db.name("_"), *i, Prec::Pi, v[0].0.pretty(db), db)
                 + ", "
                 + v[1].0.pretty(db)
                 + " => "
@@ -725,7 +725,10 @@ fn pretty_branch(db: &DB, l: &PCons, v: &Vec<Sym>, t: &Arc<Term>) -> Doc {
         }
         PCons::Cons(d) => {
             db.idefs.get(*d).name().pretty(db)
-                + Doc::intersperse(v.iter().map(|x| " " + x.0.pretty(db)), Doc::none())
+                + Doc::intersperse(
+                    v.iter().map(|x| " " + x.0.pretty(db).nest(Prec::Atom)),
+                    Doc::none(),
+                )
                 + " => "
                 + t.pretty(db)
         }

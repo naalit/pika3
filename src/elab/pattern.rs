@@ -507,12 +507,47 @@ struct PCxt {
     var: Sym,
     has_error: bool,
 }
-fn compile_rows(rows: &[PRow], pcxt: &mut PCxt, cxt: &Cxt) -> PTree {
+#[derive(Clone)]
+enum PState {
+    Any(Sym),
+    Cons(PCons, Vec<PState>),
+}
+impl PState {
+    fn with(&self, var: Sym, new: &PState) -> PState {
+        match self {
+            PState::Any(sym) if *sym == var => new.clone(),
+            PState::Any(sym) => PState::Any(*sym),
+            PState::Cons(pcons, vec) => {
+                PState::Cons(*pcons, vec.iter().map(|x| x.with(var, new)).collect())
+            }
+        }
+    }
+}
+impl Pretty for PState {
+    fn pretty(&self, db: &DB) -> Doc {
+        match self {
+            PState::Any(_) => Doc::start("_"),
+            PState::Cons(pcons, v) => match pcons {
+                PCons::Pair(_) => (v[0].pretty(db) + ", " + v[1].pretty(db)).prec(Prec::Pair),
+                PCons::Cons(d) => (db.idefs.get(*d).name().pretty(db)
+                    + Doc::intersperse(
+                        v.iter().map(|x| " " + x.pretty(db).nest(Prec::Atom)),
+                        Doc::none(),
+                    ))
+                .prec(Prec::App),
+            },
+        }
+    }
+}
+fn compile_rows(rows: &[PRow], pcxt: &mut PCxt, state: &PState, cxt: &Cxt) -> PTree {
     if rows.is_empty() {
         if !pcxt.has_error {
             pcxt.has_error = true;
             // TODO reconstruct missing cases
-            cxt.err("non-exhaustive pattern match", pcxt.span);
+            cxt.err(
+                "non-exhaustive pattern match, not covered: " + state.pretty(&cxt.db),
+                pcxt.span,
+            );
         }
         PTree::Error
     } else if rows.first().unwrap().cols.is_empty() {
@@ -642,7 +677,18 @@ fn compile_rows(rows: &[PRow], pcxt: &mut PCxt, cxt: &Cxt) -> PTree {
                             }
                         });
                     }
-                    let t = compile_rows(&rows, pcxt, &cxt);
+                    let state = state.with(
+                        *var,
+                        &PState::Cons(
+                            ctors[0].label,
+                            ctors[0]
+                                .var_tys
+                                .iter()
+                                .map(|(s, _)| PState::Any(*s))
+                                .collect(),
+                        ),
+                    );
+                    let t = compile_rows(&rows, pcxt, &state, &cxt);
                     return PTree::Match(
                         tvar,
                         vec![(ctors[0].label, ctors[0].var_tys.clone(), t)],
@@ -674,7 +720,14 @@ fn compile_rows(rows: &[PRow], pcxt: &mut PCxt, cxt: &Cxt) -> PTree {
                     for (s, val) in ctor.solved_locals {
                         cxt.solve_local(s, val);
                     }
-                    let t = compile_rows(&vrows, pcxt, &cxt);
+                    let state = state.with(
+                        *var,
+                        &PState::Cons(
+                            ctor.label,
+                            ctor.var_tys.iter().map(|(s, _)| PState::Any(*s)).collect(),
+                        ),
+                    );
+                    let t = compile_rows(&vrows, pcxt, &state, &cxt);
                     v.push((ctor.label, ctor.var_tys, t));
                 }
                 return PTree::Match(tvar, v, None);
@@ -695,7 +748,7 @@ fn compile_rows(rows: &[PRow], pcxt: &mut PCxt, cxt: &Cxt) -> PTree {
                 vrows.push(row);
             }
         }
-        compile_rows(&vrows, pcxt, &cxt)
+        compile_rows(&vrows, pcxt, &state, &cxt)
     }
 }
 
@@ -848,7 +901,7 @@ impl PMatch {
             })
             .collect();
 
-        let tree = compile_rows(&rows, &mut pcxt, &cxt);
+        let tree = compile_rows(&rows, &mut pcxt, &PState::Any(var), &cxt);
 
         (
             var,
