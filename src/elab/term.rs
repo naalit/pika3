@@ -345,13 +345,13 @@ impl Val {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TElim {
     // (branches, fallback)
-    Match(Vec<(PCons, Vec<Sym>, Arc<Term>)>, Option<Arc<Term>>),
+    Match(Vec<(PCons, Vec<(Icit, Sym)>, Arc<Term>)>, Option<Arc<Term>>),
     App(Icit, Box<Term>),
 }
 #[derive(Debug, Clone, PartialEq)]
 pub enum VElim {
     Match(
-        Vec<(PCons, Vec<Sym>, Arc<Term>)>,
+        Vec<(PCons, Vec<(Icit, Sym)>, Arc<Term>)>,
         Option<Arc<Term>>,
         Arc<Env>,
     ),
@@ -373,8 +373,9 @@ impl VElim {
                     Some((PCons::Pair(_), v, _)) => (v[0], v[1]),
                     _ => unreachable!(),
                 };
-                v[0].2
-                    .eval(&Arc::make_mut(&mut env).tap_mut(|v| v.0.extend([(s1, va), (s2, vb)])))
+                v[0].2.eval(
+                    &Arc::make_mut(&mut env).tap_mut(|v| v.0.extend([(s1.1, va), (s2.1, vb)])),
+                )
             }
 
             (x, Val::Neutral(s, vec)) => Val::Neutral(s, vec.tap_mut(|v| v.push(x))),
@@ -400,10 +401,10 @@ impl VElim {
                         let mut env = env.senv(&inner_env);
                         let vars = vars
                             .iter()
-                            .map(|s| {
+                            .map(|(i, s)| {
                                 let (s, e) = env.bind(*s);
                                 env = e;
-                                s
+                                (*i, s)
                             })
                             .collect();
                         Ok((*l, vars, Arc::new(t.subst(&env)?)))
@@ -425,8 +426,8 @@ impl TElim {
                 v.iter()
                     .map(|(l, vars, t)| {
                         let mut env = env.clone();
-                        for i in vars {
-                            let (_, e) = env.bind(*i);
+                        for (_, s) in vars {
+                            let (_, e) = env.bind(*s);
                             env = e;
                         }
                         Ok((*l, vars.clone(), Arc::new(t.subst(&env)?)))
@@ -553,13 +554,13 @@ impl Val {
                             let (l, v, t) = &v2[0];
                             // Avoid infinite recursion - abort if we're already just returning one of the matched variables
                             if let Term::Head(Head::Sym(s)) = &**t {
-                                if v.contains(s) {
+                                if v.iter().any(|(_, n)| n == s) {
                                     return None;
                                 }
                             }
                             let mut env = (*env).clone();
                             let x = Val::Neutral(*h, spine);
-                            for s in v {
+                            for (_, s) in v {
                                 env.0.insert(
                                     *s,
                                     Arc::new(
@@ -621,9 +622,28 @@ fn pretty_binder(name: Name, icit: Icit, prec: Prec, rest: Doc, db: &DB) -> Doc 
         let prec = Prec::Pi.min(rest.prec);
         (name.pretty(db) + ": " + rest.nest(Prec::Pi)).prec(prec)
     };
-    match icit {
-        Impl => "{" + body + "}",
-        Expl => body.nest(prec),
+    body.nest_icit(icit, prec)
+}
+
+fn pretty_branch(db: &DB, l: &PCons, v: &Vec<(Icit, Sym)>, t: &Arc<Term>) -> Doc {
+    match l {
+        PCons::Pair(i) => {
+            v[0].1 .0.pretty(db).nest_icit(*i, Prec::Pi)
+                + ", "
+                + v[1].1 .0.pretty(db)
+                + " => "
+                + t.pretty(db)
+        }
+        PCons::Cons(d) => {
+            db.idefs.get(*d).name().pretty(db)
+                + Doc::intersperse(
+                    v.iter()
+                        .map(|(i, x)| " " + x.0.pretty(db).nest_icit(*i, Prec::Atom)),
+                    Doc::none(),
+                )
+                + " => "
+                + t.pretty(db)
+        }
     }
 }
 
@@ -635,17 +655,10 @@ impl Pretty for Term {
             Term::Head(Head::Def(d)) => db.idefs.get(*d).name().pretty(db),
             Term::Head(Head::Meta(m)) => m.pretty(db),
             Term::Head(Head::Builtin(b)) => Doc::start(b),
-            // TODO we probably want to show implicit and explicit application differently, but that requires threading icits through neutral spines...
-            Term::App(f, TElim::App(i, x)) => (f.pretty(db).nest(Prec::App)
-                + " "
-                + pretty_binder(
-                    db.name("_"),
-                    *i,
-                    Prec::Atom,
-                    x.pretty(db).nest(Prec::Atom),
-                    db,
-                ))
-            .prec(Prec::App),
+            Term::App(f, TElim::App(i, x)) => {
+                (f.pretty(db).nest(Prec::App) + " " + x.pretty(db).nest_icit(*i, Prec::Atom))
+                    .prec(Prec::App)
+            }
             Term::App(x, TElim::Match(v, fallback)) if v.len() <= 1 => (x.pretty(db).space()
                 + Doc::keyword("case").space()
                 + Doc::intersperse(
@@ -666,15 +679,10 @@ impl Pretty for Term {
                 ))
             .indent()
             .prec(Prec::Term),
-            Term::Fun(Lam, i, s, _, body) => (pretty_binder(
-                db.name("_"),
-                *i,
-                Prec::Atom,
-                s.0.pretty(db).nest(Prec::Atom),
-                db,
-            ) + " => "
-                + body.pretty(db))
-            .prec(Prec::Term),
+            Term::Fun(Lam, i, s, _, body) => {
+                (s.0.pretty(db).nest_icit(*i, Prec::Atom) + " => " + body.pretty(db))
+                    .prec(Prec::Term)
+            }
             Term::Fun(Pi(n, c), i, s, aty, body) => {
                 (pretty_binder(s.0, *i, Prec::App, aty.pretty(db), db)
                     + " "
@@ -710,27 +718,6 @@ impl Pretty for Term {
             Term::Unknown => Doc::keyword("??"),
             Term::Error => Doc::keyword("error"),
             Term::Type => Doc::start("Type"),
-        }
-    }
-}
-
-fn pretty_branch(db: &DB, l: &PCons, v: &Vec<Sym>, t: &Arc<Term>) -> Doc {
-    match l {
-        PCons::Pair(i) => {
-            pretty_binder(db.name("_"), *i, Prec::Pi, v[0].0.pretty(db), db)
-                + ", "
-                + v[1].0.pretty(db)
-                + " => "
-                + t.pretty(db)
-        }
-        PCons::Cons(d) => {
-            db.idefs.get(*d).name().pretty(db)
-                + Doc::intersperse(
-                    v.iter().map(|x| " " + x.0.pretty(db).nest(Prec::Atom)),
-                    Doc::none(),
-                )
-                + " => "
-                + t.pretty(db)
         }
     }
 }

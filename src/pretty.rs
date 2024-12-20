@@ -196,6 +196,16 @@ impl Doc {
         self
     }
 
+    pub fn nest_icit(mut self, icit: Icit, prec: Prec) -> Self {
+        match icit {
+            Impl => {
+                self.prec = Prec::Atom;
+                "{" + self + "}"
+            }
+            Expl => self.nest(prec),
+        }
+    }
+
     /// Create a new `Doc` representing the given object
     pub fn start<D: ToString>(x: D) -> Self {
         Doc {

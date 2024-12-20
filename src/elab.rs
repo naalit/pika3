@@ -1057,7 +1057,7 @@ impl VElim {
                     assert_eq!(v1.len(), v2.len());
                     let mut env1 = (**env1).clone();
                     let mut env2 = (**env2).clone();
-                    for (&s1, &s2) in v1.iter().zip(v2) {
+                    for (&(_, s1), &(_, s2)) in v1.iter().zip(v2) {
                         let s = cxt.scxt().bind(s1.0);
                         env1.0
                             .insert(s1, Arc::new(Val::Neutral(Head::Sym(s), default())));

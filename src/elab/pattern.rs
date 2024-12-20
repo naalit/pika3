@@ -36,7 +36,14 @@ pub fn pat_bind_type(
             let val = val.quote(&cxt.qenv());
             Term::App(
                 Box::new(val),
-                TElim::Match(vec![(PCons::Pair(*i), vec![s1, s2], Arc::new(body))], None),
+                TElim::Match(
+                    vec![(
+                        PCons::Pair(*i),
+                        vec![(Expl, s1), (Expl, s2)],
+                        Arc::new(body),
+                    )],
+                    None,
+                ),
             )
         }
         _ => body(cxt),
@@ -52,7 +59,7 @@ pub enum PCons {
 #[derive(Clone, PartialEq)]
 struct PConsTy {
     label: PCons,
-    var_tys: Vec<(Sym, Arc<Val>)>,
+    var_tys: Vec<(Icit, Sym, Arc<Val>)>,
     solved_locals: Vec<(Sym, Arc<Val>)>,
 }
 
@@ -75,8 +82,9 @@ fn split_ty(
                         label,
                         var_tys: var_tys
                             .into_iter()
-                            .map(|(s, t)| {
+                            .map(|(i, s, t)| {
                                 (
+                                    i,
                                     s,
                                     Arc::new(Arc::unwrap_or_clone(t).as_cap(*c).add_cap_level(*l)),
                                 )
@@ -105,7 +113,7 @@ fn split_ty(
             }
             Some(vec![PConsTy {
                 label: PCons::Pair(*i),
-                var_tys: vec![(s1, aty.clone()), (s2, Arc::new(bty))],
+                var_tys: vec![(Expl, s1, aty.clone()), (Expl, s2, Arc::new(bty))],
                 solved_locals: default(),
             }])
         }
@@ -134,7 +142,7 @@ fn split_ty(
                             match &cty {
                                 Val::Fun(Pi(_, _), Impl, s, t, _, _) => {
                                     let s1 = cxt.bind_(cxt.db.inaccessible(s.0), t.clone());
-                                    var_tys.push((s1, t.clone()));
+                                    var_tys.push((Impl, s1, t.clone()));
                                     let mv = cxt.new_meta(
                                         (**t).clone(),
                                         MetaSource::ImpArg(s.0),
@@ -149,7 +157,7 @@ fn split_ty(
                                 }
                                 Val::Fun(Pi(_, _), Expl, s, t, _, _) => {
                                     let s1 = cxt.bind_(cxt.db.inaccessible(s.0), t.clone());
-                                    var_tys.push((s1, t.clone()));
+                                    var_tys.push((Expl, s1, t.clone()));
                                     cty = cty.app(Val::sym(s1));
                                     metas.push(None);
                                 }
@@ -170,7 +178,7 @@ fn split_ty(
                             let solved_locals = var_tys
                                 .iter()
                                 .zip(metas)
-                                .filter_map(|((s, _), m)| {
+                                .filter_map(|((_, s, _), m)| {
                                     m.and_then(|(m, sp)| {
                                         Some(sp.into_iter().fold(
                                             cxt.meta_val(m).map(Arc::unwrap_or_clone)?,
@@ -388,7 +396,7 @@ impl PRow {
         self: &PRow,
         var: Sym,
         label: Option<PCons>,
-        vars: &[(Sym, Arc<Val>)],
+        vars: &[(Icit, Sym, Arc<Val>)],
         cxt: &Cxt,
     ) -> Option<Self> {
         if let Some((i, (_, _, _))) = self
@@ -428,7 +436,7 @@ impl PRow {
                     if label == Some(pat.label) {
                         let mut j = i;
                         assert_eq!(pat.vars.len(), vars.len());
-                        for (p, (v, t)) in pat.vars.into_iter().zip(vars) {
+                        for (p, (_, v, t)) in pat.vars.into_iter().zip(vars) {
                             // these need to be in the right order for GADT/sigma reasons
                             s.cols.insert(j, (*v, t.clone(), p));
                             j += 1;
@@ -450,7 +458,7 @@ enum PTree {
     Body(u32, Vec<Sym>, Cxt),
     Match(
         Term,
-        Vec<(PCons, Vec<(Sym, Arc<Val>)>, PTree)>,
+        Vec<(PCons, Vec<(Icit, Sym, Arc<Val>)>, PTree)>,
         Option<Box<PTree>>,
     ),
     Error,
@@ -482,7 +490,7 @@ impl PTree {
                         .map(|(l, v, t)| {
                             (
                                 *l,
-                                v.iter().map(|&(s, _)| s).collect(),
+                                v.iter().map(|&(i, s, _)| (i, s)).collect(),
                                 Arc::new(t.apply(bodies)),
                             )
                         })
@@ -510,16 +518,17 @@ struct PCxt {
 #[derive(Clone)]
 enum PState {
     Any(Sym),
-    Cons(PCons, Vec<PState>),
+    Cons(PCons, Vec<(Icit, PState)>),
 }
 impl PState {
     fn with(&self, var: Sym, new: &PState) -> PState {
         match self {
             PState::Any(sym) if *sym == var => new.clone(),
             PState::Any(sym) => PState::Any(*sym),
-            PState::Cons(pcons, vec) => {
-                PState::Cons(*pcons, vec.iter().map(|x| x.with(var, new)).collect())
-            }
+            PState::Cons(pcons, vec) => PState::Cons(
+                *pcons,
+                vec.iter().map(|(i, x)| (*i, x.with(var, new))).collect(),
+            ),
         }
     }
 }
@@ -528,10 +537,14 @@ impl Pretty for PState {
         match self {
             PState::Any(_) => Doc::start("_"),
             PState::Cons(pcons, v) => match pcons {
-                PCons::Pair(_) => (v[0].pretty(db) + ", " + v[1].pretty(db)).prec(Prec::Pair),
+                PCons::Pair(i) => {
+                    (v[0].1.pretty(db).nest_icit(*i, Prec::Pi) + ", " + v[1].1.pretty(db))
+                        .prec(Prec::Pair)
+                }
                 PCons::Cons(d) => (db.idefs.get(*d).name().pretty(db)
                     + Doc::intersperse(
-                        v.iter().map(|x| " " + x.pretty(db).nest(Prec::Atom)),
+                        v.iter()
+                            .map(|(i, x)| " " + x.pretty(db).nest_icit(*i, Prec::Atom)),
                         Doc::none(),
                     ))
                 .prec(Prec::App),
@@ -543,7 +556,6 @@ fn compile_rows(rows: &[PRow], pcxt: &mut PCxt, state: &PState, cxt: &Cxt) -> PT
     if rows.is_empty() {
         if !pcxt.has_error {
             pcxt.has_error = true;
-            // TODO reconstruct missing cases
             cxt.err(
                 "non-exhaustive pattern match, not covered: " + state.pretty(&cxt.db),
                 pcxt.span,
@@ -663,8 +675,8 @@ fn compile_rows(rows: &[PRow], pcxt: &mut PCxt, state: &PState, cxt: &Cxt) -> PT
                     // Auto-unwrap implicit pairs if we don't match on them explicitly
                     // We do need to add the implicit argument to the assignments for each row
                     let mut rows = rows.to_vec();
-                    let (isym, ity) = ctors[0].var_tys[0].clone();
-                    let (vsym, vty) = ctors[0].var_tys[1].clone();
+                    let (_, isym, ity) = ctors[0].var_tys[0].clone();
+                    let (_, vsym, vty) = ctors[0].var_tys[1].clone();
                     for row in &mut rows {
                         // Because we're not calling remove_column(), they can't bind the sym we split on either, so we'll need to do that
                         row.soft_bind(*var, ty.clone(), &cxt);
@@ -684,7 +696,7 @@ fn compile_rows(rows: &[PRow], pcxt: &mut PCxt, state: &PState, cxt: &Cxt) -> PT
                             ctors[0]
                                 .var_tys
                                 .iter()
-                                .map(|(s, _)| PState::Any(*s))
+                                .map(|(i, s, _)| (*i, PState::Any(*s)))
                                 .collect(),
                         ),
                     );
@@ -724,7 +736,10 @@ fn compile_rows(rows: &[PRow], pcxt: &mut PCxt, state: &PState, cxt: &Cxt) -> PT
                         *var,
                         &PState::Cons(
                             ctor.label,
-                            ctor.var_tys.iter().map(|(s, _)| PState::Any(*s)).collect(),
+                            ctor.var_tys
+                                .iter()
+                                .map(|(i, s, _)| (*i, PState::Any(*s)))
+                                .collect(),
                         ),
                     );
                     let t = compile_rows(&vrows, pcxt, &state, &cxt);
