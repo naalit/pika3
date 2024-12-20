@@ -699,21 +699,13 @@ impl Pretty for Term {
             Term::Assign(a, b) => {
                 (a.pretty(db).nest(Prec::Pi) + " = " + b.pretty(db).nest(Prec::Pi)).prec(Prec::Term)
             }
-            Term::Cap(l, c, x) => (Doc::intersperse(
-                (0..*l).map(|_| {
-                    Doc::keyword(match c {
-                        Cap::Imm => "imm ",
-                        _ => "own ",
-                    })
-                }),
-                Doc::none(),
-            ) + (if *c == Cap::Imm && *l == 0 {
-                Doc::keyword("ref ")
-            } else if *c == Cap::Mut {
-                Doc::keyword("mut ")
-            } else {
-                Doc::none()
-            }) + x.pretty(db).nest(Prec::App))
+            Term::Cap(l, c, x) => (Doc::intersperse((0..*l).map(|_| Doc::start("&")), Doc::none())
+                + if *c == Cap::Own {
+                    Doc::none()
+                } else {
+                    Doc::keyword(*c).space()
+                }
+                + x.pretty(db).nest(Prec::App))
             .prec(Prec::App),
             Term::Unknown => Doc::keyword("??"),
             Term::Error => Doc::keyword("error"),
