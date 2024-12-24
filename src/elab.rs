@@ -712,10 +712,10 @@ impl Cxt {
         }
         r
     }
-    fn maybe_as_eval<R>(&self, f: impl FnOnce() -> R) -> (bool, R) {
+    fn maybe_as_eval<R>(&self, f: impl FnOnce() -> R) -> (Option<Span>, R) {
         let old = self.can_eval.take();
         let r = f();
-        (self.can_eval.set(old).is_none(), r)
+        (self.can_eval.set(old), r)
     }
 
     fn add_deps(&self, deps: Deps) {
@@ -1386,6 +1386,10 @@ impl SPre {
                 };
                 let (mut r, (can_eval, x)) =
                     cxt.record_deps(|| cxt.maybe_as_eval(|| x.check(aty, cxt)));
+                // put it back - if we can't eval the argument, we can't eval the whole thing
+                if can_eval.is_some() && cxt.can_eval.get().is_none() {
+                    cxt.can_eval.set(can_eval);
+                }
                 r.demote(l);
                 r.add(fr);
                 for (s, (span, lvl, _, m)) in &r.deps {
@@ -1402,7 +1406,7 @@ impl SPre {
                     }
                 }
                 cxt.add_deps(r);
-                let vx = if can_eval {
+                let vx = if can_eval.is_none() {
                     x.eval(cxt.env())
                 } else {
                     Val::Unknown
@@ -1623,6 +1627,7 @@ impl SPre {
                 let (a, aty) = a.infer_(cxt, true, Cap::Mut);
                 let ity = match aty.big() {
                     Val::Cap(l, Cap::Mut, a) => (**a).clone().add_cap_level(*l),
+                    Val::Error => Val::Error,
                     _ => unreachable!("hopefully?"),
                 };
                 let b = b.check(ity.clone(), cxt);
@@ -1730,7 +1735,11 @@ impl SPre {
             }
             (Pre::Sigma(i, None, a, None, b), Val::Fun(Sigma(_), i2, _, aty, _, _)) if i == i2 => {
                 let (can_eval, a) = cxt.maybe_as_eval(|| a.check((**aty).clone(), cxt));
-                let va = if can_eval {
+                // put it back - if we can't eval the lhs, we can't eval the whole thing
+                if can_eval.is_some() && cxt.can_eval.get().is_none() {
+                    cxt.can_eval.set(can_eval);
+                }
+                let va = if can_eval.is_none() {
                     a.eval(&cxt.env())
                 } else {
                     Val::Unknown

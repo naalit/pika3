@@ -282,6 +282,8 @@ impl Parser {
             Pre::Binder(lhs, rhs) => {
                 match &***lhs {
                     Pre::Var(name) => (Some(S(*name, lhs.span())), rhs.clone()),
+                    // TODO what's the correct thing to do here? what happens to the below error case with this branch present
+                    _ => (None, param),
                     _ => {
                         // TODO uhh wait we totally allow `(a: T, b: U) -> R`... maybe these should just be patterns too
                         // this is a weird situation. `(T, U)` is treated as a type, so it's not just a pattern here,
