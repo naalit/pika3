@@ -79,7 +79,7 @@ fn split_ty(
     cxt: &mut Cxt,
 ) -> Option<Vec<PConsTy>> {
     match &ty.clone().glued().whnf(cxt) {
-        Val::Cap(l, c, t) => split_ty(var, t, rows, names, cxt).map(|v| {
+        Val::Cap(c, t) => split_ty(var, t, rows, names, cxt).map(|v| {
             v.into_iter()
                 .map(
                     |PConsTy {
@@ -90,13 +90,7 @@ fn split_ty(
                         label,
                         var_tys: var_tys
                             .into_iter()
-                            .map(|(i, s, t)| {
-                                (
-                                    i,
-                                    s,
-                                    Arc::new(Arc::unwrap_or_clone(t).as_cap(*c).add_cap_level(*l)),
-                                )
-                            })
+                            .map(|(i, s, t)| (i, s, Arc::new(Arc::unwrap_or_clone(t).as_cap(*c))))
                             .collect(),
                         solved_locals,
                     },
@@ -155,7 +149,7 @@ fn split_ty(
                         loop {
                             match &cty {
                                 Val::Fun(VFun {
-                                    class: Pi(_, _),
+                                    class: Pi(_),
                                     icit: Impl,
                                     psym: s,
                                     pty: t,
@@ -176,7 +170,7 @@ fn split_ty(
                                     metas.push(Some((m, s)));
                                 }
                                 Val::Fun(VFun {
-                                    class: Pi(_, _),
+                                    class: Pi(_),
                                     icit: Expl,
                                     psym: s,
                                     pty: t,
@@ -359,7 +353,7 @@ impl SPrePat {
                     let (c, mut cty) = s.infer(cxt, false);
                     let mut vars = Vec::new();
                     while let Val::Fun(VFun {
-                        class: Pi(_, _),
+                        class: Pi(_),
                         icit: Impl,
                         psym: n,
                         ..

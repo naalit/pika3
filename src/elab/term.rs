@@ -48,7 +48,7 @@ pub enum Term {
     /// Argument type annotation
     Fun(TFun),
     Pair(Box<Term>, Box<Term>),
-    Cap(u32, Cap, Box<Term>),
+    Cap(Cap, Box<Term>),
     Assign(Box<Term>, Box<Term>),
     Unknown,
     Error,
@@ -176,7 +176,7 @@ pub enum Val {
     Neutral(Head, Spine),
     Fun(VFun),
     Pair(Arc<Val>, Arc<Val>),
-    Cap(u32, Cap, Arc<Val>),
+    Cap(Cap, Arc<Val>),
     Unknown,
     Error,
     Type,
@@ -185,38 +185,24 @@ impl Val {
     pub fn sym(sym: Sym) -> Val {
         Val::Neutral(Head::Sym(sym), default())
     }
-    pub fn add_cap_level(self, l: u32) -> Val {
-        if l == 0 {
-            return self;
-        }
-        match self {
-            Val::Cap(l2, c, rest) => Val::Cap(l + l2, c, rest),
-            _ => Val::Cap(l, Cap::Own, Arc::new(self)),
-        }
-    }
     pub fn as_cap(self, c: Cap) -> Val {
         if c == Cap::Own {
             return self;
         }
         match self {
-            // +0 imm (+1 own t) --> +0 imm t, not +1 imm t - required for getting rid of borrows appropriately
-            Val::Cap(_, Cap::Own, rest) if c == Cap::Imm => Val::Cap(0, Cap::Imm, rest),
-            // `mut` is the same as `imm` in this respect
-            Val::Cap(_, Cap::Own, rest) if c == Cap::Mut => Val::Cap(0, Cap::Mut, rest),
-            // own (mut | imm) and mut imm / imm mut are normal (keep levels)
-            Val::Cap(l, e, rest) => Val::Cap(l, c.min(e), rest),
-            _ => Val::Cap(0, c, Arc::new(self)),
+            Val::Cap(e, rest) => Val::Cap(c.min(e), rest),
+            _ => Val::Cap(c, Arc::new(self)),
         }
     }
-    pub fn uncap(&self) -> (u32, Cap, &Val) {
+    pub fn uncap(&self) -> (Cap, &Val) {
         match self {
-            Val::Cap(l, c, rest) => (*l, *c, rest),
-            _ => (0, Cap::Own, self),
+            Val::Cap(c, rest) => (*c, rest),
+            _ => (Cap::Own, self),
         }
     }
     pub fn cap(&self) -> Cap {
         match self {
-            Val::Cap(_, c, _) => *c,
+            Val::Cap(c, _) => *c,
             _ => Cap::Own,
         }
     }
@@ -237,7 +223,7 @@ impl Term {
             Term::Head(h) => Val::Neutral(*h, default()),
             Term::App(f, x) => x.eval(env).elim(f.eval(env)),
             Term::Fun(f) => Val::Fun(f.eval(env)),
-            Term::Cap(l, c, x) => x.eval(env).as_cap(*c).add_cap_level(*l),
+            Term::Cap(c, x) => x.eval(env).as_cap(*c),
             Term::Pair(a, b) => Val::Pair(Arc::new(a.eval(env)), Arc::new(b.eval(env))),
             Term::Assign(_, _) => panic!("L0-evaluating term with mutation"),
             Term::Unknown => Val::Unknown,
@@ -305,7 +291,7 @@ impl Term {
             Term::Head(h) => Term::Head(*h),
             Term::App(f, x) => Term::App(Box::new(f.subst(env)?), x.subst(env)?),
             Term::Fun(f) => Term::Fun(f.subst(env)?),
-            Term::Cap(l, c, x) => Term::Cap(*l, *c, Box::new(x.subst(env)?)),
+            Term::Cap(c, x) => Term::Cap(*c, Box::new(x.subst(env)?)),
             Term::Pair(a, b) => Term::Pair(Box::new(a.subst(env)?), Box::new(b.subst(env)?)),
             Term::Assign(a, b) => Term::Assign(Box::new(a.subst(env)?), Box::new(b.subst(env)?)),
             Term::Unknown => Term::Unknown,
@@ -344,7 +330,7 @@ impl Val {
                 |acc, x| Ok(Term::App(Box::new(acc?), x.quote_(env)?)),
             )?,
             Val::Fun(f) => Term::Fun(f.quote_(env)?),
-            Val::Cap(l, c, x) => Term::Cap(*l, *c, Box::new(x.quote_(env)?)),
+            Val::Cap(c, x) => Term::Cap(*c, Box::new(x.quote_(env)?)),
             Val::Pair(a, b) => Term::Pair(Box::new(a.quote_(env)?), Box::new(b.quote_(env)?)),
             Val::Unknown => Term::Unknown,
             Val::Error => Term::Error,
@@ -387,7 +373,7 @@ impl Term {
                 a.zonk_(cxt, qenv, beta_reduce);
                 b.zonk_(cxt, qenv, beta_reduce);
             }
-            Term::Cap(_, _, x) => {
+            Term::Cap(_, x) => {
                 x.zonk_(cxt, qenv, beta_reduce);
             }
             Term::Head(_) | Term::Error | Term::Type | Term::Unknown => (),
@@ -447,7 +433,7 @@ impl VElim {
             (_, Val::Error) => Val::Error,
 
             // Apply functions through caps (for pi types)
-            (s @ VElim::App(_, _), Val::Cap(_, _, v)) if matches!(*v, Val::Fun { .. }) => {
+            (s @ VElim::App(_, _), Val::Cap(_, v)) if matches!(*v, Val::Fun { .. }) => {
                 s.elim(Arc::unwrap_or_clone(v))
             }
 
@@ -748,19 +734,16 @@ impl Pretty for Term {
                 (f.psym.0.pretty(db).nest_icit(f.icit, Prec::Atom) + " => " + f.body.pretty(db))
                     .prec(Prec::Term)
             }
-            Term::Fun(
-                f @ TFun {
-                    class: Pi(n, c), ..
-                },
-            ) => (pretty_binder(f.psym.0, f.icit, Prec::App, f.pty.pretty(db), db)
-                + " "
-                + Doc::intersperse((0..*n).map(|_| "&".into()), Doc::none())
-                + match c {
-                    FCap::Own => "~> ",
-                    FCap::Imm => "-> ",
-                }
-                + f.body.pretty(db).nest(Prec::Pi))
-            .prec(Prec::Pi),
+            Term::Fun(f @ TFun { class: Pi(c), .. }) => {
+                (pretty_binder(f.psym.0, f.icit, Prec::App, f.pty.pretty(db), db)
+                    + " "
+                    + match c {
+                        FCap::Own => "~> ",
+                        FCap::Imm => "-> ",
+                    }
+                    + f.body.pretty(db).nest(Prec::Pi))
+                .prec(Prec::Pi)
+            }
             Term::Fun(
                 f @ TFun {
                     class: Sigma(s2), ..
@@ -776,13 +759,11 @@ impl Pretty for Term {
             Term::Assign(a, b) => {
                 (a.pretty(db).nest(Prec::Pi) + " = " + b.pretty(db).nest(Prec::Pi)).prec(Prec::Term)
             }
-            Term::Cap(l, c, x) => (Doc::intersperse((0..*l).map(|_| Doc::start("&")), Doc::none())
-                + if *c == Cap::Own {
-                    Doc::none()
-                } else {
-                    Doc::keyword(*c).space()
-                }
-                + x.pretty(db).nest(Prec::App))
+            Term::Cap(c, x) => (if *c == Cap::Own {
+                Doc::none()
+            } else {
+                Doc::keyword(*c).space()
+            } + x.pretty(db).nest(Prec::App))
             .prec(Prec::App),
             Term::Unknown => Doc::keyword("??"),
             Term::Error => Doc::keyword("error"),

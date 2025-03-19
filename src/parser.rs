@@ -47,11 +47,11 @@ pub enum Pre {
     Var(Name),
     Binder(SPre, SPre),
     App(SPre, SPre, Icit),
-    Pi(Icit, Name, u32, FCap, SPre, SPre),
+    Pi(Icit, Name, FCap, SPre, SPre),
     Sigma(Icit, Option<SName>, SPre, Option<SName>, SPre),
     Lam(Icit, SPrePat, SPre),
     Do(Vec<PreStmt>, SPre),
-    Cap(u32, Cap, SPre),
+    Cap(Cap, SPre),
     Assign(SPre, SPre),
     // x.f y
     Dot(SPre, SName, Option<(Icit, SPre)>),
@@ -304,7 +304,7 @@ impl Parser {
                 S(Box::new(self.reparse_pattern(lhs, message)), lhs.span()),
                 rhs.clone(),
             ),
-            Pre::Cap(0, Cap::Mut, p) => match &***p {
+            Pre::Cap(Cap::Mut, p) => match &***p {
                 Pre::Var(name) => PrePat::Name(true, S(*name, param.span())),
                 _ => {
                     self.error("invalid pattern", param.span());
@@ -432,22 +432,16 @@ impl Parser {
     }
     fn app(&mut self) -> SPre {
         let start = self.pos();
-        if self.maybe(Tok::BitAnd) {
+        if self.maybe(Tok::ImmKw) {
             let rest = self.app();
             return S(
-                Box::new(Pre::Cap(1, Cap::Own, rest)),
-                Span(start, self.pos_right()),
-            );
-        } else if self.maybe(Tok::ImmKw) {
-            let rest = self.app();
-            return S(
-                Box::new(Pre::Cap(0, Cap::Imm, rest)),
+                Box::new(Pre::Cap(Cap::Imm, rest)),
                 Span(start, self.pos_right()),
             );
         } else if self.maybe(Tok::MutKw) {
             let rest = self.app();
             return S(
-                Box::new(Pre::Cap(0, Cap::Mut, rest)),
+                Box::new(Pre::Cap(Cap::Mut, rest)),
                 Span(start, self.pos_right()),
             );
         }
@@ -542,12 +536,8 @@ impl Parser {
             self.expect(Tok::CClose);
         }
         let icit = if implicit { Impl } else { Expl };
-        if matches!(self.peek(), Tok::BitAnd | Tok::Arrow | Tok::WavyArrow) {
-            // pi (possibly &->)
-            let mut n = 0;
-            while self.maybe(Tok::BitAnd) {
-                n += 1;
-            }
+        if matches!(self.peek(), Tok::Arrow | Tok::WavyArrow) {
+            // pi
             let c = if self.maybe(Tok::WavyArrow) {
                 FCap::Own
             } else {
@@ -558,7 +548,7 @@ impl Parser {
             let (name, lhs) = self.reparse_pi_param(lhs);
             let name = name.map(|x| *x).unwrap_or(self.db.name("_"));
             S(
-                Box::new(Pre::Pi(icit, name, n, c, lhs, rhs)),
+                Box::new(Pre::Pi(icit, name, c, lhs, rhs)),
                 Span(start, self.pos_right()),
             )
         } else if self.maybe(Tok::WideArrow) {
@@ -645,7 +635,6 @@ impl Parser {
                                 Box::new(Pre::Pi(
                                     *icit,
                                     name.as_deref().copied().unwrap_or(self.db.name("_")),
-                                    0,
                                     FCap::Imm,
                                     aty,
                                     ty,
@@ -710,7 +699,6 @@ impl Parser {
                             *icit,
                             name.as_deref().copied().unwrap_or(self.db.name("_")),
                             // TODO how do we specify these on function definitions?
-                            0,
                             FCap::Imm,
                             aty,
                             ty,

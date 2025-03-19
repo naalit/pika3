@@ -28,8 +28,7 @@ pub fn with_stack<A>(c: impl FnOnce() -> A) -> A {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Class {
     Lam,
-    /// Pi types can have -n on the argument
-    Pi(u32, FCap),
+    Pi(FCap),
     /// Sigmas, unlike other closures, can have a name assigned to the second value (the closure body)
     Sigma(Name),
 }
