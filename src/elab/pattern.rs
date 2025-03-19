@@ -20,7 +20,15 @@ pub fn pat_bind_type(
         return body(cxt);
     }
     match (&***pre_ty, ty) {
-        (Pre::Sigma(i, n1, _, n2, rest), Val::Fun(Sigma(_), i2, _, aty, _, _)) if i == i2 => {
+        (
+            Pre::Sigma(i, n1, _, n2, rest),
+            Val::Fun(VFun {
+                class: Sigma(_),
+                icit: i2,
+                pty: aty,
+                ..
+            }),
+        ) if i == i2 => {
             let n1 = n1.map(|x| *x).unwrap_or(cxt.db.name("_"));
             let (s1, cxt2) = cxt.bind(n1, aty.clone());
             let bty = ty.clone().app(Val::Neutral(Head::Sym(s1), default()));
@@ -96,7 +104,13 @@ fn split_ty(
                 .collect()
         }),
 
-        Val::Fun(Sigma(n2), i, n1, aty, _, _) => {
+        Val::Fun(VFun {
+            class: Sigma(n2),
+            icit: i,
+            psym: n1,
+            pty: aty,
+            ..
+        }) => {
             // TODO better system for names accessible in types in patterns
             // let n1 = names.next().flatten().unwrap_or(cxt.db.inaccessible(*n1));
             // let n2 = names.next().flatten().unwrap_or(cxt.db.inaccessible(*n2));
@@ -140,7 +154,13 @@ fn split_ty(
                         let mut metas = Vec::new();
                         loop {
                             match &cty {
-                                Val::Fun(Pi(_, _), Impl, s, t, _, _) => {
+                                Val::Fun(VFun {
+                                    class: Pi(_, _),
+                                    icit: Impl,
+                                    psym: s,
+                                    pty: t,
+                                    ..
+                                }) => {
                                     let s1 = cxt.bind_(cxt.db.inaccessible(s.0), t.clone());
                                     var_tys.push((Impl, s1, t.clone()));
                                     let mv = cxt.new_meta(
@@ -155,7 +175,13 @@ fn split_ty(
                                     cty = cty.app(mv);
                                     metas.push(Some((m, s)));
                                 }
-                                Val::Fun(Pi(_, _), Expl, s, t, _, _) => {
+                                Val::Fun(VFun {
+                                    class: Pi(_, _),
+                                    icit: Expl,
+                                    psym: s,
+                                    pty: t,
+                                    ..
+                                }) => {
                                     let s1 = cxt.bind_(cxt.db.inaccessible(s.0), t.clone());
                                     var_tys.push((Expl, s1, t.clone()));
                                     cty = cty.app(Val::sym(s1));
@@ -241,7 +267,7 @@ fn split_ty(
                             .chain(std::iter::once(VElim::App(Expl, Arc::new(Val::sym(s))))),
                     )
                     .quote(&cxt2.qenv());
-                let t = Val::Fun(
+                let t = Val::fun(
                     Sigma(n2),
                     Expl,
                     s,
@@ -332,7 +358,13 @@ impl SPrePat {
                 PrePat::Cons(s, arg) => {
                     let (c, mut cty) = s.infer(cxt, false);
                     let mut vars = Vec::new();
-                    while let Val::Fun(Pi(_, _), Impl, n, _, _, _) = cty.whnf(cxt) {
+                    while let Val::Fun(VFun {
+                        class: Pi(_, _),
+                        icit: Impl,
+                        psym: n,
+                        ..
+                    }) = cty.whnf(cxt)
+                    {
                         if !matches!(arg, Some((Impl, _))) {
                             vars.push(S(
                                 IPat::Var(false, cxt.db.inaccessible(n.0), None),
@@ -660,7 +692,14 @@ fn compile_rows(rows: &[PRow], pcxt: &mut PCxt, state: &PState, cxt: &Cxt) -> PT
             .iter()
             .flat_map(|r| &r.cols)
             .any(|(s, _, p)| s == var && p.needs_split(&cxt.db))
-            || matches!(&**ty, Val::Fun(Sigma(_), Impl, _, _, _, _))
+            || matches!(
+                &**ty,
+                Val::Fun(VFun {
+                    class: Sigma(_),
+                    icit: Impl,
+                    ..
+                })
+            )
         {
             if let Some(ctors) = split_ty(*var, ty, rows, names.into_iter(), &mut cxt) {
                 if ctors.len() == 1
@@ -818,15 +857,15 @@ impl PMatch {
             .rev()
         {
             let body = vars.iter().rfold(body.clone(), |acc, (_, _, s, ty)| {
-                Term::Fun(Lam, Expl, *s, Box::new(ty.quote(cxt.qenv())), Arc::new(acc))
+                Term::fun(Lam, Expl, *s, ty.quote(cxt.qenv()), Arc::new(acc))
             });
             term = Term::App(
-                Box::new(Term::Fun(
+                Box::new(Term::fun(
                     Lam,
                     Expl,
                     *body_sym,
                     // TODO do we care about these types?
-                    Box::new(Term::Error),
+                    Term::Error,
                     Arc::new(term),
                 )),
                 TElim::App(Expl, Box::new(body.clone())),

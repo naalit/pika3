@@ -133,6 +133,11 @@ fn pretty_def(e: &DefElab, db: &DB) -> Doc {
     for (_, i) in &e.children {
         doc = doc.hardline() + pretty_def(i, db);
     }
+    doc = if e.can_eval {
+        "@transparent\n" + doc
+    } else {
+        doc
+    };
     doc.indent()
 }
 

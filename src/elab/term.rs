@@ -46,7 +46,7 @@ pub enum Term {
     Head(Head),
     App(Box<Term>, TElim),
     /// Argument type annotation
-    Fun(Class, Icit, Sym, Box<Term>, Arc<Term>),
+    Fun(TFun),
     Pair(Box<Term>, Box<Term>),
     Cap(u32, Cap, Box<Term>),
     Assign(Box<Term>, Box<Term>),
@@ -71,12 +71,110 @@ impl Env {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct VFun {
+    pub class: Class,
+    pub icit: Icit,
+    pub psym: Sym,
+    pub pty: Arc<Val>,
+    body: Arc<Term>,
+    env: Arc<Env>,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct TFun {
+    pub class: Class,
+    pub icit: Icit,
+    psym: Sym,
+    pty: Box<Term>,
+    body: Arc<Term>,
+}
+impl VFun {
+    fn quote_(&self, env: &QEnv) -> Result<TFun, Sym> {
+        // Fast path: if the environment is empty, we don't need to subst the term
+        // This is mostly useful for inlining metas in terms
+        if self.env.is_empty() {
+            Ok(TFun {
+                class: self.class,
+                icit: self.icit,
+                psym: self.psym,
+                pty: Box::new(self.pty.quote_(env)?),
+                body: self.body.clone(),
+            })
+        } else {
+            let (sym, senv) = env.senv(&self.env).bind(self.psym);
+            Ok(TFun {
+                class: self.class,
+                icit: self.icit,
+                psym: sym,
+                pty: Box::new(self.pty.quote_(env)?),
+                body: Arc::new(self.body.subst(&senv)?),
+            })
+        }
+    }
+}
+impl TFun {
+    fn subst(&self, env: &SEnv) -> Result<TFun, Sym> {
+        let (s, env2) = env.bind(self.psym);
+        Ok(TFun {
+            class: self.class,
+            icit: self.icit,
+            psym: s,
+            pty: Box::new(self.pty.subst(env)?),
+            body: Arc::new(self.body.subst(&env2)?),
+        })
+    }
+    fn eval(&self, env: &Env) -> VFun {
+        VFun {
+            class: self.class,
+            icit: self.icit,
+            psym: self.psym,
+            pty: Arc::new(self.pty.eval(env)),
+            body: self.body.clone(),
+            env: Arc::new(env.clone()),
+        }
+    }
+    fn zonk_(&mut self, cxt: &Cxt, qenv: &QEnv, beta_reduce: bool) {
+        self.pty.zonk_(cxt, qenv, beta_reduce);
+        Arc::make_mut(&mut self.body).zonk_(cxt, &qenv, beta_reduce);
+    }
+}
+impl Val {
+    pub fn fun(
+        class: Class,
+        icit: Icit,
+        psym: Sym,
+        pty: Arc<Val>,
+        body: Arc<Term>,
+        env: Arc<Env>,
+    ) -> Val {
+        Val::Fun(VFun {
+            class,
+            icit,
+            psym,
+            pty,
+            body,
+            env,
+        })
+    }
+}
+impl Term {
+    pub fn fun(class: Class, icit: Icit, psym: Sym, pty: Term, body: Arc<Term>) -> Term {
+        Term::Fun(TFun {
+            class,
+            icit,
+            psym,
+            pty: Box::new(pty),
+            body,
+        })
+    }
+}
+
 pub type Spine = Vec<VElim>;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Val {
     Neutral(Head, Spine),
-    Fun(Class, Icit, Sym, Arc<Val>, Arc<Term>, Arc<Env>),
+    Fun(VFun),
     Pair(Arc<Val>, Arc<Val>),
     Cap(u32, Cap, Arc<Val>),
     Unknown,
@@ -138,14 +236,7 @@ impl Term {
             Term::Head(Head::Sym(s)) => env.get(s).map(|x| (**x).clone()).unwrap_or(Val::sym(*s)),
             Term::Head(h) => Val::Neutral(*h, default()),
             Term::App(f, x) => x.eval(env).elim(f.eval(env)),
-            Term::Fun(c, i, s, aty, body) => Val::Fun(
-                *c,
-                *i,
-                *s,
-                Arc::new(aty.eval(env)),
-                body.clone(),
-                Arc::new(env.clone()),
-            ),
+            Term::Fun(f) => Val::Fun(f.eval(env)),
             Term::Cap(l, c, x) => x.eval(env).as_cap(*c).add_cap_level(*l),
             Term::Pair(a, b) => Val::Pair(Arc::new(a.eval(env)), Arc::new(b.eval(env))),
             Term::Assign(_, _) => panic!("L0-evaluating term with mutation"),
@@ -213,16 +304,7 @@ impl Term {
             Term::Head(Head::Sym(s)) => env.get(*s).quote_(&env.qenv)?,
             Term::Head(h) => Term::Head(*h),
             Term::App(f, x) => Term::App(Box::new(f.subst(env)?), x.subst(env)?),
-            Term::Fun(c, i, s, aty, body) => {
-                let (s, env2) = env.bind(*s);
-                Term::Fun(
-                    *c,
-                    *i,
-                    s,
-                    Box::new(aty.subst(env)?),
-                    Arc::new(body.subst(&env2)?),
-                )
-            }
+            Term::Fun(f) => Term::Fun(f.subst(env)?),
             Term::Cap(l, c, x) => Term::Cap(*l, *c, Box::new(x.subst(env)?)),
             Term::Pair(a, b) => Term::Pair(Box::new(a.subst(env)?), Box::new(b.subst(env)?)),
             Term::Assign(a, b) => Term::Assign(Box::new(a.subst(env)?), Box::new(b.subst(env)?)),
@@ -261,21 +343,7 @@ impl Val {
                 }),
                 |acc, x| Ok(Term::App(Box::new(acc?), x.quote_(env)?)),
             )?,
-            // Fast path: if the environment is empty, we don't need to subst the term
-            // This is mostly useful for inlining metas in terms
-            Val::Fun(c, i, s, aty, body, inner_env) if inner_env.is_empty() => {
-                Term::Fun(*c, *i, *s, Box::new(aty.quote_(env)?), body.clone())
-            }
-            Val::Fun(c, i, s, aty, body, inner_env) => {
-                let (sym, senv) = env.senv(inner_env).bind(*s);
-                Term::Fun(
-                    *c,
-                    *i,
-                    sym,
-                    Box::new(aty.quote_(env)?),
-                    Arc::new(body.subst(&senv)?),
-                )
-            }
+            Val::Fun(f) => Term::Fun(f.quote_(env)?),
             Val::Cap(l, c, x) => Term::Cap(*l, *c, Box::new(x.quote_(env)?)),
             Val::Pair(a, b) => Term::Pair(Box::new(a.quote_(env)?), Box::new(b.quote_(env)?)),
             Val::Unknown => Term::Unknown,
@@ -314,10 +382,7 @@ impl Term {
                     return true;
                 }
             }
-            Term::Fun(_, _, _, aty, body) => {
-                aty.zonk_(cxt, qenv, beta_reduce);
-                Arc::make_mut(body).zonk_(cxt, &qenv, beta_reduce);
-            }
+            Term::Fun(f) => f.zonk_(cxt, qenv, beta_reduce),
             Term::Pair(a, b) | Term::Assign(a, b) => {
                 a.zonk_(cxt, qenv, beta_reduce);
                 b.zonk_(cxt, qenv, beta_reduce);
@@ -360,9 +425,9 @@ pub enum VElim {
 impl VElim {
     pub fn elim(self, v: Val) -> Val {
         match (self, v) {
-            (VElim::App(_, x), Val::Fun(_, _, s, _, body, mut env)) => {
-                body.eval(&Arc::make_mut(&mut env).tap_mut(|v| {
-                    v.0.insert(s, x);
+            (VElim::App(_, x), Val::Fun(mut f)) => {
+                f.body.eval(&Arc::make_mut(&mut f.env).tap_mut(|v| {
+                    v.0.insert(f.psym, x);
                 }))
             }
 
@@ -679,27 +744,31 @@ impl Pretty for Term {
                 ))
             .indent()
             .prec(Prec::Term),
-            Term::Fun(Lam, i, s, _, body) => {
-                (s.0.pretty(db).nest_icit(*i, Prec::Atom) + " => " + body.pretty(db))
+            Term::Fun(f @ TFun { class: Lam, .. }) => {
+                (f.psym.0.pretty(db).nest_icit(f.icit, Prec::Atom) + " => " + f.body.pretty(db))
                     .prec(Prec::Term)
             }
-            Term::Fun(Pi(n, c), i, s, aty, body) => {
-                (pretty_binder(s.0, *i, Prec::App, aty.pretty(db), db)
-                    + " "
-                    + Doc::intersperse((0..*n).map(|_| "&".into()), Doc::none())
-                    + match c {
-                        FCap::Own => "~> ",
-                        FCap::Imm => "-> ",
-                    }
-                    + body.pretty(db).nest(Prec::Pi))
-                .prec(Prec::Pi)
-            }
-            Term::Fun(Sigma(s2), i, s1, aty, body) => {
-                (pretty_binder(s1.0, *i, Prec::Pi, aty.pretty(db), db)
-                    + ", "
-                    + pretty_binder(*s2, Expl, Prec::Pair, body.pretty(db), db))
-                .prec(Prec::Pair)
-            }
+            Term::Fun(
+                f @ TFun {
+                    class: Pi(n, c), ..
+                },
+            ) => (pretty_binder(f.psym.0, f.icit, Prec::App, f.pty.pretty(db), db)
+                + " "
+                + Doc::intersperse((0..*n).map(|_| "&".into()), Doc::none())
+                + match c {
+                    FCap::Own => "~> ",
+                    FCap::Imm => "-> ",
+                }
+                + f.body.pretty(db).nest(Prec::Pi))
+            .prec(Prec::Pi),
+            Term::Fun(
+                f @ TFun {
+                    class: Sigma(s2), ..
+                },
+            ) => (pretty_binder(f.psym.0, f.icit, Prec::Pi, f.pty.pretty(db), db)
+                + ", "
+                + pretty_binder(*s2, Expl, Prec::Pair, f.body.pretty(db), db))
+            .prec(Prec::Pair),
             Term::Pair(a, b) => {
                 (a.pretty(db).nest(Prec::Pi) + ", " + b.pretty(db).nest(Prec::Pair))
                     .prec(Prec::Pair)

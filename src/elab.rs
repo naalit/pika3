@@ -228,7 +228,7 @@ pub fn elab_def(def: Def, db: &DB) -> Option<DefElabResult> {
                 .rfold(Term::Type, |acc, (i, (s, m))| {
                     let aty = m.ty.quote(cxt.qenv());
                     let body = m.compile(&[acc], &cxt);
-                    Term::Fun(Pi(0, FCap::Imm), *i, *s, Box::new(aty), Arc::new(body))
+                    Term::fun(Pi(0, FCap::Imm), *i, *s, aty, Arc::new(body))
                 })
                 .eval(cxt.env())
                 .zonk(&cxt, true);
@@ -271,12 +271,12 @@ pub fn elab_def(def: Def, db: &DB) -> Option<DefElabResult> {
                                 &cxt,
                                 |_| rty,
                             );
-                            Term::Fun(Pi(0, FCap::Imm), *i, s, Box::new(aty), Arc::new(body))
+                            Term::fun(Pi(0, FCap::Imm), *i, s, aty, Arc::new(body))
                         });
                         m.iter().rfold(vty, |acc, (_, (s, m))| {
                             let aty = m.ty.quote(cxt.qenv());
                             let body = m.compile(&[acc], &cxt);
-                            Term::Fun(Pi(0, FCap::Imm), Impl, *s, Box::new(aty), Arc::new(body))
+                            Term::fun(Pi(0, FCap::Imm), Impl, *s, aty, Arc::new(body))
                         })
                     }
                 };
@@ -361,10 +361,15 @@ impl Val {
     fn is_owned(&self) -> bool {
         match self {
             Val::Neutral(_, _) => true,
-            Val::Fun(Sigma(_), _, s, a, _, _) => {
-                a.is_owned() || self.clone().app(Val::sym(*s)).is_owned()
-            }
-            Val::Fun(Pi(_, c), _, _, _, _, _) => *c == FCap::Own,
+            Val::Fun(VFun {
+                class: Sigma(_),
+                psym: s,
+                pty: a,
+                ..
+            }) => a.is_owned() || self.clone().app(Val::sym(*s)).is_owned(),
+            Val::Fun(VFun {
+                class: Pi(_, c), ..
+            }) => *c == FCap::Own,
             Val::Fun { .. } => true,
             Val::Pair(_, _) => unreachable!(),
             Val::Cap(_, c, t) => *c != Cap::Imm && t.is_owned(),
@@ -871,7 +876,12 @@ impl Cxt {
         // So we make two metas (possibly recursively), and return (?0, ?1)
         // In general this can be applied to any single-constructor datatype, but we probably won't actually implement that
         // But since we usually tuple function arguments, this makes type inference work much better in practice
-        if let Val::Fun(Sigma(_), _, _, aty, _, _) = &ty {
+        if let Val::Fun(VFun {
+            class: Sigma(_),
+            pty: aty,
+            ..
+        }) = &ty
+        {
             let m1 = self.new_meta((**aty).clone(), source, span);
             let bty = ty.app(m1.clone());
             let m2 = self.new_meta(bty, source, span);
@@ -979,11 +989,11 @@ impl Cxt {
         match solution.quote_(&qenv) {
             Ok(body) => {
                 let term = spine.iter().zip(syms).rfold(body, |acc, (_, s)| {
-                    Term::Fun(
+                    Term::fun(
                         Lam,
                         Expl,
                         s.unwrap_or(self.scxt().bind(self.db.name("_"))),
-                        Box::new(Term::Error),
+                        Term::Error,
                         Arc::new(acc),
                     )
                 });
@@ -1113,15 +1123,17 @@ impl GVal {
                 {
                     true
                 }
-                (Val::Fun(c, i1, n1, aty, _, _), Val::Fun(c2, i2, _, aty2, _, _))
-                    if (c == c2 || matches!((c, c2), (Sigma(_), Sigma(_)))) && i1 == i2 =>
+                (Val::Fun(f), Val::Fun(f2))
+                    if (f.class == f2.class
+                        || matches!((f.class, f2.class), (Sigma(_), Sigma(_))))
+                        && f.icit == f2.icit =>
                 {
-                    let s = cxt.scxt().bind(n1.0);
+                    let s = cxt.scxt().bind(f.psym.0);
                     let arg = Val::Neutral(Head::Sym(s), default());
-                    if !(**aty)
+                    if !(*f.pty)
                         .clone()
                         .glued()
-                        .unify_((**aty2).clone().glued(), span, cxt, mode)
+                        .unify_((*f2.pty).clone().glued(), span, cxt, mode)
                     {
                         false
                     } else {
@@ -1160,7 +1172,22 @@ impl GVal {
                 }
                 // eta-expand if there's a lambda on only one side
                 // TODO this might have problems since we don't make sure the icits match?
-                (Val::Fun(Lam, _, n, _, _, _), _) | (_, Val::Fun(Lam, _, n, _, _, _)) => {
+                (
+                    Val::Fun(VFun {
+                        class: Lam,
+                        psym: n,
+                        ..
+                    }),
+                    _,
+                )
+                | (
+                    _,
+                    Val::Fun(VFun {
+                        class: Lam,
+                        psym: n,
+                        ..
+                    }),
+                ) => {
                     let s = cxt.scxt().bind(n.0);
                     let arg = Val::Neutral(Head::Sym(s), default());
                     a = a.as_big().app(arg.clone()).glued();
@@ -1179,7 +1206,13 @@ impl GVal {
 // don't call this if checking against an implicit lambda
 fn insert_metas(term: Term, mut ty: GVal, cxt: &Cxt, span: Span) -> (Term, GVal) {
     match ty.whnf(cxt) {
-        Val::Fun(Pi(_, _), Impl, n, aty, _, _) => {
+        Val::Fun(VFun {
+            class: Pi(_, _),
+            icit: Impl,
+            psym: n,
+            pty: aty,
+            ..
+        }) => {
             let m = cxt.new_meta((**aty).clone(), MetaSource::ImpArg(n.0), span);
             let term = Term::App(
                 Box::new(term),
@@ -1233,7 +1266,7 @@ fn elab_block(block: &[PreStmt], last_: &SPre, ty: Option<GVal>, cxt1: &Cxt) -> 
             None => acc,
         };
         Term::App(
-            Box::new(Term::Fun(Lam, Expl, s, Box::new(t), Arc::new(acc))),
+            Box::new(Term::fun(Lam, Expl, s, t, Arc::new(acc))),
             TElim::App(Expl, Box::new(x)),
         )
     });
@@ -1303,10 +1336,15 @@ impl SPre {
                     Val::Error => (Val::Error, 0),
                     // TODO: calling `-1 (+1 t, +0 u) -> ()` with `(+0 t, +0 u)` should be fine, right?
                     // TODO: and also how does this affect the surplus of the result?
-                    Val::Fun(Pi(l, c), i2, _, aty, _, _) if i == i2 && fc >= c.cap() => {
-                        ((**aty).clone(), *l)
-                    }
-                    Val::Fun(Pi(_, c), _, _, _, _, _) if fc >= c.cap() => {
+                    Val::Fun(VFun {
+                        class: Pi(l, c),
+                        icit: i2,
+                        pty: aty,
+                        ..
+                    }) if i == i2 && fc >= c.cap() => ((**aty).clone(), *l),
+                    Val::Fun(VFun {
+                        class: Pi(_, c), ..
+                    }) if fc >= c.cap() => {
                         cxt.err(
                             "wrong function type: expected "
                                 + Doc::start(*i)
@@ -1319,7 +1357,10 @@ impl SPre {
                         fty = Val::Error.glued();
                         (Val::Error, 0)
                     }
-                    Val::Fun(Pi(_, FCap::Own), _, _, _, _, _) if fc < Cap::Own => {
+                    Val::Fun(VFun {
+                        class: Pi(_, FCap::Own),
+                        ..
+                    }) if fc < Cap::Own => {
                         cxt.err(
                             "cannot call owned ~> function through "
                                 + Doc::keyword(fc)
@@ -1361,7 +1402,7 @@ impl SPre {
                         cxt.solve_meta(
                             *m,
                             spine,
-                            Val::Fun(
+                            Val::fun(
                                 Pi(0, FCap::Imm),
                                 *i,
                                 s,
@@ -1435,14 +1476,14 @@ impl SPre {
                 let scope = q.then(|| cxt.pop_uquant().unwrap());
                 (
                     scope.into_iter().flatten().rfold(
-                        Term::Fun(Pi(*l, *c), *i, s, Box::new(aty), Arc::new(body)),
+                        Term::fun(Pi(*l, *c), *i, s, aty, Arc::new(body)),
                         |acc, (s, ty)| {
-                            Term::Fun(
+                            Term::fun(
                                 // use -0 imm for the uquant pis
                                 Pi(0, FCap::Imm),
                                 Impl,
                                 s,
-                                Box::new(ty.quote(cxt.qenv())),
+                                ty.quote(cxt.qenv()),
                                 Arc::new(acc),
                             )
                         },
@@ -1498,24 +1539,24 @@ impl SPre {
                 let scope = q.then(|| cxt.pop_uquant().unwrap());
                 (
                     scope.iter().flatten().rfold(
-                        Term::Fun(Lam, *i, s, Box::new(aty2.clone()), Arc::new(body)),
+                        Term::fun(Lam, *i, s, aty2.clone(), Arc::new(body)),
                         |acc, (s, ty)| {
                             // Don't introduce a redex, the user clearly intended to make a polymorphic lambda
                             should_insert_metas = false;
-                            Term::Fun(Lam, Impl, *s, Box::new(ty.quote(cxt.qenv())), Arc::new(acc))
+                            Term::fun(Lam, Impl, *s, ty.quote(cxt.qenv()), Arc::new(acc))
                         },
                     ),
                     scope
                         .into_iter()
                         .flatten()
                         .fold(
-                            Term::Fun(Pi(0, cap), *i, s, Box::new(aty2), Arc::new(rty)),
+                            Term::fun(Pi(0, cap), *i, s, aty2, Arc::new(rty)),
                             |acc, (s, ty)| {
-                                Term::Fun(
+                                Term::fun(
                                     Pi(0, FCap::Imm),
                                     Impl,
                                     s,
-                                    Box::new(ty.quote(cxt.qenv())),
+                                    ty.quote(cxt.qenv()),
                                     Arc::new(acc),
                                 )
                             },
@@ -1532,7 +1573,7 @@ impl SPre {
                 let bty = bty.small().quote(cxt.qenv());
                 (
                     Term::Pair(Box::new(a), Box::new(b)),
-                    Val::Fun(
+                    Val::fun(
                         Sigma(cxt.db.name("_")),
                         *i,
                         s,
@@ -1620,7 +1661,7 @@ impl SPre {
                     }
                 }
                 let t = p.compile(&bodies, &cxt);
-                let t = Term::Fun(Lam, Expl, s, Box::new(p.ty.quote(cxt.qenv())), Arc::new(t));
+                let t = Term::fun(Lam, Expl, s, p.ty.quote(cxt.qenv()), Arc::new(t));
                 (Term::App(Box::new(t), TElim::App(Expl, Box::new(x))), rty)
             }
             Pre::Assign(a, b) => {
@@ -1647,7 +1688,16 @@ impl SPre {
             Pre::Error => (Term::Error, Val::Error),
         };
         let sty = sty.glued();
-        if should_insert_metas && !matches!(s, Term::Fun(Lam, Impl, _, _, _)) {
+        if should_insert_metas
+            && !matches!(
+                s,
+                Term::Fun(TFun {
+                    class: Lam,
+                    icit: Impl,
+                    ..
+                })
+            )
+        {
             insert_metas(s, sty, cxt, self.span())
         } else {
             (s, sty)
@@ -1657,7 +1707,15 @@ impl SPre {
     fn check(&self, ty: impl Into<GVal>, cxt: &Cxt) -> Term {
         let mut ty: GVal = ty.into();
         match (&***self, ty.whnf(cxt)) {
-            (Pre::Lam(i, pat, body), Val::Fun(Pi(l, c), i2, _, aty2, _, _)) if i == i2 => {
+            (
+                Pre::Lam(i, pat, body),
+                Val::Fun(VFun {
+                    class: Pi(l, c),
+                    icit: i2,
+                    pty: aty2,
+                    ..
+                }),
+            ) if i == i2 => {
                 let c = *c;
                 let l = *l;
                 let mut cxt = cxt.clone();
@@ -1721,7 +1779,7 @@ impl SPre {
                     );
                 }
                 let body = pat.compile(&[body], &cxt);
-                Term::Fun(Lam, *i, sym, Box::new(aty), Arc::new(body))
+                Term::fun(Lam, *i, sym, aty, Arc::new(body))
             }
             // when checking pair against type, assume sigma
             (Pre::Sigma(i, n1, aty, n2, body), Val::Type) => {
@@ -1731,9 +1789,17 @@ impl SPre {
                 let vaty = aty.eval(cxt.env());
                 let (s, cxt) = cxt.bind(n1, vaty);
                 let body = body.check(Val::Type, &cxt);
-                Term::Fun(Sigma(n2), *i, s, Box::new(aty), Arc::new(body))
+                Term::fun(Sigma(n2), *i, s, aty, Arc::new(body))
             }
-            (Pre::Sigma(i, None, a, None, b), Val::Fun(Sigma(_), i2, _, aty, _, _)) if i == i2 => {
+            (
+                Pre::Sigma(i, None, a, None, b),
+                Val::Fun(VFun {
+                    class: Sigma(_),
+                    icit: i2,
+                    pty: aty,
+                    ..
+                }),
+            ) if i == i2 => {
                 let (can_eval, a) = cxt.maybe_as_eval(|| a.check((**aty).clone(), cxt));
                 // put it back - if we can't eval the lhs, we can't eval the whole thing
                 if can_eval.is_some() && cxt.can_eval.get().is_none() {
@@ -1751,7 +1817,16 @@ impl SPre {
             (Pre::Do(block, last), _) => elab_block(block, last, Some(ty), cxt).0,
 
             // insert lambda when checking (non-implicit lambda) against implicit function type
-            (_, Val::Fun(Pi(l, _), Impl, n, aty, _, _)) => {
+            (
+                _,
+                Val::Fun(VFun {
+                    class: Pi(l, _),
+                    icit: Impl,
+                    psym: n,
+                    pty: aty,
+                    ..
+                }),
+            ) => {
                 let l = *l;
                 let aty2 = aty.quote(cxt.qenv());
                 // don't let them access the name in the term (shadowing existing names would be unintuitive)
@@ -1765,10 +1840,19 @@ impl SPre {
                     .app(Val::Neutral(Head::Sym(sym), default()))
                     .add_cap_level(l);
                 let body = self.check(rty, &cxt);
-                Term::Fun(Lam, Impl, sym, Box::new(aty2), Arc::new(body))
+                Term::fun(Lam, Impl, sym, aty2, Arc::new(body))
             }
             // and similar for implicit sigma
-            (_, Val::Fun(Sigma(_), Impl, n, aty, _, _)) => {
+            (
+                _,
+                Val::Fun(VFun {
+                    class: Sigma(_),
+                    icit: Impl,
+                    psym: n,
+                    pty: aty,
+                    ..
+                }),
+            ) => {
                 let a = cxt
                     .new_meta((**aty).clone(), MetaSource::ImpArg(n.0), self.span())
                     .quote(&cxt.qenv());
@@ -1782,7 +1866,14 @@ impl SPre {
                 let (r, (s, sty)) = cxt.record_deps(|| {
                     self.infer_(
                         cxt,
-                        !matches!(ty.big(), Val::Fun(Pi(_, _), Impl, _, _, _, _)),
+                        !matches!(
+                            ty.big(),
+                            Val::Fun(VFun {
+                                class: Pi(_, _),
+                                icit: Impl,
+                                ..
+                            })
+                        ),
                         ty.big().cap(),
                     )
                 });
