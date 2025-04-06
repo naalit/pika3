@@ -1,6 +1,6 @@
 use super::*;
 
-use std::sync::atomic::AtomicU32;
+use std::sync::{atomic::AtomicU32, Arc};
 
 // -- types --
 
@@ -24,12 +24,24 @@ impl Pretty for Meta {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Builtin {
     Module,
+    Region,
 }
 impl std::fmt::Display for Builtin {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Builtin::Module => write!(f, "Module"),
+            Builtin::Region => write!(f, "Region"),
         }
+    }
+}
+impl From<Builtin> for Term {
+    fn from(value: Builtin) -> Self {
+        Term::Head(Head::Builtin(value))
+    }
+}
+impl From<Builtin> for Val {
+    fn from(value: Builtin) -> Self {
+        Val::Neutral(Head::Builtin(value), Vec::new())
     }
 }
 
@@ -41,6 +53,9 @@ pub enum Head {
     Builtin(Builtin),
 }
 
+// TODO switch to Vec<(Borrow, Option<T>)> or similar
+pub type Region<T> = Vec<T>;
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Term {
     Head(Head),
@@ -50,6 +65,8 @@ pub enum Term {
     Pair(Box<Term>, Box<Term>),
     Cap(Cap, Box<Term>),
     Assign(Box<Term>, Box<Term>),
+    Region(Region<Term>),
+    RegionAnn(Region<Term>, Box<Term>),
     Unknown,
     Error,
     Type,
@@ -68,6 +85,53 @@ impl Env {
                 v.insert(s, Arc::new(Val::sym(s2)));
             })),
         )
+    }
+}
+
+pub type Spine = Vec<VElim>;
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Val {
+    Neutral(Head, Spine),
+    Fun(VFun),
+    Pair(Arc<Val>, Arc<Val>),
+    Cap(Cap, Option<Region<Arc<Val>>>, Arc<Val>),
+    Region(Region<Arc<Val>>),
+    Unknown,
+    Error,
+    Type,
+}
+impl Val {
+    pub fn sym(sym: Sym) -> Val {
+        Val::Neutral(Head::Sym(sym), default())
+    }
+    pub fn as_cap(self, c: Cap) -> Val {
+        if c == Cap::Own {
+            return self;
+        }
+        match self {
+            Val::Cap(e, r, rest) => Val::Cap(c.min(e), r, rest),
+            _ => Val::Cap(c, None, Arc::new(self)),
+        }
+    }
+    pub fn with_region(self, r: Option<Region<Arc<Val>>>) -> Val {
+        match self {
+            Val::Cap(e, r2, rest) if r.is_none() => Val::Cap(e, r2, rest),
+            Val::Cap(e, _, rest) => Val::Cap(e, r, rest),
+            _ => Val::Cap(Cap::Own, r, Arc::new(self)),
+        }
+    }
+    pub fn uncap(&self) -> (Cap, Option<Region<Arc<Val>>>, &Val) {
+        match self {
+            Val::Cap(c, r, rest) => (*c, r.clone(), rest),
+            _ => (Cap::Own, None, self),
+        }
+    }
+    pub fn cap(&self) -> Cap {
+        match self {
+            Val::Cap(c, _, _) => *c,
+            _ => Cap::Own,
+        }
     }
 }
 
@@ -169,45 +233,6 @@ impl Term {
     }
 }
 
-pub type Spine = Vec<VElim>;
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum Val {
-    Neutral(Head, Spine),
-    Fun(VFun),
-    Pair(Arc<Val>, Arc<Val>),
-    Cap(Cap, Arc<Val>),
-    Unknown,
-    Error,
-    Type,
-}
-impl Val {
-    pub fn sym(sym: Sym) -> Val {
-        Val::Neutral(Head::Sym(sym), default())
-    }
-    pub fn as_cap(self, c: Cap) -> Val {
-        if c == Cap::Own {
-            return self;
-        }
-        match self {
-            Val::Cap(e, rest) => Val::Cap(c.min(e), rest),
-            _ => Val::Cap(c, Arc::new(self)),
-        }
-    }
-    pub fn uncap(&self) -> (Cap, &Val) {
-        match self {
-            Val::Cap(c, rest) => (*c, rest),
-            _ => (Cap::Own, self),
-        }
-    }
-    pub fn cap(&self) -> Cap {
-        match self {
-            Val::Cap(c, _) => *c,
-            _ => Cap::Own,
-        }
-    }
-}
-
 // -- evaluation and quoting --
 
 impl Val {
@@ -226,6 +251,11 @@ impl Term {
             Term::Cap(c, x) => x.eval(env).as_cap(*c),
             Term::Pair(a, b) => Val::Pair(Arc::new(a.eval(env)), Arc::new(b.eval(env))),
             Term::Assign(_, _) => panic!("L0-evaluating term with mutation"),
+            // TODO combine regions
+            Term::Region(r) => Val::Region(r.iter().map(|x| Arc::new(x.eval(env))).collect()),
+            Term::RegionAnn(r, x) => x
+                .eval(env)
+                .with_region(Some(r.iter().map(|x| Arc::new(x.eval(env))).collect())),
             Term::Unknown => Val::Unknown,
             Term::Error => Val::Error,
             Term::Type => Val::Type,
@@ -294,6 +324,13 @@ impl Term {
             Term::Cap(c, x) => Term::Cap(*c, Box::new(x.subst(env)?)),
             Term::Pair(a, b) => Term::Pair(Box::new(a.subst(env)?), Box::new(b.subst(env)?)),
             Term::Assign(a, b) => Term::Assign(Box::new(a.subst(env)?), Box::new(b.subst(env)?)),
+            Term::Region(r) => {
+                Term::Region(r.iter().map(|x| x.subst(env)).collect::<Result<_, _>>()?)
+            }
+            Term::RegionAnn(r, x) => Term::RegionAnn(
+                r.iter().map(|x| x.subst(env)).collect::<Result<_, _>>()?,
+                Box::new(x.subst(env)?),
+            ),
             Term::Unknown => Term::Unknown,
             Term::Error => Term::Error,
             Term::Type => Term::Type,
@@ -330,7 +367,14 @@ impl Val {
                 |acc, x| Ok(Term::App(Box::new(acc?), x.quote_(env)?)),
             )?,
             Val::Fun(f) => Term::Fun(f.quote_(env)?),
-            Val::Cap(c, x) => Term::Cap(*c, Box::new(x.quote_(env)?)),
+            Val::Region(r) => {
+                Term::Region(r.iter().map(|x| x.quote_(env)).collect::<Result<_, _>>()?)
+            }
+            Val::Cap(c, None, x) => Term::Cap(*c, Box::new(x.quote_(env)?)),
+            Val::Cap(c, Some(r), x) => Term::RegionAnn(
+                r.iter().map(|x| x.quote_(env)).collect::<Result<_, _>>()?,
+                Box::new(Term::Cap(*c, Box::new(x.quote_(env)?))),
+            ),
             Val::Pair(a, b) => Term::Pair(Box::new(a.quote_(env)?), Box::new(b.quote_(env)?)),
             Val::Unknown => Term::Unknown,
             Val::Error => Term::Error,
@@ -374,6 +418,17 @@ impl Term {
                 b.zonk_(cxt, qenv, beta_reduce);
             }
             Term::Cap(_, x) => {
+                x.zonk_(cxt, qenv, beta_reduce);
+            }
+            Term::Region(r) => {
+                r.iter_mut().for_each(|x| {
+                    x.zonk_(cxt, qenv, beta_reduce);
+                });
+            }
+            Term::RegionAnn(r, x) => {
+                r.iter_mut().for_each(|x| {
+                    x.zonk_(cxt, qenv, beta_reduce);
+                });
                 x.zonk_(cxt, qenv, beta_reduce);
             }
             Term::Head(_) | Term::Error | Term::Type | Term::Unknown => (),
@@ -433,7 +488,8 @@ impl VElim {
             (_, Val::Error) => Val::Error,
 
             // Apply functions through caps (for pi types)
-            (s @ VElim::App(_, _), Val::Cap(_, v)) if matches!(*v, Val::Fun { .. }) => {
+            // TODO do we need to do something with this region? it's the function `'self` borrow or whatever
+            (s @ VElim::App(_, _), Val::Cap(_, _, v)) if matches!(*v, Val::Fun { .. }) => {
                 s.elim(Arc::unwrap_or_clone(v))
             }
 
@@ -697,12 +753,18 @@ fn pretty_branch(db: &DB, l: &PCons, v: &Vec<(Icit, Sym)>, t: &Arc<Term>) -> Doc
         }
     }
 }
+fn pretty_region(db: &DB, r: &Region<Term>) -> Doc {
+    if r.is_empty() {
+        Doc::start("'()")
+    } else {
+        Doc::intersperse(r.iter().map(|x| x.pretty(db)), Doc::start(" "))
+    }
+}
 
 impl Pretty for Term {
     fn pretty(&self, db: &DB) -> Doc {
         match self {
-            // TODO how do we get types of local variables for e.g. semantic highlights or hover?
-            Term::Head(Head::Sym(s)) => Doc::start(db.get(s.0)), // + &*format!("@{}", s.1),
+            Term::Head(Head::Sym(s)) => Doc::start(db.get(s.0)),
             Term::Head(Head::Def(d)) => db.idefs.get(*d).name().pretty(db),
             Term::Head(Head::Meta(m)) => m.pretty(db),
             Term::Head(Head::Builtin(b)) => Doc::start(b),
@@ -768,6 +830,8 @@ impl Pretty for Term {
             Term::Unknown => Doc::keyword("??"),
             Term::Error => Doc::keyword("error"),
             Term::Type => Doc::start("Type"),
+            Term::Region(r) => pretty_region(db, r),
+            Term::RegionAnn(r, x) => pretty_region(db, r) + " " + x.pretty(db),
         }
     }
 }

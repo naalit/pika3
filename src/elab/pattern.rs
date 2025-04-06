@@ -79,7 +79,7 @@ fn split_ty(
     cxt: &mut Cxt,
 ) -> Option<Vec<PConsTy>> {
     match &ty.clone().glued().whnf(cxt) {
-        Val::Cap(c, t) => split_ty(var, t, rows, names, cxt).map(|v| {
+        Val::Cap(c, r, t) => split_ty(var, t, rows, names, cxt).map(|v| {
             v.into_iter()
                 .map(
                     |PConsTy {
@@ -90,7 +90,15 @@ fn split_ty(
                         label,
                         var_tys: var_tys
                             .into_iter()
-                            .map(|(i, s, t)| (i, s, Arc::new(Arc::unwrap_or_clone(t).as_cap(*c))))
+                            .map(|(i, s, t)| {
+                                (
+                                    i,
+                                    s,
+                                    Arc::new(
+                                        Arc::unwrap_or_clone(t).as_cap(*c).with_region(r.clone()),
+                                    ),
+                                )
+                            })
                             .collect(),
                         solved_locals,
                     },

@@ -46,6 +46,7 @@ pub enum Tok {
     Arrow,
     WideArrow,
     WavyArrow,
+    SingleQuote,
     Plus,
     Minus,
     Times,
@@ -371,6 +372,7 @@ impl Lexer {
             '@' => self.tok(Tok::At),
             '\\' => self.tok(Tok::Backslash),
             ';' => self.tok(Tok::Newline),
+            '\'' => self.tok(Tok::SingleQuote),
 
             '\n' => {
                 // We're going to emit one or more tokens which might include newline, indent, and dedent
@@ -558,6 +560,7 @@ impl<'i> fmt::Display for Tok {
             Tok::Arrow => "'->'",
             Tok::WideArrow => "'=>'",
             Tok::WavyArrow => "'~>'",
+            Tok::SingleQuote => "region '_",
             Tok::Plus => "'+'",
             Tok::Minus => "'-'",
             Tok::Times => "'*'",

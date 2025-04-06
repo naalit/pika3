@@ -369,8 +369,8 @@ impl Val {
             }) => a.is_owned() || self.clone().app(Val::sym(*s)).is_owned(),
             Val::Fun(VFun { class: Pi(c), .. }) => *c == FCap::Own,
             Val::Fun { .. } => true,
-            Val::Pair(_, _) => unreachable!(),
-            Val::Cap(c, t) => *c != Cap::Imm && t.is_owned(),
+            Val::Pair(_, _) | Val::Region(_) => unreachable!(),
+            Val::Cap(c, _, t) => *c != Cap::Imm && t.is_owned(),
             Val::Unknown => true,
             Val::Error => false,
             Val::Type => false,
@@ -1036,6 +1036,46 @@ impl VElim {
     }
 }
 
+fn unify_regions(
+    r: &Region<Arc<Val>>,
+    r2: &Region<Arc<Val>>,
+    span: Span,
+    cxt: &Cxt,
+    mode: UnfoldState,
+) -> bool {
+    let (mut r, mut r2) = (&**r, &**r2);
+    loop {
+        if r.len() == 0 {
+            return r2.len() == 0;
+        }
+        if r.len() == 1 {
+            return (*r[0]).clone().glued().unify_(
+                Val::Region(r2.to_vec()).glued(),
+                span,
+                cxt,
+                mode,
+            );
+        }
+        if r2.len() == 1 {
+            return Val::Region(r.to_vec()).glued().unify_(
+                (*r2[0]).clone().glued(),
+                span,
+                cxt,
+                mode,
+            );
+        }
+        if !(*r[0])
+            .clone()
+            .glued()
+            .unify_((*r2[0]).clone().glued(), span, cxt, mode)
+        {
+            return false;
+        }
+        r = &r[1..];
+        r2 = &r2[1..];
+    }
+}
+
 impl GVal {
     fn unify(self, other: GVal, span: Span, cxt: &Cxt) -> bool {
         self.unify_(other, span, cxt, UnfoldState::Maybe)
@@ -1080,9 +1120,23 @@ impl GVal {
                         continue;
                     }
                 }
-                (Val::Cap(c, t), Val::Cap(c2, t2)) if *c == *c2 => {
+                (Val::Cap(c, r, t), Val::Cap(c2, r2, t2))
+                    if *c == *c2
+                        && r.as_ref().map_or(r2.is_none(), |r| {
+                            r2.is_some() && unify_regions(r, r2.as_ref().unwrap(), span, cxt, mode)
+                        }) =>
+                {
                     a = (**t).clone().glued();
                     b = (**t2).clone().glued();
+                    continue;
+                }
+                (Val::Region(r), Val::Region(r2)) => unify_regions(r, r2, span, cxt, mode),
+                (Val::Region(v), _) if v.len() == 1 => {
+                    a = (*v[0]).clone().glued();
+                    continue;
+                }
+                (_, Val::Region(v)) if v.len() == 1 => {
+                    b = (*v[0]).clone().glued();
                     continue;
                 }
 
@@ -1268,7 +1322,7 @@ impl SPre {
             },
             Pre::App(fs, x, i) => {
                 let (fr, (mut f, mut fty)) = cxt.record_deps(|| fs.infer(cxt, *i == Expl));
-                let (fc, vfty) = fty.whnf(cxt).uncap();
+                let (fc, fr_, vfty) = fty.whnf(cxt).uncap();
                 let aty = match vfty {
                     Val::Error => Val::Error,
                     // TODO: calling `-1 (+1 t, +0 u) -> ()` with `(+0 t, +0 u)` should be fine, right?
@@ -1515,6 +1569,21 @@ impl SPre {
                     ),
                 )
             }
+            Pre::Region(r) => {
+                let r = r
+                    .iter()
+                    .map(|x| x.check(Val::from(Builtin::Region), cxt))
+                    .collect();
+                (Term::Region(r), Builtin::Region.into())
+            }
+            Pre::RegionAnn(r, x) => {
+                let r = r
+                    .iter()
+                    .map(|x| x.check(Val::from(Builtin::Region), cxt))
+                    .collect();
+                let x = x.check(Val::Type, cxt);
+                (Term::RegionAnn(r, Box::new(x)), Val::Type)
+            }
             // temporary desugaring (eventually we do need the larger structure for method syntax)
             Pre::Dot(lhs, dot, Some((icit, rhs))) => {
                 return S(
@@ -1599,7 +1668,8 @@ impl SPre {
             Pre::Assign(a, b) => {
                 let (a, aty) = a.infer_(cxt, true, Cap::Mut);
                 let ity = match aty.big() {
-                    Val::Cap(Cap::Mut, a) => (**a).clone(),
+                    // TODO check that b region ⊆ r
+                    Val::Cap(Cap::Mut, r, a) => (**a).clone(),
                     Val::Error => Val::Error,
                     _ => unreachable!("hopefully?"),
                 };
@@ -1814,13 +1884,14 @@ impl GVal {
             // Try to coerce if possible
             match (to.whnf(cxt), self.whnf(cxt)) {
                 // demotion is always available
-                (Val::Cap(_, ty), _sty) if !matches!(_sty, Val::Cap(_, _)) => {
+                // TODO track lhs/rhs regions in unification
+                (Val::Cap(_, r_, ty), _sty) if !matches!(_sty, Val::Cap(_, _, _)) => {
                     if (**ty).clone().glued().unify(self.clone(), span, cxt) {
                         cxt.add_deps(r);
                         return;
                     }
                 }
-                (Val::Cap(c1, ty), Val::Cap(c2, sty)) if c2 >= c1 => {
+                (Val::Cap(c1, r1, ty), Val::Cap(c2, r2, sty)) if c2 >= c1 => {
                     if (**ty)
                         .clone()
                         .glued()

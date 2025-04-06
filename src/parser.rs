@@ -1,3 +1,5 @@
+use either::Either;
+
 use crate::common::*;
 use crate::lexer::*;
 
@@ -52,6 +54,8 @@ pub enum Pre {
     Lam(Icit, SPrePat, SPre),
     Do(Vec<PreStmt>, SPre),
     Cap(Cap, SPre),
+    Region(Vec<SPre>),
+    RegionAnn(Vec<SPre>, SPre),
     Assign(SPre, SPre),
     // x.f y
     Dot(SPre, SName, Option<(Icit, SPre)>),
@@ -444,6 +448,33 @@ impl Parser {
                 Box::new(Pre::Cap(Cap::Mut, rest)),
                 Span(start, self.pos_right()),
             );
+        }
+        if self.peek() == Tok::SingleQuote {
+            let mut r = Vec::new();
+            while self.maybe(Tok::SingleQuote) {
+                if self.peek() == Tok::Name {
+                    let x = self.spanned(|s| {
+                        let n = s.name();
+                        Box::new(Pre::Var(s.db.name(&format!("'{}", s.db.get(n)))))
+                    });
+                    r.push(x);
+                } else {
+                    let a = self.atom();
+                    match &**a {
+                        // TODO Pre::Unit => (),
+                        _ => r.push(a),
+                    }
+                }
+            }
+            if self.peek().starts_atom() {
+                let rest = self.app();
+                return S(
+                    Box::new(Pre::RegionAnn(r, rest)),
+                    Span(start, self.pos_right()),
+                );
+            } else {
+                return S(Box::new(Pre::Region(r)), Span(start, self.pos_right()));
+            }
         }
         let mut a = self.atom();
         // make sure we don't get in an infinite loop - stop looking for atoms if we don't consume any input
