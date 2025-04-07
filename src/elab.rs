@@ -71,7 +71,7 @@ pub fn elab_module(file: File, def: Def, db: &DB) -> ModuleElabResult {
                 if !mval
                     .clone()
                     .glued()
-                    .unify((*val).clone().glued(), span, &root_cxt)
+                    .unify(None, (*val).clone().glued(), None, span, &root_cxt)
                 {
                     errors.push(Error {
                         secondary: if let Some(s) = source_map.get(&m) {
@@ -193,7 +193,7 @@ pub fn elab_def(def: Def, db: &DB) -> Option<DefElabResult> {
                 if !ty
                     .clone()
                     .glued()
-                    .unify(ety.clone().glued(), name.span(), &cxt)
+                    .unify(None, ety.clone().glued(), None, name.span(), &cxt)
                 {
                     cxt.err(
                         "definition body has type "
@@ -360,6 +360,7 @@ impl Pretty for MetaSource {
 impl Val {
     fn is_owned(&self) -> bool {
         match self {
+            Val::Neutral(Head::Builtin(Builtin::Region), v) if v.is_empty() => false,
             Val::Neutral(_, _) => true,
             Val::Fun(VFun {
                 class: Sigma(_),
@@ -458,7 +459,7 @@ impl VarResult<'_> {
                     }
                 }
                 // Re-mutate all the mutable borrows in `entry.deps`
-                entry.deps.with(|edeps| {
+                let deps = entry.deps.with(|edeps| {
                     let deps = edeps.iter().cloned().map(|(s, g, m)| {
                         if m {
                             let g = cxt.vars.get(&s).unwrap().borrow_gen.with_mut(|x| {
@@ -489,19 +490,45 @@ impl VarResult<'_> {
                         Deps::from_var(deps.collect(), span)
                     };
                     // TODO is this logic correct?
+                    let vdeps = deps.to_var();
                     cxt.add_deps(deps);
+                    vdeps
                 });
-                (
-                    Term::Head(Head::Sym(entry.sym)),
-                    Arc::new((*entry.ty).clone().as_cap(if is_owned || acap == Cap::Mut {
-                        acap
-                    } else {
-                        Cap::Own
-                    })),
-                )
+                let mut ty = (*entry.ty).clone().as_cap(if is_owned || acap == Cap::Mut {
+                    acap
+                } else {
+                    Cap::Own
+                });
+                if let Val::Cap(_, Some(r), _) = &mut ty {
+                    r.add(deps.into());
+                }
+                (Term::Head(Head::Sym(entry.sym)), Arc::new(ty))
             }
             VarResult::Other(term, ty) => (term, ty),
         }
+    }
+}
+
+type Borrow = (Sym, u32, bool);
+impl<T> From<VDeps> for Region<T> {
+    fn from(borrows: VDeps) -> Self {
+        Region {
+            borrows,
+            values: Vec::new(),
+        }
+    }
+}
+impl VRegion {
+    fn deps(&self) -> VDeps {
+        let mut borrows = self.borrows.clone();
+        for (b, _) in &self.values {
+            for b in b {
+                if !borrows.contains(b) {
+                    borrows.push(*b);
+                }
+            }
+        }
+        borrows
     }
 }
 
@@ -551,11 +578,14 @@ impl Deps {
             }
         }
     }
-    fn to_var(self) -> VDeps {
+    fn to_var(&self) -> VDeps {
         self.deps
-            .into_iter()
-            .map(|(k, (_, vb, vm))| (k, vb, vm))
+            .iter()
+            .map(|(&k, &(_, vb, vm))| (k, vb, vm))
             .collect()
+    }
+    fn region<T>(&self) -> Region<T> {
+        self.to_var().into()
     }
     fn from_var(d: VDeps, span: Span) -> Self {
         Deps {
@@ -989,7 +1019,7 @@ impl VElim {
                 (**x)
                     .clone()
                     .glued()
-                    .unify_((**y).clone().glued(), span, cxt, mode)
+                    .unify_(None, (**y).clone().glued(), None, span, cxt, mode)
             }
             (
                 VElim::Match(branches1, fallback1, env1),
@@ -1011,21 +1041,26 @@ impl VElim {
                         env2.0
                             .insert(s2, Arc::new(Val::Neutral(Head::Sym(s), default())));
                     }
-                    if !t1
-                        .eval(&env1)
-                        .glued()
-                        .unify_(t2.eval(&env2).glued(), span, cxt, mode)
-                    {
+                    if !t1.eval(&env1).glued().unify_(
+                        None,
+                        t2.eval(&env2).glued(),
+                        None,
+                        span,
+                        cxt,
+                        mode,
+                    ) {
                         return false;
                     }
                 }
                 if let Some(fallback1) = fallback1 {
                     let fallback2 = fallback2.as_ref().unwrap();
-                    if !fallback1
-                        .eval(env1)
-                        .glued()
-                        .unify(fallback2.eval(env2).glued(), span, cxt)
-                    {
+                    if !fallback1.eval(env1).glued().unify(
+                        None,
+                        fallback2.eval(env2).glued(),
+                        None,
+                        span,
+                        cxt,
+                    ) {
                         return false;
                     }
                 }
@@ -1036,39 +1071,88 @@ impl VElim {
     }
 }
 
-fn unify_regions(
-    r: &Region<Arc<Val>>,
-    r2: &Region<Arc<Val>>,
-    span: Span,
-    cxt: &Cxt,
-    mode: UnfoldState,
-) -> bool {
-    let (mut r, mut r2) = (&**r, &**r2);
-    loop {
-        if r.len() == 0 {
-            return r2.len() == 0;
+impl VRegion {
+    fn whnf(&mut self, cxt: &Cxt) {
+        let mut i = 0;
+        while i < self.values.len() {
+            let v = (*self.values[i].1).clone();
+            let v = v.glued().whnf(cxt).clone();
+            match v {
+                Val::Region(mut r) => {
+                    self.values.swap_remove(i);
+                    for i in r.borrows {
+                        if !self.borrows.contains(&i) {
+                            self.borrows.push(i);
+                        }
+                    }
+                    self.values.append(&mut r.values);
+                }
+                v => {
+                    self.values[i].1 = Arc::new(v);
+                    i += 1;
+                }
+            }
         }
+    }
+}
+fn unify_regions(r: &VRegion, r2: &VRegion, span: Span, cxt: &Cxt, mode: UnfoldState) -> bool {
+    if mode == UnfoldState::Maybe {
+        return unify_regions(r, r2, span, cxt, UnfoldState::No)
+            || unify_regions(r, r2, span, cxt, UnfoldState::Yes);
+    }
+    let (mut r, mut r2) = (r.clone(), r2.clone());
+    if mode == UnfoldState::Yes {
+        r.whnf(cxt);
+        r2.whnf(cxt);
+    }
+    let b = r
+        .borrows
+        .iter()
+        .copied()
+        .filter(|x| !r2.borrows.contains(x))
+        .collect::<Vec<_>>();
+    let b2 = r2
+        .borrows
+        .iter()
+        .copied()
+        .filter(|x| !r.borrows.contains(x))
+        .collect::<Vec<_>>();
+
+    let (mut r, mut r2) = (&*r.values, &*r2.values);
+    loop {
         if r.len() == 1 {
-            return (*r[0]).clone().glued().unify_(
-                Val::Region(r2.to_vec()).glued(),
+            return (*r[0].1).clone().glued().unify_(
+                None,
+                Val::Region(Region {
+                    borrows: b2,
+                    values: r2.to_vec(),
+                })
+                .glued(),
+                None,
                 span,
                 cxt,
                 mode,
             );
         }
         if r2.len() == 1 {
-            return Val::Region(r.to_vec()).glued().unify_(
-                (*r2[0]).clone().glued(),
-                span,
-                cxt,
-                mode,
-            );
-        }
-        if !(*r[0])
-            .clone()
+            return Val::Region(Region {
+                borrows: b,
+                values: r.to_vec(),
+            })
             .glued()
-            .unify_((*r2[0]).clone().glued(), span, cxt, mode)
-        {
+            .unify_(None, (*r2[0].1).clone().glued(), None, span, cxt, mode);
+        }
+        if r.is_empty() || r2.is_empty() {
+            return r.is_empty() && r2.is_empty() && b.is_empty() && b2.is_empty();
+        }
+        if !(*r[0].1).clone().glued().unify_(
+            None,
+            (*r2[0].1).clone().glued(),
+            None,
+            span,
+            cxt,
+            mode,
+        ) {
             return false;
         }
         r = &r[1..];
@@ -1077,10 +1161,25 @@ fn unify_regions(
 }
 
 impl GVal {
-    fn unify(self, other: GVal, span: Span, cxt: &Cxt) -> bool {
-        self.unify_(other, span, cxt, UnfoldState::Maybe)
+    fn unify(
+        self,
+        ra: impl Into<Option<VRegion>>,
+        other: GVal,
+        rb: impl Into<Option<VRegion>>,
+        span: Span,
+        cxt: &Cxt,
+    ) -> bool {
+        self.unify_(ra.into(), other, rb.into(), span, cxt, UnfoldState::Maybe)
     }
-    fn unify_(self, other: GVal, span: Span, cxt: &Cxt, mut mode: UnfoldState) -> bool {
+    fn unify_(
+        self,
+        mut ra: Option<VRegion>,
+        other: GVal,
+        mut rb: Option<VRegion>,
+        span: Span,
+        cxt: &Cxt,
+        mut mode: UnfoldState,
+    ) -> bool {
         let (mut a, mut b) = (self, other);
         loop {
             if mode == UnfoldState::Yes {
@@ -1107,11 +1206,14 @@ impl GVal {
                 {
                     let s = cxt.scxt().bind(f.psym.0);
                     let arg = Val::Neutral(Head::Sym(s), default());
-                    if !(*f.pty)
-                        .clone()
-                        .glued()
-                        .unify_((*f2.pty).clone().glued(), span, cxt, mode)
-                    {
+                    if !(*f.pty).clone().glued().unify_(
+                        ra.clone(),
+                        (*f2.pty).clone().glued(),
+                        rb.clone(),
+                        span,
+                        cxt,
+                        mode,
+                    ) {
                         false
                     } else {
                         a = a.as_big().app(arg.clone()).glued();
@@ -1131,12 +1233,34 @@ impl GVal {
                     continue;
                 }
                 (Val::Region(r), Val::Region(r2)) => unify_regions(r, r2, span, cxt, mode),
-                (Val::Region(v), _) if v.len() == 1 => {
-                    a = (*v[0]).clone().glued();
+                (Val::Region(r), _) if r.borrows.is_empty() && r.values.len() == 1 => {
+                    a = (*r.values[0].1).clone().glued();
                     continue;
                 }
-                (_, Val::Region(v)) if v.len() == 1 => {
-                    b = (*v[0]).clone().glued();
+                (_, Val::Region(r)) if r.borrows.is_empty() && r.values.len() == 1 => {
+                    b = (*r.values[0].1).clone().glued();
+                    continue;
+                }
+                (Val::Cap(Cap::Own, None, rest), _) => {
+                    a = (**rest).clone().glued();
+                    continue;
+                }
+                (_, Val::Cap(Cap::Own, None, rest)) => {
+                    b = (**rest).clone().glued();
+                    continue;
+                }
+                (Val::Cap(c, Some(r), rest), _)
+                    if rb.is_some() && unify_regions(r, rb.as_ref().unwrap(), span, cxt, mode) =>
+                {
+                    ra = Some(r.clone());
+                    a = Val::Cap(*c, None, rest.clone()).glued();
+                    continue;
+                }
+                (_, Val::Cap(c, Some(r), rest))
+                    if ra.is_some() && unify_regions(ra.as_ref().unwrap(), r, span, cxt, mode) =>
+                {
+                    rb = Some(r.clone());
+                    b = Val::Cap(*c, None, rest.clone()).glued();
                     continue;
                 }
 
@@ -1320,6 +1444,7 @@ impl SPre {
                     (Term::Error, Val::Error)
                 }
             },
+            Pre::Unit => (Builtin::Unit.into(), Builtin::UnitType.into()),
             Pre::App(fs, x, i) => {
                 let (fr, (mut f, mut fty)) = cxt.record_deps(|| fs.infer(cxt, *i == Expl));
                 let (fc, fr_, vfty) = fty.whnf(cxt).uncap();
@@ -1432,16 +1557,18 @@ impl SPre {
                         cxt.set_deps(*s, deps.to_var());
                     }
                 }
-                cxt.add_deps(r);
                 let vx = if can_eval.is_none() {
                     x.eval(cxt.env())
                 } else {
                     Val::Unknown
                 };
-                (
-                    Term::App(Box::new(f), TElim::App(*i, Box::new(x))),
-                    fty.as_small().app(vx),
-                )
+                let rty = fty.as_small().app(vx);
+                if let (_, Some(r), _) = rty.uncap() {
+                    cxt.add_deps(Deps::from_var(r.deps(), self.span()));
+                } else {
+                    cxt.add_deps(r);
+                }
+                (Term::App(Box::new(f), TElim::App(*i, Box::new(x))), rty)
             }
             Pre::Pi(i, n, c, paty, body) => {
                 let q = !cxt.has_uquant();
@@ -1572,17 +1699,19 @@ impl SPre {
             Pre::Region(r) => {
                 let r = r
                     .iter()
-                    .map(|x| x.check(Val::from(Builtin::Region), cxt))
+                    .map(|x| cxt.record_deps(|| x.check(Val::from(Builtin::Region), cxt)))
+                    .map(|(b, x)| (b.to_var(), x))
                     .collect();
-                (Term::Region(r), Builtin::Region.into())
+                (Term::Region(Region::new(r)), Builtin::Region.into())
             }
             Pre::RegionAnn(r, x) => {
                 let r = r
                     .iter()
-                    .map(|x| x.check(Val::from(Builtin::Region), cxt))
+                    .map(|x| cxt.record_deps(|| x.check(Val::from(Builtin::Region), cxt)))
+                    .map(|(b, x)| (b.to_var(), x))
                     .collect();
                 let x = x.check(Val::Type, cxt);
-                (Term::RegionAnn(r, Box::new(x)), Val::Type)
+                (Term::RegionAnn(Region::new(r), Box::new(x)), Val::Type)
             }
             // temporary desugaring (eventually we do need the larger structure for method syntax)
             Pre::Dot(lhs, dot, Some((icit, rhs))) => {
@@ -1708,7 +1837,8 @@ impl SPre {
 
     fn check(&self, ty: impl Into<GVal>, cxt: &Cxt) -> Term {
         let mut ty: GVal = ty.into();
-        match (&***self, ty.whnf(cxt)) {
+        let (tcap, treg, t) = ty.whnf(cxt).uncap();
+        let r = match (&***self, t) {
             (
                 Pre::Lam(i, pat, body),
                 Val::Fun(VFun {
@@ -1814,7 +1944,8 @@ impl SPre {
                 let b = b.check(rty, cxt);
                 Term::Pair(Box::new(a), Box::new(b))
             }
-            (Pre::Do(block, last), _) => elab_block(block, last, Some(ty), cxt).0,
+            (Pre::Do(block, last), _) => return elab_block(block, last, Some(ty), cxt).0,
+            (Pre::Unit, Val::Type) => Builtin::UnitType.into(),
 
             // insert lambda when checking (non-implicit lambda) against implicit function type
             (
@@ -1869,33 +2000,105 @@ impl SPre {
                                 ..
                             })
                         ),
-                        ty.big().cap(),
+                        tcap,
                     )
                 });
                 sty.coerce(ty, r, self.span(), cxt);
-                s
+                return s;
+            }
+        };
+        if let Some(treg) = treg {
+            let creg = cxt.current_deps.with(|d| d.region());
+            if !coerce_region(&creg, &treg, self.span(), cxt) {
+                cxt.err(
+                    "could not match regions: expected "
+                        + Val::Region(treg).pretty(&cxt.db)
+                        + ", found "
+                        + Val::Region(creg).pretty(&cxt.db),
+                    self.span(),
+                );
             }
         }
+        r
     }
+}
+fn coerce_region(from: &VRegion, to: &VRegion, span: Span, cxt: &Cxt) -> bool {
+    for borrow in &from.borrows {
+        if !to.borrows.contains(borrow) {
+            return false;
+        }
+    }
+    for (b, v) in &from.values {
+        // TODO this should work but doesn't for like region parameters
+        // maybe b should be an Option?
+        // if b.iter().all(|b| to.borrows.contains(b)) {
+        //     continue;
+        // }
+        if to.values.iter().any(|(_, v2)| {
+            (**v)
+                .clone()
+                .glued()
+                .unify(None, (**v2).clone().glued(), None, span, cxt)
+        }) {
+            continue;
+        } else {
+            return false;
+        }
+    }
+    true
 }
 impl GVal {
     fn coerce(mut self, mut to: GVal, r: Deps, span: Span, cxt: &Cxt) {
-        if !to.clone().unify(self.clone(), span, cxt) {
+        let r = Deps::from_var(
+            self.big().uncap().1.unwrap_or_else(|| r.region()).deps(),
+            span,
+        );
+        if !to.clone().unify(None, self.clone(), r.region(), span, cxt) {
             // Try to coerce if possible
             match (to.whnf(cxt), self.whnf(cxt)) {
                 // demotion is always available
                 // TODO track lhs/rhs regions in unification
-                (Val::Cap(_, r_, ty), _sty) if !matches!(_sty, Val::Cap(_, _, _)) => {
-                    if (**ty).clone().glued().unify(self.clone(), span, cxt) {
+                (Val::Cap(_, r1, ty), _sty) if !matches!(_sty, Val::Cap(_, _, _)) => {
+                    if r1
+                        .as_ref()
+                        .map_or(true, |r1| coerce_region(&r.region(), r1, span, cxt))
+                        && (**ty).clone().glued().unify(
+                            r1.clone(),
+                            self.clone(),
+                            r.region(),
+                            span,
+                            cxt,
+                        )
+                    {
                         cxt.add_deps(r);
                         return;
                     }
                 }
                 (Val::Cap(c1, r1, ty), Val::Cap(c2, r2, sty)) if c2 >= c1 => {
+                    if (r1.is_none()
+                        || coerce_region(
+                            &r2.clone().unwrap_or_else(|| r.region()),
+                            r1.as_ref().unwrap(),
+                            span,
+                            cxt,
+                        ))
+                        && (**ty).clone().glued().unify(
+                            r1.clone(),
+                            (**sty).clone().glued(),
+                            r2.clone().or_else(|| Some(r.region())),
+                            span,
+                            cxt,
+                        )
+                    {
+                        cxt.add_deps(r);
+                        return;
+                    }
+                }
+                (_ity, Val::Cap(Cap::Own, r1, ty)) if !matches!(_ity, Val::Cap(_, _, _)) => {
                     if (**ty)
                         .clone()
                         .glued()
-                        .unify((**sty).clone().glued(), span, cxt)
+                        .unify(r1.clone(), to.clone(), None, span, cxt)
                     {
                         cxt.add_deps(r);
                         return;
@@ -1908,6 +2111,11 @@ impl GVal {
                 "could not match types: expected "
                     + to.small().zonk(cxt, true).pretty(&cxt.db)
                     + ", found "
+                    + if to.small().uncap().1.is_some() && !self.small().uncap().1.is_some() {
+                        Val::Region(r.region()).pretty(&cxt.db) + " "
+                    } else {
+                        Doc::none()
+                    }
                     + self.small().zonk(cxt, true).pretty(&cxt.db),
                 span,
             );

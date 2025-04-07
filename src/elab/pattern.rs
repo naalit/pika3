@@ -192,10 +192,13 @@ fn split_ty(
                                 _ => break,
                             }
                         }
-                        if !cty
-                            .glued()
-                            .unify(ty.clone().glued(), cxt.errors.span.span(), cxt)
-                        {
+                        if !cty.glued().unify(
+                            None,
+                            ty.clone().glued(),
+                            None,
+                            cxt.errors.span.span(),
+                            cxt,
+                        ) {
                             eprintln!(
                                 "ruling out cons {} for type {}",
                                 cons.pretty(&cxt.db),
@@ -450,7 +453,11 @@ impl PRow {
                 }
                 IPat::Var(m, n, Some(paty)) => {
                     let aty = cxt.as_eval(|| paty.check(Val::Type, cxt)).eval(cxt.env());
-                    if !aty.clone().glued().unify((*t).clone().glued(), pat.1, cxt) {
+                    if !aty
+                        .clone()
+                        .glued()
+                        .unify(None, (*t).clone().glued(), None, pat.1, cxt)
+                    {
                         cxt.err(
                             Doc::start("mismatched types: pattern has type ")
                                 + aty.pretty(&cxt.db)
@@ -609,10 +616,13 @@ fn compile_rows(rows: &[PRow], pcxt: &mut PCxt, state: &PState, cxt: &Cxt) -> PT
                     .all(|((m1, n1, _, t1), (m2, n2, _, t2, _))| {
                         m1 == m2
                             && n1 == n2
-                            && (**t1)
-                                .clone()
-                                .glued()
-                                .unify((**t2).clone().glued(), pcxt.span, cxt)
+                            && (**t1).clone().glued().unify(
+                                None,
+                                (**t2).clone().glued(),
+                                None,
+                                pcxt.span,
+                                cxt,
+                            )
                     })
             {
                 cxt.err(

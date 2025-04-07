@@ -60,6 +60,7 @@ pub enum Pre {
     // x.f y
     Dot(SPre, SName, Option<(Icit, SPre)>),
     Case(SPre, Vec<(SPrePat, SPre)>),
+    Unit,
     Error,
 }
 pub type SPre = S<Box<Pre>>;
@@ -286,6 +287,10 @@ impl Parser {
             Pre::Binder(lhs, rhs) => {
                 match &***lhs {
                     Pre::Var(name) => (Some(S(*name, lhs.span())), rhs.clone()),
+                    Pre::Region(v) if v.len() == 1 => match &**v[0] {
+                        Pre::Var(name) => (Some(S(*name, lhs.span())), rhs.clone()),
+                        _ => (None, param),
+                    },
                     // TODO what's the correct thing to do here? what happens to the below error case with this branch present
                     _ => (None, param),
                     _ => {
@@ -379,6 +384,9 @@ impl Parser {
                 Tok::Name => Pre::Var(s.name()),
                 Tok::POpen => {
                     s.next();
+                    if s.maybe(Tok::PClose) {
+                        return Box::new(Pre::Unit);
+                    }
                     let t = s.term();
                     s.expect(Tok::PClose);
                     *t.0
@@ -461,7 +469,7 @@ impl Parser {
                 } else {
                     let a = self.atom();
                     match &**a {
-                        // TODO Pre::Unit => (),
+                        Pre::Unit => (),
                         _ => r.push(a),
                     }
                 }
