@@ -829,7 +829,7 @@ impl PMatch {
         self.pcxt.bodies[body as usize].reached
     }
 
-    pub fn bind(&self, body: u32, deps: &VDeps, cxt: &Cxt) -> Cxt {
+    pub fn bind(&self, body: u32, deps: &Region, cxt: &Cxt) -> Cxt {
         let mut cxt = cxt.clone();
         for (m, name, sym, ty) in &self.pcxt.bodies[body as usize].vars {
             if *sym == self.pcxt.var {

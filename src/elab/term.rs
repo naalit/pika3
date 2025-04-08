@@ -57,33 +57,111 @@ pub enum Head {
     Builtin(Builtin),
 }
 
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct Borrow {
+    pub sym: Sym,
+    pub span: Span,
+    pub imm_gen: u32,
+    pub mut_gen: Option<u32>,
+}
+impl Borrow {
+    pub fn mutable(&self) -> bool {
+        self.mut_gen.is_some()
+    }
+}
 // TODO switch to Vec<(Borrow, Option<T>)> or similar
 #[derive(Clone, Debug, PartialEq, Educe)]
 #[educe(Default)]
-pub struct Region<T> {
-    pub borrows: Vec<Borrow>,
-    pub values: Vec<(Vec<Borrow>, T)>,
+pub struct Region {
+    pub borrows: FxHashMap<Sym, Borrow>,
+    pub values: Vec<Arc<Val>>,
 }
-impl<T> Region<T> {
+impl Region {
     pub fn is_empty(&self) -> bool {
         self.borrows.is_empty() && self.values.is_empty()
     }
-    pub fn new(values: Vec<(VDeps, T)>) -> Self {
+    pub fn new(base: &Region, values: Vec<Arc<Val>>) -> Self {
         Region {
-            borrows: Vec::new(),
+            borrows: base.borrows.clone(),
             values,
         }
     }
-    pub fn add(&mut self, mut other: Region<T>) {
-        for i in other.borrows {
-            if !self.borrows.contains(&i) {
-                self.borrows.push(i);
+    pub fn add(&mut self, other: Region) {
+        self.values
+            .extend(other.values.into_iter().filter_map(|v| match &*v {
+                Val::Borrow(b) => {
+                    let b: Vec<_> = b
+                        .iter()
+                        .copied()
+                        .filter(|b| !self.borrows.contains_key(&b.sym))
+                        .collect();
+                    if b.is_empty() {
+                        None
+                    } else {
+                        Some(Arc::new(Val::Borrow(b)))
+                    }
+                }
+                _ => Some(v),
+            }));
+        for (k, v) in other.borrows {
+            match self.borrows.get_mut(&k) {
+                None => {
+                    self.borrows.insert(k, v);
+                }
+                Some(v2) => {
+                    // the oldest one is the one that matters
+                    v2.imm_gen = v.imm_gen.min(v2.imm_gen);
+                    v2.mut_gen = v
+                        .mut_gen
+                        .map(|i| v2.mut_gen.map_or(i, |j| i.min(j)))
+                        .or(v2.mut_gen);
+                }
             }
         }
-        self.values.append(&mut other.values)
+    }
+    pub fn borrows(&self) -> Box<dyn Iterator<Item = &Borrow> + '_> {
+        Box::new(
+            self.borrows.values(), // .chain(self.values.iter().flat_map(|(r, _)| r.borrows())),
+        )
+    }
+    pub fn borrows_mut(&mut self) -> Box<dyn Iterator<Item = &mut Borrow> + '_> {
+        Box::new(
+            self.borrows.values_mut(), // .chain(self.values.iter_mut().flat_map(|(r, _)| r.borrows_mut())),
+        )
     }
 }
-pub type VRegion = Region<Arc<Val>>;
+impl Region {
+    pub fn from_val(values: Vec<Arc<Val>>, base: &Region) -> Self {
+        let mut r = Region::default();
+        let mut any_unknown = false;
+        for i in values {
+            match &*i {
+                Val::Region(v) => r.add(Region::from_val(v.clone(), base)),
+                Val::Borrow(b) => {
+                    for &i in b {
+                        r.add(i.into());
+                    }
+                }
+                _ => {
+                    r.values.push(i);
+                    any_unknown = true;
+                }
+            }
+        }
+        if any_unknown {
+            r.add(base.clone());
+        }
+        r
+    }
+}
+impl From<Borrow> for Region {
+    fn from(value: Borrow) -> Self {
+        Region {
+            borrows: std::iter::once((value.sym, value)).collect(),
+            values: vec![Arc::new(Val::Borrow(vec![value]))],
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Term {
@@ -94,8 +172,9 @@ pub enum Term {
     Pair(Box<Term>, Box<Term>),
     Cap(Cap, Box<Term>),
     Assign(Box<Term>, Box<Term>),
-    Region(Region<Term>),
-    RegionAnn(Region<Term>, Box<Term>),
+    Region(Vec<Term>),
+    RegionAnn(Box<Term>, Box<Term>),
+    Borrow(Vec<Borrow>),
     Unknown,
     Error,
     Type,
@@ -124,8 +203,9 @@ pub enum Val {
     Neutral(Head, Spine),
     Fun(VFun),
     Pair(Arc<Val>, Arc<Val>),
-    Cap(Cap, Option<Region<Arc<Val>>>, Arc<Val>),
-    Region(Region<Arc<Val>>),
+    Cap(Cap, Option<Vec<Arc<Val>>>, Arc<Val>),
+    Region(Vec<Arc<Val>>),
+    Borrow(Vec<Borrow>),
     Unknown,
     Error,
     Type,
@@ -143,14 +223,20 @@ impl Val {
             _ => Val::Cap(c, None, Arc::new(self)),
         }
     }
-    pub fn with_region(self, r: Option<Region<Arc<Val>>>) -> Val {
+    fn unregion(self) -> Vec<Arc<Val>> {
+        match self {
+            Val::Region(r) => r,
+            _ => vec![Arc::new(self)],
+        }
+    }
+    pub fn with_region(self, r: Option<Vec<Arc<Val>>>) -> Val {
         match self {
             Val::Cap(e, r2, rest) if r.is_none() => Val::Cap(e, r2, rest),
             Val::Cap(e, _, rest) => Val::Cap(e, r, rest),
             _ => Val::Cap(Cap::Own, r, Arc::new(self)),
         }
     }
-    pub fn uncap(&self) -> (Cap, Option<Region<Arc<Val>>>, &Val) {
+    pub fn uncap(&self) -> (Cap, Option<Vec<Arc<Val>>>, &Val) {
         match self {
             Val::Cap(c, r, rest) => (*c, r.clone(), rest),
             _ => (Cap::Own, None, self),
@@ -269,26 +355,6 @@ impl Val {
         VElim::App(Expl, Arc::new(other)).elim(self)
     }
 }
-impl Region<Term> {
-    pub fn eval(&self, env: &Env) -> Region<Arc<Val>> {
-        let mut borrows = self.borrows.clone();
-        let mut values = Vec::new();
-        for (b, v) in &self.values {
-            match v.eval(env) {
-                Val::Region(mut r) => {
-                    for b in &r.borrows {
-                        if !borrows.contains(b) {
-                            borrows.push(*b);
-                        }
-                    }
-                    values.append(&mut r.values);
-                }
-                v => values.push((b.clone(), Arc::new(v))),
-            }
-        }
-        Region { borrows, values }
-    }
-}
 impl Term {
     pub fn eval(&self, env: &Env) -> Val {
         with_stack(|| match self {
@@ -299,9 +365,18 @@ impl Term {
             Term::Cap(c, x) => x.eval(env).as_cap(*c),
             Term::Pair(a, b) => Val::Pair(Arc::new(a.eval(env)), Arc::new(b.eval(env))),
             Term::Assign(_, _) => panic!("L0-evaluating term with mutation"),
-            // TODO combine regions
-            Term::Region(r) => Val::Region(r.eval(env)),
-            Term::RegionAnn(r, x) => x.eval(env).with_region(Some(r.eval(env))),
+            Term::Region(r) => {
+                let mut v = Vec::new();
+                for i in r {
+                    match i.eval(env) {
+                        Val::Region(mut r) => v.append(&mut r),
+                        i => v.push(Arc::new(i)),
+                    }
+                }
+                Val::Region(v)
+            }
+            Term::RegionAnn(r, x) => x.eval(env).with_region(Some(r.eval(env).unregion())),
+            Term::Borrow(b) => Val::Borrow(b.clone()),
             Term::Unknown => Val::Unknown,
             Term::Error => Val::Error,
             Term::Type => Val::Type,
@@ -360,18 +435,6 @@ impl SEnv {
     }
 }
 
-impl Region<Term> {
-    fn subst(&self, env: &SEnv) -> Result<Region<Term>, Sym> {
-        Ok(Region {
-            borrows: self.borrows.clone(),
-            values: self
-                .values
-                .iter()
-                .map(|(b, x)| Ok((b.clone(), x.subst(env)?)))
-                .collect::<Result<_, _>>()?,
-        })
-    }
-}
 impl Term {
     fn subst(&self, env: &SEnv) -> Result<Term, Sym> {
         Ok(match self {
@@ -382,8 +445,13 @@ impl Term {
             Term::Cap(c, x) => Term::Cap(*c, Box::new(x.subst(env)?)),
             Term::Pair(a, b) => Term::Pair(Box::new(a.subst(env)?), Box::new(b.subst(env)?)),
             Term::Assign(a, b) => Term::Assign(Box::new(a.subst(env)?), Box::new(b.subst(env)?)),
-            Term::Region(r) => Term::Region(r.subst(env)?),
-            Term::RegionAnn(r, x) => Term::RegionAnn(r.subst(env)?, Box::new(x.subst(env)?)),
+            Term::Region(r) => {
+                Term::Region(r.iter().map(|x| x.subst(env)).collect::<Result<_, _>>()?)
+            }
+            Term::RegionAnn(r, x) => {
+                Term::RegionAnn(Box::new(r.subst(env)?), Box::new(x.subst(env)?))
+            }
+            Term::Borrow(b) => Term::Borrow(b.clone()),
             Term::Unknown => Term::Unknown,
             Term::Error => Term::Error,
             Term::Type => Term::Type,
@@ -391,18 +459,6 @@ impl Term {
     }
 }
 
-impl Region<Arc<Val>> {
-    fn quote_(&self, env: &QEnv) -> Result<Region<Term>, Sym> {
-        Ok(Region {
-            borrows: self.borrows.clone(),
-            values: self
-                .values
-                .iter()
-                .map(|(b, x)| Ok((b.clone(), x.quote_(env)?)))
-                .collect::<Result<_, _>>()?,
-        })
-    }
-}
 impl Val {
     pub(super) fn quote(&self, env: &QEnv) -> Term {
         self.quote_(env).unwrap_or_else(|s| {
@@ -432,13 +488,19 @@ impl Val {
                 |acc, x| Ok(Term::App(Box::new(acc?), x.quote_(env)?)),
             )?,
             Val::Fun(f) => Term::Fun(f.quote_(env)?),
-            Val::Region(r) => Term::Region(r.quote_(env)?),
+            Val::Region(r) => {
+                Term::Region(r.iter().map(|x| x.quote_(env)).collect::<Result<_, _>>()?)
+            }
             Val::Cap(c, None, x) => Term::Cap(*c, Box::new(x.quote_(env)?)),
             Val::Cap(c, Some(r), x) => Term::RegionAnn(
-                r.quote_(env)?,
+                // TODO skip the Region layer for one element?
+                Box::new(Term::Region(
+                    r.iter().map(|x| x.quote_(env)).collect::<Result<_, _>>()?,
+                )),
                 Box::new(Term::Cap(*c, Box::new(x.quote_(env)?))),
             ),
             Val::Pair(a, b) => Term::Pair(Box::new(a.quote_(env)?), Box::new(b.quote_(env)?)),
+            Val::Borrow(b) => Term::Borrow(b.clone()),
             Val::Unknown => Term::Unknown,
             Val::Error => Term::Error,
             Val::Type => Term::Type,
@@ -484,17 +546,15 @@ impl Term {
                 x.zonk_(cxt, qenv, beta_reduce);
             }
             Term::Region(r) => {
-                r.values.iter_mut().for_each(|(_, x)| {
+                r.iter_mut().for_each(|x| {
                     x.zonk_(cxt, qenv, beta_reduce);
                 });
             }
             Term::RegionAnn(r, x) => {
-                r.values.iter_mut().for_each(|(_, x)| {
-                    x.zonk_(cxt, qenv, beta_reduce);
-                });
+                r.zonk_(cxt, qenv, beta_reduce);
                 x.zonk_(cxt, qenv, beta_reduce);
             }
-            Term::Head(_) | Term::Error | Term::Type | Term::Unknown => (),
+            Term::Head(_) | Term::Borrow(_) | Term::Error | Term::Type | Term::Unknown => (),
         }
         false
     }
@@ -677,6 +737,10 @@ impl Val {
     }
     fn maybe_whnf(&self, cxt: &Cxt) -> Option<Val> {
         match self {
+            // We do need to whnf in caps because we call `.whnf().uncap()` and that needs to work
+            Val::Cap(c, r, x) => x
+                .maybe_whnf(cxt)
+                .map(|x| Val::Cap(*c, r.clone(), Arc::new(x))),
             Val::Neutral(h, spine) => {
                 if let Some(val) = match h {
                     Head::Def(d) => {
@@ -816,16 +880,13 @@ fn pretty_branch(db: &DB, l: &PCons, v: &Vec<(Icit, Sym)>, t: &Arc<Term>) -> Doc
         }
     }
 }
-fn pretty_region(db: &DB, r: &Region<Term>) -> Doc {
+fn pretty_region(db: &DB, r: &Vec<Term>) -> Doc {
     if r.is_empty() {
         Doc::start("'()")
     } else {
+        // TODO '(x) when necessary
         Doc::intersperse(
-            r.borrows
-                .iter()
-                .map(|(s, _, _)| "'" + Doc::start(db.get(s.0)) + "$")
-                // TODO '(x) when necessary
-                .chain(r.values.iter().map(|(_, v)| v.pretty(db).nest(Prec::Atom))),
+            r.iter().map(|v| v.pretty(db).nest(Prec::Atom)),
             Doc::start(" "),
         )
     }
@@ -913,8 +974,12 @@ impl Pretty for Term {
             Term::Region(r) => pretty_region(db, r),
             // TODO parens on `'a ('b t)`
             Term::RegionAnn(r, x) => {
-                (pretty_region(db, r) + " " + x.pretty(db).nest(Prec::App)).prec(Prec::App)
+                (r.pretty(db) + " " + x.pretty(db).nest(Prec::App)).prec(Prec::App)
             }
+            Term::Borrow(v) => ("'("
+                + Doc::intersperse(v.iter().map(|x| "&" + x.sym.0.pretty(db)), Doc::start(" "))
+                + ")")
+                .prec(Prec::Atom),
         }
     }
 }

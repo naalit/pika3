@@ -184,7 +184,9 @@ pub fn elab_def(def: Def, db: &DB) -> Option<DefElabResult> {
                 );
             }
 
-            cxt.current_deps.take().check(&cxt);
+            cxt.current_deps
+                .take()
+                .check(&cxt, value.as_ref().map_or(name.span(), |x| x.span()));
 
             body.as_mut().map(|x| x.zonk(&cxt, false));
             let ty = ty.zonk(&cxt, true);
@@ -370,7 +372,7 @@ impl Val {
             }) => a.is_owned() || self.clone().app(Val::sym(*s)).is_owned(),
             Val::Fun(VFun { class: Pi(c), .. }) => *c == FCap::Own,
             Val::Fun { .. } => true,
-            Val::Pair(_, _) | Val::Region(_) => unreachable!(),
+            Val::Pair(_, _) | Val::Region(_) | Val::Borrow(_) => unreachable!(),
             Val::Cap(c, _, t) => *c != Cap::Imm && t.is_owned(),
             Val::Unknown => true,
             Val::Error => false,
@@ -385,8 +387,9 @@ struct VarEntry {
     sym: Sym,
     ty: Arc<Val>,
     invalidated: Ref<Option<Span>>,
-    deps: Ref<VDeps>,
-    borrow_gen: Ref<(u32, Span)>,
+    deps: Ref<Region>,
+    borrow_gen_imm: Ref<(u32, Span)>,
+    borrow_gen_mut: Ref<(u32, Span)>,
     mutable: bool,
 }
 enum VarResult<'a> {
@@ -425,8 +428,9 @@ impl VarResult<'_> {
                         entry.invalidated.set(Some(span));
                     }
                     if cap >= Cap::Mut {
-                        entry.borrow_gen.with_mut(|x| *x = (x.0 + 1, span));
+                        entry.borrow_gen_imm.with_mut(|x| *x = (x.0 + 1, span));
                     }
+                    entry.borrow_gen_mut.with_mut(|x| *x = (x.0 + 1, span));
                 }
                 if entry.mutable && cxt.can_eval.with(Option::is_none) {
                     cxt.can_eval.set(Some(span));
@@ -459,40 +463,46 @@ impl VarResult<'_> {
                     }
                 }
                 // Re-mutate all the mutable borrows in `entry.deps`
+                // TODO we re-access immutably too right
                 let deps = entry.deps.with(|edeps| {
-                    let deps = edeps.iter().cloned().map(|(s, g, m)| {
-                        if m {
-                            let g = cxt.vars.get(&s).unwrap().borrow_gen.with_mut(|x| {
+                    let mut deps = edeps.clone();
+                    for (s, v) in deps.borrows.iter_mut() {
+                        cxt.vars.get(s).unwrap().borrow_gen_mut.with_mut(|x| {
+                            let g = {
+                                *x = (x.0 + 1, span);
+                                x.0
+                            };
+                            if let Some(m) = &mut v.mut_gen {
                                 // don't suppress borrow errors though
-                                if x.0 == g {
+                                if *m == g - 1 {
+                                    *m = g;
+                                }
+                            }
+                        });
+                        if v.mutable() {
+                            cxt.vars.get(s).unwrap().borrow_gen_imm.with_mut(|x| {
+                                let g = {
                                     *x = (x.0 + 1, span);
                                     x.0
-                                } else {
-                                    g
+                                };
+                                // don't suppress borrow errors though
+                                if v.imm_gen == g - 1 {
+                                    v.imm_gen = g;
                                 }
                             });
-                            (s, g, m)
-                        } else {
-                            (s, g, m)
                         }
-                    });
-                    let deps = if is_owned && acap < Cap::Own {
-                        Deps::from_var(
-                            deps.chain(std::iter::once((
-                                entry.sym,
-                                entry.borrow_gen.get().0,
-                                acap == Cap::Mut,
-                            )))
-                            .collect(),
+                    }
+                    if is_owned && acap < Cap::Own {
+                        deps.add(Region::from(Borrow {
+                            sym: entry.sym,
                             span,
-                        )
-                    } else {
-                        Deps::from_var(deps.collect(), span)
-                    };
+                            imm_gen: entry.borrow_gen_imm.get().0,
+                            mut_gen: (acap == Cap::Mut).then(|| entry.borrow_gen_mut.get().0),
+                        }));
+                    }
                     // TODO is this logic correct?
-                    let vdeps = deps.to_var();
-                    cxt.add_deps(deps);
-                    vdeps
+                    cxt.add_deps(deps.clone());
+                    deps
                 });
                 let mut ty = (*entry.ty).clone().as_cap(if is_owned || acap == Cap::Mut {
                     acap
@@ -500,7 +510,7 @@ impl VarResult<'_> {
                     Cap::Own
                 });
                 if let Val::Cap(_, Some(r), _) = &mut ty {
-                    r.add(deps.into());
+                    r.extend(deps.values);
                 }
                 (Term::Head(Head::Sym(entry.sym)), Arc::new(ty))
             }
@@ -509,91 +519,60 @@ impl VarResult<'_> {
     }
 }
 
-type Borrow = (Sym, u32, bool);
-impl<T> From<VDeps> for Region<T> {
-    fn from(borrows: VDeps) -> Self {
-        Region {
-            borrows,
-            values: Vec::new(),
-        }
-    }
-}
-impl VRegion {
-    fn deps(&self) -> VDeps {
-        let mut borrows = self.borrows.clone();
-        for (b, _) in &self.values {
-            for b in b {
-                if !borrows.contains(b) {
-                    borrows.push(*b);
-                }
-            }
-        }
-        borrows
-    }
-}
-
-type VDeps = Vec<(Sym, u32, bool)>;
-#[derive(Default, Clone)]
-struct Deps {
-    // (span, level, borrow generation, mutable)
-    deps: FxHashMap<Sym, (Span, u32, bool)>,
-}
-impl Deps {
-    fn check(&self, cxt: &Cxt) {
-        for (s, (span, b, _)) in &self.deps {
+impl Region {
+    /// returns whether we're okay
+    fn check(&self, cxt: &Cxt, span: Span) -> bool {
+        let mut okay = true;
+        for (s, b) in &self.borrows {
             if let Some(e) = cxt.vars.get(&s) {
-                if e.borrow_gen.get().0 > *b {
+                if e.borrow_gen_imm.get().0 > b.imm_gen {
+                    okay = false;
                     cxt.errors.push(
                         Error::simple(
                             "this expression borrows "
                                 + s.0.pretty(&cxt.db)
                                 + " which has been mutated or consumed",
-                            *span,
+                            span,
                         )
                         .with_secondary(Label {
-                            span: e.borrow_gen.get().1,
+                            span: e.borrow_gen_imm.get().1,
                             message: s.0.pretty(&cxt.db) + " was mutated or consumed here",
                             color: Some(Doc::COLOR2),
+                        })
+                        .with_secondary(Label {
+                            span: b.span,
+                            message: s.0.pretty(&cxt.db) + " was borrowed here",
+                            color: Some(Doc::COLOR3),
                         }),
                     );
                 }
+                if let Some(g) = b.mut_gen {
+                    if e.borrow_gen_mut.get().0 > g {
+                        okay = false;
+                        cxt.errors.push(
+                            Error::simple(
+                                "cannot access "
+                                    + s.0.pretty(&cxt.db)
+                                    + " while it is mutably borrowed",
+                                e.borrow_gen_mut.get().1,
+                            )
+                            .with_secondary(Label {
+                                span: b.span,
+                                message: s.0.pretty(&cxt.db) + " mutable borrow later used here",
+                                color: Some(Doc::COLOR2),
+                            }),
+                        );
+                    }
+                }
             } else {
+                okay = false;
                 cxt.errors.push(Error::simple(
                     "internal error: couldnt find " + s.0.pretty(&cxt.db),
-                    *span,
+                    b.span,
                 ));
             }
         }
-    }
-    fn add(&mut self, other: Deps) {
-        for (s, (span, vb, vm)) in other.deps {
-            match self.deps.get_mut(&s) {
-                None => {
-                    self.deps.insert(s, (span, vb, vm));
-                }
-                Some((_, b, m)) => {
-                    *b = vb.min(*b);
-                    *m |= vm;
-                }
-            }
-        }
-    }
-    fn to_var(&self) -> VDeps {
-        self.deps
-            .iter()
-            .map(|(&k, &(_, vb, vm))| (k, vb, vm))
-            .collect()
-    }
-    fn region<T>(&self) -> Region<T> {
-        self.to_var().into()
-    }
-    fn from_var(d: VDeps, span: Span) -> Self {
-        Deps {
-            deps: d
-                .into_iter()
-                .map(|(k, vb, vm)| (k, (span, vb, vm)))
-                .collect(),
-        }
+        okay
     }
 }
 
@@ -608,7 +587,7 @@ struct Cxt {
     env: SEnv,
     uquant_stack: Ref<Vec<Vec<(Sym, Arc<Val>)>>>,
     closure_stack: Vec<(Arc<FxHashSet<Sym>>, Ref<FxHashMap<Sym, (Span, Cap)>>)>,
-    current_deps: Ref<Deps>,
+    current_deps: Ref<Region>,
     can_eval: Ref<Option<Span>>,
     errors: Errors,
 }
@@ -691,10 +670,10 @@ impl Cxt {
         (self.can_eval.set(old), r)
     }
 
-    fn add_deps(&self, deps: Deps) {
+    fn add_deps(&self, deps: Region) {
         self.current_deps.with_mut(|t| t.add(deps))
     }
-    fn record_deps<R>(&self, f: impl FnOnce() -> R) -> (Deps, R) {
+    fn record_deps<R>(&self, f: impl FnOnce() -> R) -> (Region, R) {
         let before = self.current_deps.take();
         let r = f();
         (self.current_deps.set(before), r)
@@ -770,11 +749,11 @@ impl Cxt {
             panic!("call can_solve first")
         }
     }
-    fn get_deps(&self, s: Sym) -> VDeps {
+    fn get_deps(&self, s: Sym) -> Region {
         let e = self.vars.get(&s).unwrap();
         e.deps.with(Clone::clone)
     }
-    fn set_deps(&self, s: Sym, deps: VDeps) {
+    fn set_deps(&self, s: Sym, deps: Region) {
         let e = self.vars.get(&s).unwrap();
         e.deps.set(deps);
     }
@@ -805,7 +784,8 @@ impl Cxt {
                         invalidated: default(),
                         ty: ty.into(),
                         deps: default(),
-                        borrow_gen: (0, Span(0, 0)).into(),
+                        borrow_gen_imm: (0, Span(0, 0)).into(),
+                        borrow_gen_mut: (0, Span(0, 0)).into(),
                         mutable: false,
                     },
                 )
@@ -1071,63 +1051,28 @@ impl VElim {
     }
 }
 
-impl VRegion {
-    fn whnf(&mut self, cxt: &Cxt) {
-        let mut i = 0;
-        while i < self.values.len() {
-            let v = (*self.values[i].1).clone();
-            let v = v.glued().whnf(cxt).clone();
-            match v {
-                Val::Region(mut r) => {
-                    self.values.swap_remove(i);
-                    for i in r.borrows {
-                        if !self.borrows.contains(&i) {
-                            self.borrows.push(i);
-                        }
-                    }
-                    self.values.append(&mut r.values);
-                }
-                v => {
-                    self.values[i].1 = Arc::new(v);
-                    i += 1;
-                }
-            }
-        }
-    }
-}
-fn unify_regions(r: &VRegion, r2: &VRegion, span: Span, cxt: &Cxt, mode: UnfoldState) -> bool {
-    if mode == UnfoldState::Maybe {
-        return unify_regions(r, r2, span, cxt, UnfoldState::No)
-            || unify_regions(r, r2, span, cxt, UnfoldState::Yes);
-    }
+fn unify_regions(
+    r: &Vec<Arc<Val>>,
+    r2: &Vec<Arc<Val>>,
+    span: Span,
+    cxt: &Cxt,
+    mode: UnfoldState,
+) -> bool {
+    // if mode == UnfoldState::Maybe {
+    //     return unify_regions(r, r2, span, cxt, UnfoldState::No)
+    //         || unify_regions(r, r2, span, cxt, UnfoldState::Yes);
+    // }
     let (mut r, mut r2) = (r.clone(), r2.clone());
-    if mode == UnfoldState::Yes {
-        r.whnf(cxt);
-        r2.whnf(cxt);
-    }
-    let b = r
-        .borrows
-        .iter()
-        .copied()
-        .filter(|x| !r2.borrows.contains(x))
-        .collect::<Vec<_>>();
-    let b2 = r2
-        .borrows
-        .iter()
-        .copied()
-        .filter(|x| !r.borrows.contains(x))
-        .collect::<Vec<_>>();
+    // if mode == UnfoldState::Yes {
+    //     r.whnf(cxt);
+    //     r2.whnf(cxt);
+    // }
 
-    let (mut r, mut r2) = (&*r.values, &*r2.values);
     loop {
         if r.len() == 1 {
-            return (*r[0].1).clone().glued().unify_(
+            return (*r[0]).clone().glued().unify_(
                 None,
-                Val::Region(Region {
-                    borrows: b2,
-                    values: r2.to_vec(),
-                })
-                .glued(),
+                Val::Region(r2).glued(),
                 None,
                 span,
                 cxt,
@@ -1135,37 +1080,41 @@ fn unify_regions(r: &VRegion, r2: &VRegion, span: Span, cxt: &Cxt, mode: UnfoldS
             );
         }
         if r2.len() == 1 {
-            return Val::Region(Region {
-                borrows: b,
-                values: r.to_vec(),
-            })
-            .glued()
-            .unify_(None, (*r2[0].1).clone().glued(), None, span, cxt, mode);
+            return Val::Region(r).glued().unify_(
+                None,
+                (*r2[0]).clone().glued(),
+                None,
+                span,
+                cxt,
+                mode,
+            );
         }
         if r.is_empty() || r2.is_empty() {
-            return r.is_empty() && r2.is_empty() && b.is_empty() && b2.is_empty();
+            return r.is_empty() && r2.is_empty();
         }
-        if !(*r[0].1).clone().glued().unify_(
-            None,
-            (*r2[0].1).clone().glued(),
-            None,
-            span,
-            cxt,
-            mode,
-        ) {
+        let a = (*r.pop().unwrap()).clone().glued();
+        let mut found = false;
+        for i in 0..r2.len() {
+            if a.clone()
+                .unify_(None, (*r2[i]).clone().glued(), None, span, cxt, mode)
+            {
+                r2.remove(i);
+                found = true;
+                break;
+            }
+        }
+        if !found {
             return false;
         }
-        r = &r[1..];
-        r2 = &r2[1..];
     }
 }
 
 impl GVal {
     fn unify(
         self,
-        ra: impl Into<Option<VRegion>>,
+        ra: impl Into<Option<Vec<Arc<Val>>>>,
         other: GVal,
-        rb: impl Into<Option<VRegion>>,
+        rb: impl Into<Option<Vec<Arc<Val>>>>,
         span: Span,
         cxt: &Cxt,
     ) -> bool {
@@ -1173,9 +1122,9 @@ impl GVal {
     }
     fn unify_(
         self,
-        mut ra: Option<VRegion>,
+        mut ra: Option<Vec<Arc<Val>>>,
         other: GVal,
-        mut rb: Option<VRegion>,
+        mut rb: Option<Vec<Arc<Val>>>,
         span: Span,
         cxt: &Cxt,
         mut mode: UnfoldState,
@@ -1233,12 +1182,12 @@ impl GVal {
                     continue;
                 }
                 (Val::Region(r), Val::Region(r2)) => unify_regions(r, r2, span, cxt, mode),
-                (Val::Region(r), _) if r.borrows.is_empty() && r.values.len() == 1 => {
-                    a = (*r.values[0].1).clone().glued();
+                (Val::Region(r), _) if r.len() == 1 => {
+                    a = (*r[0]).clone().glued();
                     continue;
                 }
-                (_, Val::Region(r)) if r.borrows.is_empty() && r.values.len() == 1 => {
-                    b = (*r.values[0].1).clone().glued();
+                (_, Val::Region(r)) if r.len() == 1 => {
+                    b = (*r[0]).clone().glued();
                     continue;
                 }
                 (Val::Cap(Cap::Own, None, rest), _) => {
@@ -1344,36 +1293,43 @@ fn elab_block(block: &[PreStmt], last_: &SPre, ty: Option<GVal>, cxt1: &Cxt) -> 
     let mut cxt = cxt1.clone();
     let mut v = Vec::new();
     for x in block {
-        let (vsym, deps, t, p, x) = match x {
+        let (vsym, deps, t, p, x, span) = match x {
             PreStmt::Expr(x) => {
+                let span = x.span();
                 let (deps, (x, xty)) = cxt.record_deps(|| x.infer(&cxt, true));
                 let vsym = cxt.bind_(cxt.db.name("_"), xty.small().clone());
-                (vsym, deps, xty.as_small(), None, x)
+                (vsym, deps, xty.as_small(), None, x, span)
             }
             PreStmt::Let(pat, body) if matches!(&***pat, PrePat::Binder(_, _)) => {
+                let span = body.span();
                 let cxt_start = cxt.clone();
                 let (sym, pat) = PMatch::new(None, &[pat.clone()], None, &mut cxt);
                 let aty = (*pat.ty).clone();
                 let (deps, body) = cxt.record_deps(|| body.check(aty.clone(), &cxt_start));
-                (sym, deps, aty, Some(pat), body)
+                (sym, deps, aty, Some(pat), body, span)
             }
             PreStmt::Let(pat, body) => {
+                let span = body.span();
                 let (deps, (body, aty)) = cxt.record_deps(|| body.infer(&cxt, true));
                 let (sym, pat) = PMatch::new(Some(aty.clone()), &[pat.clone()], None, &mut cxt);
-                (sym, deps, aty.as_small(), Some(pat), body)
+                (sym, deps, aty.as_small(), Some(pat), body, span)
             }
         };
-        deps.check(&cxt);
+        deps.check(&cxt, span);
         let t2 = t.quote(&cxt.qenv());
         if let Some(p) = &p {
-            let deps = deps.to_var();
             cxt = p.bind(0, &deps, &cxt);
             cxt.set_deps(vsym, deps);
         }
         v.push((vsym, t2, p, x));
     }
     let explicit_ty = ty.is_some();
-    let (last, lty) = last_.elab(ty, &cxt);
+    // give better error messages on block return dependencies
+    let (r, (last, lty)) = cxt.record_deps(|| last_.elab(ty, &cxt));
+    // we don't need the errors twice though
+    if r.check(&cxt, last_.span()) {
+        cxt.add_deps(r);
+    }
     let mut lty = lty.as_small();
     let term = v.into_iter().rfold(last, |acc, (s, t, p, x)| {
         let acc = match p {
@@ -1546,15 +1502,15 @@ impl SPre {
                     cxt.can_eval.set(can_eval);
                 }
                 r.add(fr);
-                for (s, (span, _, m)) in &r.deps {
-                    if *m {
+                for (s, b) in &r.borrows {
+                    if b.mutable() {
                         // if we depend on `mut x`, then all the other dependencies get added to `x`'s dependencies
-                        let mut deps = Deps::from_var(cxt.get_deps(*s), *span);
+                        let mut deps = cxt.get_deps(*s);
                         let mut r2 = r.clone();
                         // it doesn't depend on itself tho
-                        r2.deps.remove(s);
+                        r2.borrows.remove(s);
                         deps.add(r2);
-                        cxt.set_deps(*s, deps.to_var());
+                        cxt.set_deps(*s, deps);
                     }
                 }
                 let vx = if can_eval.is_none() {
@@ -1563,8 +1519,8 @@ impl SPre {
                     Val::Unknown
                 };
                 let rty = fty.as_small().app(vx);
-                if let (_, Some(r), _) = rty.uncap() {
-                    cxt.add_deps(Deps::from_var(r.deps(), self.span()));
+                if let (_, Some(r2), _) = rty.uncap() {
+                    cxt.add_deps(Region::from_val(r2, &r));
                 } else {
                     cxt.add_deps(r);
                 }
@@ -1622,8 +1578,9 @@ impl SPre {
                 cxt2.push_closure(s);
                 let mut cxt3 = pat.bind(0, &default(), &cxt2);
                 // TODO should we do anything with this dependency?
+                let bspan = body.span();
                 let (deps, (body, rty)) = cxt.record_deps(|| body.infer(&cxt3, true));
-                deps.check(&cxt3);
+                deps.check(&cxt3, bspan);
                 let cap = cxt3
                     .pop_closure()
                     .into_iter()
@@ -1634,10 +1591,10 @@ impl SPre {
                 // non-unique closure return value can't have unique (mutable) dependencies (from outside the closure)
                 // TODO should we instead just make this a ~> closure? probably?
                 if cap == FCap::Imm {
-                    if let Some((s, (span, _, _))) = deps
-                        .deps
+                    if let Some((s, Borrow { span, .. })) = deps
+                        .borrows
                         .iter()
-                        .find(|(s, (_, _, m))| *m && before_syms.contains(s))
+                        .find(|(s, b)| b.mutable() && before_syms.contains(s))
                     {
                         cxt.err(
                             "immutable function -> cannot return value that borrows mutable "
@@ -1699,19 +1656,20 @@ impl SPre {
             Pre::Region(r) => {
                 let r = r
                     .iter()
-                    .map(|x| cxt.record_deps(|| x.check(Val::from(Builtin::Region), cxt)))
-                    .map(|(b, x)| (b.to_var(), x))
+                    .map(|x| x.check(Val::from(Builtin::Region), cxt))
                     .collect();
-                (Term::Region(Region::new(r)), Builtin::Region.into())
+                (Term::Region(r), Builtin::Region.into())
             }
             Pre::RegionAnn(r, x) => {
                 let r = r
                     .iter()
-                    .map(|x| cxt.record_deps(|| x.check(Val::from(Builtin::Region), cxt)))
-                    .map(|(b, x)| (b.to_var(), x))
+                    .map(|x| x.check(Val::from(Builtin::Region), cxt))
                     .collect();
                 let x = x.check(Val::Type, cxt);
-                (Term::RegionAnn(Region::new(r), Box::new(x)), Val::Type)
+                (
+                    Term::RegionAnn(Box::new(Term::Region(r)), Box::new(x)),
+                    Val::Type,
+                )
             }
             // temporary desugaring (eventually we do need the larger structure for method syntax)
             Pre::Dot(lhs, dot, Some((icit, rhs))) => {
@@ -1775,7 +1733,6 @@ impl SPre {
                 let pats: Vec<_> = branches.iter().map(|(a, _)| a.clone()).collect();
                 let mut cxt = cxt.clone();
                 let (s, p) = PMatch::new(Some(xty), &pats, Some(span), &mut cxt);
-                let xdeps = xdeps.to_var();
                 let rty = cxt.new_meta(Val::Type, MetaSource::Hole, self.span());
                 let mut bodies = Vec::new();
                 for (i, (_, v)) in branches.iter().enumerate() {
@@ -1865,8 +1822,9 @@ impl SPre {
                 cxt.push_closure(sym);
                 let mut cxt = pat.bind(0, &default(), &cxt);
                 // TODO should we do anything with this dependency?
+                let bspan = body.span();
                 let (deps, body) = cxt.record_deps(|| body.check(rty, &cxt));
-                deps.check(&cxt);
+                deps.check(&cxt, bspan);
                 let (cs, (cspan, cap)) = cxt
                     .pop_closure()
                     .into_iter()
@@ -1875,10 +1833,10 @@ impl SPre {
                     .unwrap_or((sym, (self.span(), Cap::Imm)));
                 // non-unique closure return value can't have unique (mutable) dependencies (from outside the closure)
                 if c == FCap::Imm {
-                    if let Some((s, (span, _, _))) = deps
-                        .deps
+                    if let Some((s, Borrow { span, .. })) = deps
+                        .borrows
                         .iter()
-                        .find(|(s, (_, _, m))| *m && before_syms.contains(s))
+                        .find(|(s, b)| b.mutable() && before_syms.contains(s))
                     {
                         cxt.err(
                             "immutable function -> cannot return value that borrows mutable "
@@ -2008,13 +1966,18 @@ impl SPre {
             }
         };
         if let Some(treg) = treg {
-            let creg = cxt.current_deps.with(|d| d.region());
-            if !coerce_region(&creg, &treg, self.span(), cxt) {
+            let creg = cxt.current_deps.with(Clone::clone);
+            if !coerce_region(
+                &creg,
+                &Region::from_val(treg.clone(), &default()),
+                self.span(),
+                cxt,
+            ) {
                 cxt.err(
                     "could not match regions: expected "
                         + Val::Region(treg).pretty(&cxt.db)
                         + ", found "
-                        + Val::Region(creg).pretty(&cxt.db),
+                        + Val::Region(creg.values).pretty(&cxt.db),
                     self.span(),
                 );
             }
@@ -2022,19 +1985,16 @@ impl SPre {
         r
     }
 }
-fn coerce_region(from: &VRegion, to: &VRegion, span: Span, cxt: &Cxt) -> bool {
-    for borrow in &from.borrows {
-        if !to.borrows.contains(borrow) {
+fn coerce_region(from: &Region, to: &Region, span: Span, cxt: &Cxt) -> bool {
+    for (s, borrow) in &from.borrows {
+        if !to.borrows.contains_key(s)
+            || (!to.borrows.get(s).unwrap().mutable() && borrow.mutable())
+        {
             return false;
         }
     }
-    for (b, v) in &from.values {
-        // TODO this should work but doesn't for like region parameters
-        // maybe b should be an Option?
-        // if b.iter().all(|b| to.borrows.contains(b)) {
-        //     continue;
-        // }
-        if to.values.iter().any(|(_, v2)| {
+    for v in &from.values {
+        if to.values.iter().any(|v2| {
             (**v)
                 .clone()
                 .glued()
@@ -2048,28 +2008,31 @@ fn coerce_region(from: &VRegion, to: &VRegion, span: Span, cxt: &Cxt) -> bool {
     true
 }
 impl GVal {
-    fn coerce(mut self, mut to: GVal, r: Deps, span: Span, cxt: &Cxt) {
-        let r = Deps::from_var(
-            self.big().uncap().1.unwrap_or_else(|| r.region()).deps(),
-            span,
-        );
-        if !to.clone().unify(None, self.clone(), r.region(), span, cxt) {
+    fn coerce(mut self, mut to: GVal, r: Region, span: Span, cxt: &Cxt) {
+        let r = self
+            .big()
+            .uncap()
+            .1
+            .map(|x| Region::from_val(x, &r))
+            .unwrap_or(r);
+        if !to
+            .clone()
+            .unify(None, self.clone(), r.values.clone(), span, cxt)
+        {
             // Try to coerce if possible
             match (to.whnf(cxt), self.whnf(cxt)) {
                 // demotion is always available
                 // TODO track lhs/rhs regions in unification
                 (Val::Cap(_, r1, ty), _sty) if !matches!(_sty, Val::Cap(_, _, _)) => {
-                    if r1
-                        .as_ref()
-                        .map_or(true, |r1| coerce_region(&r.region(), r1, span, cxt))
-                        && (**ty).clone().glued().unify(
-                            r1.clone(),
-                            self.clone(),
-                            r.region(),
-                            span,
-                            cxt,
-                        )
-                    {
+                    if r1.as_ref().map_or(true, |r1| {
+                        coerce_region(&r, &Region::from_val(r1.clone(), &default()), span, cxt)
+                    }) && (**ty).clone().glued().unify(
+                        r1.clone(),
+                        self.clone(),
+                        r.values.clone(),
+                        span,
+                        cxt,
+                    ) {
                         cxt.add_deps(r);
                         return;
                     }
@@ -2077,15 +2040,17 @@ impl GVal {
                 (Val::Cap(c1, r1, ty), Val::Cap(c2, r2, sty)) if c2 >= c1 => {
                     if (r1.is_none()
                         || coerce_region(
-                            &r2.clone().unwrap_or_else(|| r.region()),
-                            r1.as_ref().unwrap(),
+                            &r2.clone()
+                                .map(|r2| Region::from_val(r2, &default()))
+                                .unwrap_or_else(|| r.clone()),
+                            &Region::from_val(r1.clone().unwrap(), &default()),
                             span,
                             cxt,
                         ))
                         && (**ty).clone().glued().unify(
                             r1.clone(),
                             (**sty).clone().glued(),
-                            r2.clone().or_else(|| Some(r.region())),
+                            r2.clone().or_else(|| Some(r.values.clone())),
                             span,
                             cxt,
                         )
@@ -2112,7 +2077,7 @@ impl GVal {
                     + to.small().zonk(cxt, true).pretty(&cxt.db)
                     + ", found "
                     + if to.small().uncap().1.is_some() && !self.small().uncap().1.is_some() {
-                        Val::Region(r.region()).pretty(&cxt.db) + " "
+                        Val::Region(r.values.clone()).pretty(&cxt.db) + " "
                     } else {
                         Doc::none()
                     }
