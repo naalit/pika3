@@ -41,7 +41,7 @@ fn demo() {
 
 #[test]
 fn demo_errors() {
-    test(&["DemoErr.pk"]).num_errors(42);
+    test(&["DemoErr.pk"]).num_errors(48);
 }
 
 #[test]

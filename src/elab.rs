@@ -468,6 +468,7 @@ impl VarResult<'_> {
                     let mut deps = edeps.clone();
                     for (s, v) in deps.borrows.iter_mut() {
                         cxt.vars.get(s).unwrap().borrow_gen_mut.with_mut(|x| {
+                            let old = *x;
                             let g = {
                                 *x = (x.0 + 1, span);
                                 x.0
@@ -476,11 +477,14 @@ impl VarResult<'_> {
                                 // don't suppress borrow errors though
                                 if *m == g - 1 {
                                     *m = g;
+                                } else {
+                                    *x = old;
                                 }
                             }
                         });
                         if v.mutable() {
                             cxt.vars.get(s).unwrap().borrow_gen_imm.with_mut(|x| {
+                                let old = *x;
                                 let g = {
                                     *x = (x.0 + 1, span);
                                     x.0
@@ -488,6 +492,8 @@ impl VarResult<'_> {
                                 // don't suppress borrow errors though
                                 if v.imm_gen == g - 1 {
                                     v.imm_gen = g;
+                                } else {
+                                    *x = old;
                                 }
                             });
                         }
@@ -557,9 +563,14 @@ impl Region {
                                 e.borrow_gen_mut.get().1,
                             )
                             .with_secondary(Label {
-                                span: b.span,
+                                span: span,
                                 message: s.0.pretty(&cxt.db) + " mutable borrow later used here",
                                 color: Some(Doc::COLOR2),
+                            })
+                            .with_secondary(Label {
+                                span: b.span,
+                                message: s.0.pretty(&cxt.db) + " was mutably borrowed here",
+                                color: Some(Doc::COLOR3),
                             }),
                         );
                     }

@@ -171,21 +171,16 @@ def solve2 = unclear Type
 def mutual1 = (x: Nat) => mutual2 x
 def mutual2 = y => mutual1 y -> Type
 
-def t = &Nat
-def p9 : t -> t = x => x
-def p10 : &Nat -> &Nat = x => x
-def p11_demotion : &Nat -> Nat = x => x
-def p12_demotion : &&Nat -> &Nat = x => x
-def p13_promotion_e : Nat -> &Nat = x => x
-def p14_promotion_e : &Nat -> &&Nat = x => x
-def p15 = (x : &Nat, y : Nat) => add x y
-def p16_ambient : (&Nat, &Nat) -> &Nat = (x, y) => add x y
-def p17_type : &Type = Type
-def p18_ambient_e : (&Nat, &Nat) -> &&Nat = (x, y) => add x y
-def p19_minus_one : &Nat &-> Nat = x => x
-def p20_minus_one_e : Nat &-> Nat = x => x
+def p11_demotion : 'a Nat -> 'a 'b Nat = x => x
+def p12_demotion : 'a 'c Nat -> 'a 'b 'c Nat = x => x
+def p13_promotion_e : 'a 'b Nat -> 'a Nat = x => x
+def p14_promotion_e : 'a 'b 'c Nat -> 'a 'c Nat = x => x
+def p15_ambient : ('a Nat, 'b Nat) -> 'a 'b Nat = (x, y) => add x y
+def p16_ambient_e : ('a Nat, 'b Nat) -> 'a Nat = (x, y) => add x y
+def p17_hiding_e : 'a 'b Nat -> 'a ('a 'b Nat, ()) = x => (x, ())
 
-def with_fun : ((U ~> U) &~> r) -> r = f => f (x => x)
+# this works because 'r can't be solved to 'a because of meta scope restrictions ('r is a parameter of with_fun but 'a is a parameter of the closure)
+def with_fun : ({'a:_} -> 'a (U ~> U) ~> 'r r) -> r = f => f {'()} (x => x)
 def p21_good =
   with_fun (f => do
     let f2 = with_fun
@@ -219,7 +214,7 @@ def p27_dupf_e = do
 def p28_callf_e : imm (a ~> a) -> a -> a = f => x => f x
 def p29_curry_e : (a ~> a) -> a -> a = f => x => f x
 
-def p30_imm : imm a &-> Type = _ => Type
+def p30_imm : imm a -> '() Type = _ => Type
 def p31_borrow : a -> a = x => do
   let y = p30_imm x
   x
@@ -230,8 +225,8 @@ def p33_imm : imm a -> Type = _ => Type
 def p34_borrow_e : a -> (a, Type) = x => do
   let y = p33_imm x
   (x, y)
-def p35_imm : &imm a -> &imm a = x => x
-def p36_borrow_e : a -> imm a = x => p35_imm x # unclear if this should error or not
+def p35_imm : 'a imm a -> 'a imm a = x => x
+def p36_borrow_e : a -> '() imm a = x => p35_imm x # unclear if this should error or not
 
 def p37_mut : mut a -> Type = x => U
 def p37_mut_ : mut a -> mut a = mut x => x
@@ -260,7 +255,7 @@ def p42_let_mut : a -> a = x => do
   z
 
 def p43_ret_mut_e : a -> (U -> mut a) = mut x => _ => x
-def p44_problems : a -> (mut a, mut a) = mut x => do
+def p44_problems_e : a -> (mut a, mut a) = mut x => do
   let f = p43_ret_mut_e x
   f U, f U # problem: duplicating mut reference!
 
@@ -271,14 +266,14 @@ def p45_problems_e : a -> U = mut x => do
   let w = z
   U
 
-def p46_problems_e : &a -> U = mut x => do
-  let y : imm (&_) = x
+def p46_problems_e : 'a a -> U = mut x => do
+  let y : imm _ = x
   let z : imm _ = y
   p37_mut x # problem: mutating while borrowed!
   let w = z
   U
 
-def p47_problems_e : (&a, U) -> U = mut x => do
+def p47_problems_e : ('a a, U) -> U = mut x => do
   let y : imm _ = x
   let (z, _) = y
   p37_mut x # problem: mutating while borrowed!
@@ -293,12 +288,12 @@ def p48_store_and_ret_e : mut a -> (mut a -> mut a) = mut x => do
     z # but that's not how we implement this restriction - this is an error bc z depends on y. not sure if that means there are loopholes but it's def possible
 
 # here we can't make `z` depend on `y` (we can make `y` depend on `z` though, probably - TODO this is likely a problem)
-def _store : (mut a, &mut a) &-> U = _ => U
-def p49_store_and_ret : mut a -> (&mut a &-> mut a) = mut x => do
-  mut y = x
-  (mut z => do
-    _store (y, z)
-    z)
+# def _store : (mut a, &mut a) &-> U = _ => U
+# def p49_store_and_ret : mut a -> (&mut a &-> mut a) = mut x => do
+#   mut y = x
+#   (mut z => do
+#     _store (y, z)
+#     z)
 
 def p50_mutable_type : (a : Type) -> a -> a = mut a => x => do
   a = Type
@@ -320,3 +315,11 @@ def fail1 : Data -> imm Data = x => do
     let w = z # w depends on x through z
     move x # x is moved here
     w # error: w depends on x which has been moved
+
+def p52_fun_syntax (x : Data) : Data = x
+def p53_fun_curry (x : Data) (y : Data) : Data = y # these are all ->; this is okay here bc we don't actually capture x
+def p54_fun_infer x = move x # TODO if we add : U, that should be correct but in fact causes an error because of reparse_pi_param()
+def p55_fun_impl {x : Data} = x
+
+def return_borrow (x : mut 'a Data) : '(_) imm Data = x
+def return_borrow2 (x : 'a mut Data) : 'a Type = p30_imm x
