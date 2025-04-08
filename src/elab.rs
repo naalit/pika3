@@ -406,6 +406,8 @@ impl VarResult<'_> {
     fn access(self, cap: Cap, cxt: &Cxt) -> (Term, Arc<Val>) {
         match self {
             VarResult::Local(span, entry) => {
+                // Before we do anything else, make sure this variable is still valid!
+                entry.deps.with(|x| x.check(cxt, span));
                 let is_owned = (*entry.ty).clone().glued().whnf(cxt).is_owned();
                 if is_owned {
                     if let Some(ispan) = entry.invalidated.get() {
