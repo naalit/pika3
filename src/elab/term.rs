@@ -80,29 +80,60 @@ impl Region {
     pub fn is_empty(&self) -> bool {
         self.borrows.is_empty() && self.values.is_empty()
     }
-    pub fn new(base: &Region, values: Vec<Arc<Val>>) -> Self {
-        Region {
-            borrows: base.borrows.clone(),
-            values,
+    pub fn whnf(&mut self, cxt: &Cxt) {
+        let mut i = 0;
+        while i < self.values.len() {
+            let v = self.values[i].maybe_whnf(cxt);
+            match v {
+                Some(v @ (Val::Borrow(_) | Val::Region(_))) => {
+                    self.add(Region::from_val(vec![Arc::new(v)], &default(), cxt), cxt);
+                    self.values.swap_remove(i);
+                }
+                Some(v) => {
+                    self.values[i] = Arc::new(v);
+                    i += 1;
+                }
+                None => i += 1,
+            }
         }
     }
-    pub fn add(&mut self, other: Region) {
-        self.values
-            .extend(other.values.into_iter().filter_map(|v| match &*v {
-                Val::Borrow(b) => {
-                    let b: Vec<_> = b
-                        .iter()
-                        .copied()
-                        .filter(|b| !self.borrows.contains_key(&b.sym))
-                        .collect();
-                    if b.is_empty() {
-                        None
-                    } else {
-                        Some(Arc::new(Val::Borrow(b)))
-                    }
-                }
-                _ => Some(v),
-            }));
+    pub fn add(&mut self, other: Region, cxt: &Cxt) {
+        self.values.extend(
+            other
+                .values
+                .into_iter()
+                //.map(|v| Arc::new((*v).clone().and_whnf(cxt)))
+                // .filter_map(|v| match &*v {
+                //     Val::Borrow(b) => {
+                //         let b: Vec<_> = b
+                //             .iter()
+                //             .copied()
+                //             .filter(|b| {
+                //                 !self.borrows.contains_key(&b.sym)
+                //                     || (b.mutable() && !self.borrows.get(&b.sym).unwrap().mutable())
+                //             })
+                //             .collect();
+                //         if b.is_empty() {
+                //             None
+                //         } else {
+                //             Some(Arc::new(Val::Borrow(b)))
+                //         }
+                //     }
+                //     _ => Some(v),
+                // })
+                .filter(|v| {
+                    !self.values.iter().any(|v2| {
+                        (**v).clone().glued().unify(
+                            None,
+                            (**v2).clone().glued(),
+                            None,
+                            cxt.errors.span.span(),
+                            cxt,
+                        )
+                    })
+                })
+                .collect::<Vec<_>>(),
+        );
         for (k, v) in other.borrows {
             match self.borrows.get_mut(&k) {
                 None => {
@@ -120,26 +151,32 @@ impl Region {
         }
     }
     pub fn borrows(&self) -> Box<dyn Iterator<Item = &Borrow> + '_> {
-        Box::new(
-            self.borrows.values(), // .chain(self.values.iter().flat_map(|(r, _)| r.borrows())),
-        )
+        Box::new(self.borrows.values())
     }
     pub fn borrows_mut(&mut self) -> Box<dyn Iterator<Item = &mut Borrow> + '_> {
-        Box::new(
-            self.borrows.values_mut(), // .chain(self.values.iter_mut().flat_map(|(r, _)| r.borrows_mut())),
-        )
+        Box::new(self.borrows.values_mut())
     }
-}
-impl Region {
-    pub fn from_val(values: Vec<Arc<Val>>, base: &Region) -> Self {
+
+    pub fn values(&self) -> Vec<Arc<Val>> {
+        let mut values = Vec::new();
+        if !self.borrows.is_empty() {
+            values.push(Arc::new(Val::Borrow(
+                self.borrows.values().copied().collect(),
+            )));
+        }
+        values.extend(self.values.iter().cloned());
+        values
+    }
+
+    pub fn from_val(values: Vec<Arc<Val>>, base: &Region, cxt: &Cxt) -> Self {
         let mut r = Region::default();
         let mut any_unknown = false;
         for i in values {
             match &*i {
-                Val::Region(v) => r.add(Region::from_val(v.clone(), base)),
+                Val::Region(v) => r.add(Region::from_val(v.clone(), base, cxt), cxt),
                 Val::Borrow(b) => {
                     for &i in b {
-                        r.add(i.into());
+                        r.add(i.into(), cxt);
                     }
                 }
                 _ => {
@@ -149,7 +186,7 @@ impl Region {
             }
         }
         if any_unknown {
-            r.add(base.clone());
+            r.add(base.clone(), cxt);
         }
         r
     }
@@ -158,7 +195,7 @@ impl From<Borrow> for Region {
     fn from(value: Borrow) -> Self {
         Region {
             borrows: std::iter::once((value.sym, value)).collect(),
-            values: vec![Arc::new(Val::Borrow(vec![value]))],
+            values: Vec::new(),
         }
     }
 }
@@ -612,8 +649,14 @@ impl VElim {
 
             // Apply functions through caps (for pi types)
             // TODO do we need to do something with this region? it's the function `'self` borrow or whatever
-            (s @ VElim::App(_, _), Val::Cap(_, _, v)) if matches!(*v, Val::Fun { .. }) => {
-                s.elim(Arc::unwrap_or_clone(v))
+            (s @ VElim::App(_, _), Val::Cap(_, _, v))
+                if matches!(*v, Val::Fun { .. } | Val::Neutral(_, _)) =>
+            {
+                let q = s.elim(Arc::unwrap_or_clone(v));
+                if format!("{:?}", q) == "Neutral(Def(Interned(1, PhantomData<pika3::common::DefLoc>)), [App(Expl, Neutral(Sym(Sym(Interned(10, PhantomData<alloc::sync::Arc<str>>), 7)), []))])" {
+                    panic!()
+                }
+                q
             }
 
             (s, v) => {

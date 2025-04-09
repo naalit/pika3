@@ -453,11 +453,12 @@ impl PRow {
                 }
                 IPat::Var(m, n, Some(paty)) => {
                     let aty = cxt.as_eval(|| paty.check(Val::Type, cxt)).eval(cxt.env());
-                    if !aty
-                        .clone()
-                        .glued()
-                        .unify(None, (*t).clone().glued(), None, pat.1, cxt)
-                    {
+                    if !(*t).clone().glued().coerce(
+                        aty.clone().glued(),
+                        cxt.current_deps.with(Clone::clone),
+                        pat.1,
+                        cxt,
+                    ) {
                         cxt.err(
                             Doc::start("mismatched types: pattern has type ")
                                 + aty.pretty(&cxt.db)

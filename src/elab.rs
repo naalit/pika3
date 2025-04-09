@@ -1,6 +1,8 @@
 mod pattern;
 mod term;
 
+use std::sync::Arc;
+
 use pattern::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use term::*;
@@ -110,13 +112,28 @@ pub fn elab_module(file: File, def: Def, db: &DB) -> ModuleElabResult {
     }
     for (m, val) in root_cxt.metas.take() {
         match val {
-            MetaEntry::Unsolved(_, source) => errors.push(
-                Error::simple(
-                    "could not find solution for " + source.pretty(db) + " (" + m.pretty(db) + ")",
-                    source.span(),
+            MetaEntry::Unsolved(ty, source) => {
+                // Regions get solved to '() by default, () only has one possible value
+                if matches!(
+                    *ty,
+                    Val::Neutral(Head::Builtin(Builtin::Region | Builtin::UnitType), _)
+                ) {
+                    continue;
+                }
+                errors.push(
+                    Error::simple(
+                        "could not find solution for "
+                            + source.pretty(db)
+                            + " ("
+                            + m.pretty(db)
+                            + ")"
+                            + " of type "
+                            + ty.pretty(db),
+                        source.span(),
+                    )
+                    .with_label("metavariable introduced here"),
                 )
-                .with_label("metavariable introduced here"),
-            ),
+            }
             MetaEntry::Solved(_) => (),
         }
     }
@@ -338,7 +355,6 @@ pub fn elab_def(def: Def, db: &DB) -> Option<DefElabResult> {
 
 enum MetaEntry {
     // The first field is the type; we'll need that eventually for typeclass resolution, but it doesn't matter right now
-    // TODO error on unsolved metas (that's why the span is here)
     Unsolved(Arc<Val>, S<MetaSource>),
     Solved(Arc<Val>),
 }
@@ -501,15 +517,16 @@ impl VarResult<'_> {
                         }
                     }
                     if is_owned && acap < Cap::Own {
-                        deps.add(Region::from(Borrow {
-                            sym: entry.sym,
-                            span,
-                            imm_gen: entry.borrow_gen_imm.get().0,
-                            mut_gen: (acap == Cap::Mut).then(|| entry.borrow_gen_mut.get().0),
-                        }));
+                        deps.add(
+                            Region::from(Borrow {
+                                sym: entry.sym,
+                                span,
+                                imm_gen: entry.borrow_gen_imm.get().0,
+                                mut_gen: (acap == Cap::Mut).then(|| entry.borrow_gen_mut.get().0),
+                            }),
+                            cxt,
+                        );
                     }
-                    // TODO is this logic correct?
-                    cxt.add_deps(deps.clone());
                     deps
                 });
                 let mut ty = (*entry.ty).clone().as_cap(if is_owned || acap == Cap::Mut {
@@ -517,9 +534,21 @@ impl VarResult<'_> {
                 } else {
                     Cap::Own
                 });
+
+                cxt.add_deps(deps.clone());
                 if let Val::Cap(_, Some(r), _) = &mut ty {
-                    r.extend(deps.values);
+                    eprintln!(
+                        "{} / {}",
+                        Val::Region(r.clone()).pretty(&cxt.db),
+                        Val::Region(deps.values()).pretty(&cxt.db)
+                    );
+                    *r = Region::from_val(r.clone(), &default(), cxt)
+                        .tap_mut(|r| r.add(deps, cxt))
+                        .values();
+                    eprintln!("-> {}", Val::Region(r.clone()).pretty(&cxt.db));
+                    //r.extend(deps.values);
                 }
+
                 (Term::Head(Head::Sym(entry.sym)), Arc::new(ty))
             }
             VarResult::Other(term, ty) => (term, ty),
@@ -684,7 +713,7 @@ impl Cxt {
     }
 
     fn add_deps(&self, deps: Region) {
-        self.current_deps.with_mut(|t| t.add(deps))
+        self.current_deps.with_mut(|t| t.add(deps, self))
     }
     fn record_deps<R>(&self, f: impl FnOnce() -> R) -> (Region, R) {
         let before = self.current_deps.take();
@@ -948,6 +977,7 @@ impl Cxt {
         // For now this is enough, but in the future we might need to do more
         match solution.quote_(&qenv) {
             Ok(body) => {
+                // TODO occurs check, this keeps coming up
                 let term = spine.iter().zip(syms).rfold(body, |acc, (_, s)| {
                     Term::fun(
                         Lam,
@@ -1290,6 +1320,7 @@ fn insert_metas(term: Term, mut ty: GVal, cxt: &Cxt, span: Span) -> (Term, GVal)
             pty: aty,
             ..
         }) => {
+            eprintln!("{}", aty.pretty(&cxt.db));
             let m = cxt.new_meta((**aty).clone(), MetaSource::ImpArg(n.0), span);
             let term = Term::App(
                 Box::new(term),
@@ -1379,6 +1410,40 @@ fn elab_block(block: &[PreStmt], last_: &SPre, ty: Option<GVal>, cxt1: &Cxt) -> 
 }
 
 impl SPre {
+    fn insert_par_regions(&self, name: Name, bucket: &mut Vec<Name>, db: &DB) -> SPre {
+        match &***self {
+            Pre::Sigma(i, n1, left, n2, right) => S(
+                Box::new(Pre::Sigma(
+                    *i,
+                    *n1,
+                    left.insert_par_regions(
+                        n1.as_deref().copied().unwrap_or_else(|| db.name("_")),
+                        bucket,
+                        db,
+                    ),
+                    *n2,
+                    right.insert_par_regions(
+                        n2.as_deref().copied().unwrap_or_else(|| db.name("_")),
+                        bucket,
+                        db,
+                    ),
+                )),
+                self.span(),
+            ),
+            Pre::RegionAnn(_, _) => self.clone(),
+            _ => {
+                let name = db.name(&format!("'{}", db.get(name)));
+                bucket.push(name);
+                S(
+                    Box::new(Pre::RegionAnn(
+                        vec![S(Box::new(Pre::Var(name)), self.span())],
+                        self.clone(),
+                    )),
+                    self.span(),
+                )
+            }
+        }
+    }
     // Helper to delegate to infer or check
     fn elab(&self, ty: Option<GVal>, cxt: &Cxt) -> (Term, GVal) {
         match ty {
@@ -1514,7 +1579,7 @@ impl SPre {
                 if can_eval.is_some() && cxt.can_eval.get().is_none() {
                     cxt.can_eval.set(can_eval);
                 }
-                r.add(fr);
+                r.add(fr, cxt);
                 for (s, b) in &r.borrows {
                     if b.mutable() {
                         // if we depend on `mut x`, then all the other dependencies get added to `x`'s dependencies
@@ -1522,7 +1587,7 @@ impl SPre {
                         let mut r2 = r.clone();
                         // it doesn't depend on itself tho
                         r2.borrows.remove(s);
-                        deps.add(r2);
+                        deps.add(r2, cxt);
                         cxt.set_deps(*s, deps);
                     }
                 }
@@ -1533,7 +1598,7 @@ impl SPre {
                 };
                 let rty = fty.as_small().app(vx);
                 if let (_, Some(r2), _) = rty.uncap() {
-                    cxt.add_deps(Region::from_val(r2, &r));
+                    cxt.add_deps(Region::from_val(r2, &r, cxt));
                 } else {
                     cxt.add_deps(r);
                 }
@@ -1544,16 +1609,36 @@ impl SPre {
                 if q {
                     cxt.push_uquant();
                 }
+                let mut borrows = Vec::new();
+                let paty = paty.insert_par_regions(*n, &mut borrows, &cxt.db);
                 let aty = cxt.as_eval(|| paty.check(Val::Type, cxt));
                 let vaty = aty.eval(cxt.env());
                 let (s, cxt) = cxt.bind(*n, vaty.clone());
-                // TODO do we apply the local promotion while checking the pi return type?
                 let body = pat_bind_type(
                     &paty,
                     Val::Neutral(Head::Sym(s), default()),
                     &vaty,
                     &cxt,
-                    |cxt| body.check(Val::Type, cxt),
+                    |cxt| {
+                        // we don't want just leaving off the return type (which then generates a hole) to mean anything about the return region, that should be inferred
+                        let body = if matches!(&***body, Pre::RegionAnn(_, _))
+                            || matches!(&***body, Pre::Var(v) if *v == cxt.db.name("_"))
+                        {
+                            body.clone()
+                        } else {
+                            S(
+                                Box::new(Pre::RegionAnn(
+                                    borrows
+                                        .into_iter()
+                                        .map(|x| S(Box::new(Pre::Var(x)), body.span()))
+                                        .collect(),
+                                    body.clone(),
+                                )),
+                                body.span(),
+                            )
+                        };
+                        body.check(Val::Type, cxt)
+                    },
                 );
                 let scope = q.then(|| cxt.pop_uquant().unwrap());
                 (
@@ -1974,7 +2059,21 @@ impl SPre {
                         tcap,
                     )
                 });
-                sty.coerce(ty, r, self.span(), cxt);
+                if !sty.clone().coerce(ty.clone(), r.clone(), self.span(), cxt) {
+                    cxt.err(
+                        "could not match types: expected "
+                            + ty.small().zonk(cxt, true).pretty(&cxt.db)
+                            + ", found "
+                            + if ty.small().uncap().1.is_some() && !sty.small().uncap().1.is_some()
+                            {
+                                Val::Region(r.values()).pretty(&cxt.db) + " "
+                            } else {
+                                Doc::none()
+                            }
+                            + sty.small().zonk(cxt, true).pretty(&cxt.db),
+                        self.span(),
+                    );
+                }
                 return s;
             }
         };
@@ -1982,7 +2081,7 @@ impl SPre {
             let creg = cxt.current_deps.with(Clone::clone);
             if !coerce_region(
                 &creg,
-                &Region::from_val(treg.clone(), &default()),
+                &Region::from_val(treg.clone(), &default(), cxt),
                 self.span(),
                 cxt,
             ) {
@@ -1990,7 +2089,7 @@ impl SPre {
                     "could not match regions: expected "
                         + Val::Region(treg).pretty(&cxt.db)
                         + ", found "
-                        + Val::Region(creg.values).pretty(&cxt.db),
+                        + Val::Region(creg.values()).pretty(&cxt.db),
                     self.span(),
                 );
             }
@@ -1999,13 +2098,38 @@ impl SPre {
     }
 }
 fn coerce_region(from: &Region, to: &Region, span: Span, cxt: &Cxt) -> bool {
+    // Necessary to deal with metas solved to borrows
+    let mut from = from.clone();
+    let mut to = to.clone();
+    from.whnf(cxt);
+    to.whnf(cxt);
+
     for (s, borrow) in &from.borrows {
         if !to.borrows.contains_key(s)
             || (!to.borrows.get(s).unwrap().mutable() && borrow.mutable())
         {
-            return false;
+            // We can coerce away borrows by invalidating the thing we're borrowing so nobody can modify it (bc Pika has a GC, unlike Rust)
+            cxt.vars[&borrow.sym].invalidated.set(Some(span));
         }
     }
+    // if from.values.len() == 1 {
+    //     return (*from.values[0]).clone().glued().unify(
+    //         None,
+    //         Val::Region(to.values.clone()).glued(),
+    //         None,
+    //         span,
+    //         cxt,
+    //     );
+    // }
+    // if to.values.len() == 1 {
+    //     return (*to.values[0]).clone().glued().unify(
+    //         None,
+    //         Val::Region(from.values.clone()).glued(),
+    //         None,
+    //         span,
+    //         cxt,
+    //     );
+    // }
     for v in &from.values {
         if to.values.iter().any(|v2| {
             (**v)
@@ -2021,55 +2145,57 @@ fn coerce_region(from: &Region, to: &Region, span: Span, cxt: &Cxt) -> bool {
     true
 }
 impl GVal {
-    fn coerce(mut self, mut to: GVal, r: Region, span: Span, cxt: &Cxt) {
+    pub(super) fn coerce(mut self, mut to: GVal, r: Region, span: Span, cxt: &Cxt) -> bool {
         let r = self
             .big()
             .uncap()
             .1
-            .map(|x| Region::from_val(x, &r))
+            .map(|x| Region::from_val(x, &r, cxt))
             .unwrap_or(r);
-        if !to
-            .clone()
-            .unify(None, self.clone(), r.values.clone(), span, cxt)
-        {
+        if !to.clone().unify(None, self.clone(), r.values(), span, cxt) {
             // Try to coerce if possible
             match (to.whnf(cxt), self.whnf(cxt)) {
                 // demotion is always available
                 // TODO track lhs/rhs regions in unification
                 (Val::Cap(_, r1, ty), _sty) if !matches!(_sty, Val::Cap(_, _, _)) => {
                     if r1.as_ref().map_or(true, |r1| {
-                        coerce_region(&r, &Region::from_val(r1.clone(), &default()), span, cxt)
+                        coerce_region(
+                            &r,
+                            &Region::from_val(r1.clone(), &default(), cxt),
+                            span,
+                            cxt,
+                        )
                     }) && (**ty).clone().glued().unify(
                         r1.clone(),
                         self.clone(),
-                        r.values.clone(),
+                        r.values(),
                         span,
                         cxt,
                     ) {
                         cxt.add_deps(r);
-                        return;
+                        return true;
                     }
                 }
                 (Val::Cap(c1, r1, ty), Val::Cap(c2, r2, sty)) if c2 >= c1 => {
                     if (r1.is_none()
                         || coerce_region(
                             &r2.clone()
-                                .map(|r2| Region::from_val(r2, &default()))
+                                .map(|r2| Region::from_val(r2, &default(), cxt))
                                 .unwrap_or_else(|| r.clone()),
-                            &Region::from_val(r1.clone().unwrap(), &default()),
+                            &Region::from_val(r1.clone().unwrap(), &default(), cxt),
                             span,
                             cxt,
                         ))
                         && (**ty).clone().glued().unify(
                             r1.clone(),
                             (**sty).clone().glued(),
-                            r2.clone().or_else(|| Some(r.values.clone())),
+                            r2.clone().or_else(|| Some(r.values())),
                             span,
                             cxt,
                         )
                     {
                         cxt.add_deps(r);
-                        return;
+                        return true;
                     }
                 }
                 (_ity, Val::Cap(Cap::Own, r1, ty)) if !matches!(_ity, Val::Cap(_, _, _)) => {
@@ -2079,25 +2205,17 @@ impl GVal {
                         .unify(r1.clone(), to.clone(), None, span, cxt)
                     {
                         cxt.add_deps(r);
-                        return;
+                        return true;
                     }
                 }
                 _ => (),
             }
 
-            cxt.err(
-                "could not match types: expected "
-                    + to.small().zonk(cxt, true).pretty(&cxt.db)
-                    + ", found "
-                    + if to.small().uncap().1.is_some() && !self.small().uncap().1.is_some() {
-                        Val::Region(r.values.clone()).pretty(&cxt.db) + " "
-                    } else {
-                        Doc::none()
-                    }
-                    + self.small().zonk(cxt, true).pretty(&cxt.db),
-                span,
-            );
+            cxt.add_deps(r);
+            return false;
+        } else {
+            cxt.add_deps(r);
+            return true;
         }
-        cxt.add_deps(r);
     }
 }
