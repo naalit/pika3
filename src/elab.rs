@@ -1312,7 +1312,7 @@ impl GVal {
 
 // don't call this if checking against an implicit lambda
 fn insert_metas(term: Term, mut ty: GVal, cxt: &Cxt, span: Span) -> (Term, GVal) {
-    match ty.whnf(cxt) {
+    match ty.whnf(cxt).uncap().2 {
         Val::Fun(VFun {
             class: Pi(_),
             icit: Impl,
@@ -1467,6 +1467,10 @@ impl SPre {
                     .new_meta(mty.clone(), MetaSource::Hole, self.span())
                     .quote(&cxt.qenv());
                 (m, mty)
+            }
+            // TODO proper builtin name lookup
+            Pre::Var(name) if cxt.db.name("Region") == *name => {
+                (Term::Head(Head::Builtin(Builtin::Region)), Val::Type)
             }
             Pre::Var(name) => match cxt.lookup(S(*name, self.span())) {
                 Some(entry) => {
@@ -1626,6 +1630,17 @@ impl SPre {
                         {
                             body.clone()
                         } else {
+                            // TODO:
+                            // (_: a, _: b) -> a
+                            // ->
+                            // (_: '_ a, _: '_ b) -> '_ '_ a
+                            // but this is a *presyntax* transformation - those '_s aren't separate, they're literally the same variable!
+                            // which... is not really what we want, to be *perfectly* honest.
+                            // partly because '_ should never be the same variable as another '_ - it's the *anonymous* lifetime.
+                            // and partly because, even if you have `(x: a, x: b)`, we probably shouldn't do this transformation at presyntax -
+                            // we should do it in actual syntax, or at least have some way of keeping the two `'x`s separate.
+                            // basicanlly, this should be hygienic in the macro sense, and the way we are currently doing it is not.
+                            // TODO number two: currying. which is related to 'self, if we want to do that ...
                             S(
                                 Box::new(Pre::RegionAnn(
                                     borrows
@@ -1900,9 +1915,18 @@ impl SPre {
                     class: Pi(c),
                     icit: i2,
                     pty: aty2,
+                    psym,
                     ..
                 }),
-            ) if i == i2 => {
+            ) if i == i2
+                // if the pi has an implicit '_ region parameter, only match that one if the lambda also has a region variable '_
+                // that way you can write `def t : {a} -> a = {a} => a` without accidentally matching on the anonymous region created by region inference
+                && (*i == Expl
+                    || !cxt.db.get(psym.0).starts_with("'")
+                    || pat
+                        .name()
+                        .map_or(false, |n| cxt.db.get(n.0).starts_with("'"))) =>
+            {
                 let c = *c;
                 let mut cxt = cxt.clone();
                 let before_syms: FxHashSet<_> = cxt.vars.keys().copied().collect();
@@ -2156,7 +2180,6 @@ impl GVal {
             // Try to coerce if possible
             match (to.whnf(cxt), self.whnf(cxt)) {
                 // demotion is always available
-                // TODO track lhs/rhs regions in unification
                 (Val::Cap(_, r1, ty), _sty) if !matches!(_sty, Val::Cap(_, _, _)) => {
                     if r1.as_ref().map_or(true, |r1| {
                         coerce_region(

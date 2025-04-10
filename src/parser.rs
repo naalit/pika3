@@ -1,5 +1,3 @@
-use either::Either;
-
 use crate::common::*;
 use crate::lexer::*;
 
@@ -37,6 +35,17 @@ pub enum PrePat {
     Pair(Icit, SPrePat, SPrePat),
     Cons(SPre, Option<(Icit, SPrePat)>),
     Error,
+}
+impl PrePat {
+    pub fn name(&self) -> Option<SName> {
+        match self {
+            PrePat::Name(_, s) => Some(*s),
+            PrePat::Binder(s, _) => s.name(),
+            PrePat::Pair(_, _, _) => None,
+            PrePat::Cons(_, _) => None,
+            PrePat::Error => None,
+        }
+    }
 }
 #[derive(Debug, Clone)]
 pub enum PreStmt {

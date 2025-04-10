@@ -927,9 +927,16 @@ fn pretty_region(db: &DB, r: &Vec<Term>) -> Doc {
     if r.is_empty() {
         Doc::start("'()")
     } else {
-        // TODO '(x) when necessary
         Doc::intersperse(
-            r.iter().map(|v| v.pretty(db).nest(Prec::Atom)),
+            r.iter().map(|v| {
+                // this is kind of hacky but. it works as a heuristic
+                let v = v.pretty(db);
+                if v.clone().to_string(false).starts_with("'") {
+                    v
+                } else {
+                    "'(" + v + ")"
+                }
+            }),
             Doc::start(" "),
         )
     }
