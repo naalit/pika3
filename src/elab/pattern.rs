@@ -277,6 +277,7 @@ fn split_ty(
                     Expl,
                     s,
                     ta,
+                    None,
                     Arc::new(tb),
                     Arc::new(cxt.env().clone()),
                 );
@@ -870,13 +871,14 @@ impl PMatch {
             .rev()
         {
             let body = vars.iter().rfold(body.clone(), |acc, (_, _, s, ty)| {
-                Term::fun(Lam, Expl, *s, ty.quote(cxt.qenv()), Arc::new(acc))
+                Term::fun(Lam, Expl, *s, None, ty.quote(cxt.qenv()), Arc::new(acc))
             });
             term = Term::App(
                 Box::new(Term::fun(
                     Lam,
                     Expl,
                     *body_sym,
+                    None,
                     // TODO do we care about these types?
                     Term::Error,
                     Arc::new(term),

@@ -268,6 +268,9 @@ impl Val {
     }
     pub fn with_region(self, r: Option<Vec<Arc<Val>>>) -> Val {
         match self {
+            // Types can't contain (accessible) pointers so they don't care about regions
+            // The compiler knowing that makes type-level programming a bit nicer
+            Val::Type => Val::Type,
             Val::Cap(e, r2, rest) if r.is_none() => Val::Cap(e, r2, rest),
             Val::Cap(e, _, rest) => Val::Cap(e, r, rest),
             _ => Val::Cap(Cap::Own, r, Arc::new(self)),
@@ -292,6 +295,7 @@ pub struct VFun {
     pub class: Class,
     pub icit: Icit,
     pub psym: Sym,
+    pub rself_sym: Option<Sym>,
     pub pty: Arc<Val>,
     body: Arc<Term>,
     env: Arc<Env>,
@@ -300,6 +304,7 @@ pub struct VFun {
 pub struct TFun {
     pub class: Class,
     pub icit: Icit,
+    rself_sym: Option<Sym>,
     psym: Sym,
     pty: Box<Term>,
     body: Arc<Term>,
@@ -313,15 +318,21 @@ impl VFun {
                 class: self.class,
                 icit: self.icit,
                 psym: self.psym,
+                rself_sym: self.rself_sym,
                 pty: Box::new(self.pty.quote_(env)?),
                 body: self.body.clone(),
             })
         } else {
             let (sym, senv) = env.senv(&self.env).bind(self.psym);
+            let (rself_sym, senv) = self.rself_sym.map_or((None, senv.clone()), |r| {
+                let (a, b) = senv.bind(r);
+                (Some(a), b)
+            });
             Ok(TFun {
                 class: self.class,
                 icit: self.icit,
                 psym: sym,
+                rself_sym,
                 pty: Box::new(self.pty.quote_(env)?),
                 body: Arc::new(self.body.subst(&senv)?),
             })
@@ -331,10 +342,15 @@ impl VFun {
 impl TFun {
     fn subst(&self, env: &SEnv) -> Result<TFun, Sym> {
         let (s, env2) = env.bind(self.psym);
+        let (rself_sym, env2) = self.rself_sym.map_or((None, env2.clone()), |r| {
+            let (a, b) = env2.bind(r);
+            (Some(a), b)
+        });
         Ok(TFun {
             class: self.class,
             icit: self.icit,
             psym: s,
+            rself_sym,
             pty: Box::new(self.pty.subst(env)?),
             body: Arc::new(self.body.subst(&env2)?),
         })
@@ -344,6 +360,7 @@ impl TFun {
             class: self.class,
             icit: self.icit,
             psym: self.psym,
+            rself_sym: self.rself_sym,
             pty: Arc::new(self.pty.eval(env)),
             body: self.body.clone(),
             env: Arc::new(env.clone()),
@@ -360,6 +377,7 @@ impl Val {
         icit: Icit,
         psym: Sym,
         pty: Arc<Val>,
+        rself_sym: Option<Sym>,
         body: Arc<Term>,
         env: Arc<Env>,
     ) -> Val {
@@ -367,6 +385,7 @@ impl Val {
             class,
             icit,
             psym,
+            rself_sym,
             pty,
             body,
             env,
@@ -374,11 +393,19 @@ impl Val {
     }
 }
 impl Term {
-    pub fn fun(class: Class, icit: Icit, psym: Sym, pty: Term, body: Arc<Term>) -> Term {
+    pub fn fun(
+        class: Class,
+        icit: Icit,
+        psym: Sym,
+        rself_sym: Option<Sym>,
+        pty: Term,
+        body: Arc<Term>,
+    ) -> Term {
         Term::Fun(TFun {
             class,
             icit,
             psym,
+            rself_sym,
             pty: Box::new(pty),
             body,
         })
@@ -622,6 +649,19 @@ pub enum VElim {
         Arc<Env>,
     ),
     App(Icit, Arc<Val>),
+}
+impl Val {
+    pub fn app_rself(self, x: Val, r: Val) -> Val {
+        match self {
+            Val::Fun(mut f) => f.body.eval(&Arc::make_mut(&mut f.env).tap_mut(|v| {
+                v.0.insert(f.psym, Arc::new(x));
+                if let Some(s) = f.rself_sym {
+                    v.0.insert(s, Arc::new(r));
+                }
+            })),
+            _ => self.app(x),
+        }
+    }
 }
 impl VElim {
     pub fn elim(self, v: Val) -> Val {

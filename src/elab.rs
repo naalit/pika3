@@ -247,7 +247,7 @@ pub fn elab_def(def: Def, db: &DB) -> Option<DefElabResult> {
                 .rfold(Term::Type, |acc, (i, (s, m))| {
                     let aty = m.ty.quote(cxt.qenv());
                     let body = m.compile(&[acc], &cxt);
-                    Term::fun(Pi(FCap::Imm), *i, *s, aty, Arc::new(body))
+                    Term::fun(Pi(FCap::Imm), *i, *s, None, aty, Arc::new(body))
                 })
                 .eval(cxt.env())
                 .zonk(&cxt, true);
@@ -290,12 +290,12 @@ pub fn elab_def(def: Def, db: &DB) -> Option<DefElabResult> {
                                 &cxt,
                                 |_| rty,
                             );
-                            Term::fun(Pi(FCap::Imm), *i, s, aty, Arc::new(body))
+                            Term::fun(Pi(FCap::Imm), *i, s, None, aty, Arc::new(body))
                         });
                         m.iter().rfold(vty, |acc, (_, (s, m))| {
                             let aty = m.ty.quote(cxt.qenv());
                             let body = m.compile(&[acc], &cxt);
-                            Term::fun(Pi(FCap::Imm), Impl, *s, aty, Arc::new(body))
+                            Term::fun(Pi(FCap::Imm), Impl, *s, None, aty, Arc::new(body))
                         })
                     }
                 };
@@ -630,6 +630,7 @@ struct Cxt {
     uquant_stack: Ref<Vec<Vec<(Sym, Arc<Val>)>>>,
     closure_stack: Vec<(Arc<FxHashSet<Sym>>, Ref<FxHashMap<Sym, (Span, Cap)>>)>,
     current_deps: Ref<Region>,
+    rself: Option<Sym>,
     can_eval: Ref<Option<Span>>,
     errors: Errors,
 }
@@ -669,6 +670,7 @@ impl Cxt {
             uquant_stack: default(),
             closure_stack: default(),
             current_deps: default(),
+            rself: None,
             can_eval: default(),
             zonked_metas: default(),
         }
@@ -983,6 +985,7 @@ impl Cxt {
                         Lam,
                         Expl,
                         s.unwrap_or(self.scxt().bind(self.db.name("_"))),
+                        None,
                         Term::Error,
                         Arc::new(acc),
                     )
@@ -1381,7 +1384,7 @@ fn elab_block(block: &[PreStmt], last_: &SPre, ty: Option<GVal>, cxt1: &Cxt) -> 
             None => acc,
         };
         Term::App(
-            Box::new(Term::fun(Lam, Expl, s, t, Arc::new(acc))),
+            Box::new(Term::fun(Lam, Expl, s, None, t, Arc::new(acc))),
             TElim::App(Expl, Box::new(x)),
         )
     });
@@ -1472,6 +1475,13 @@ impl SPre {
             Pre::Var(name) if cxt.db.name("Region") == *name => {
                 (Term::Head(Head::Builtin(Builtin::Region)), Val::Type)
             }
+            Pre::Var(name) if cxt.db.name("'self") == *name => match cxt.rself {
+                Some(s) => (Term::Head(Head::Sym(s)), Builtin::Region.into()),
+                None => {
+                    cxt.err("'self used outside a function type", self.span());
+                    (Term::Error, Val::Error)
+                }
+            },
             Pre::Var(name) => match cxt.lookup(S(*name, self.span())) {
                 Some(entry) => {
                     let (term, ty) = entry.access(borrow_as, cxt);
@@ -1559,6 +1569,7 @@ impl SPre {
                                 *i,
                                 s,
                                 Arc::new(m1.clone()),
+                                None, // TODO does 'self make sense here?
                                 Arc::new(m2.quote(cxt2.qenv())),
                                 Arc::new(cxt.env().clone()),
                             ),
@@ -1583,7 +1594,7 @@ impl SPre {
                 if can_eval.is_some() && cxt.can_eval.get().is_none() {
                     cxt.can_eval.set(can_eval);
                 }
-                r.add(fr, cxt);
+                r.add(fr.clone(), cxt);
                 for (s, b) in &r.borrows {
                     if b.mutable() {
                         // if we depend on `mut x`, then all the other dependencies get added to `x`'s dependencies
@@ -1600,7 +1611,7 @@ impl SPre {
                 } else {
                     Val::Unknown
                 };
-                let rty = fty.as_small().app(vx);
+                let rty = fty.as_small().app_rself(vx, Val::Region(fr.values()));
                 if let (_, Some(r2), _) = rty.uncap() {
                     cxt.add_deps(Region::from_val(r2, &r, cxt));
                 } else {
@@ -1614,8 +1625,13 @@ impl SPre {
                     cxt.push_uquant();
                 }
                 let mut borrows = Vec::new();
+
+                let (rself_sym, mut cxt) =
+                    cxt.bind(cxt.db.name("'self"), Arc::new(Builtin::Region.into()));
+                cxt.rself = Some(rself_sym);
+
                 let paty = paty.insert_par_regions(*n, &mut borrows, &cxt.db);
-                let aty = cxt.as_eval(|| paty.check(Val::Type, cxt));
+                let aty = cxt.as_eval(|| paty.check(Val::Type, &cxt));
                 let vaty = aty.eval(cxt.env());
                 let (s, cxt) = cxt.bind(*n, vaty.clone());
                 let body = pat_bind_type(
@@ -1640,12 +1656,16 @@ impl SPre {
                             // and partly because, even if you have `(x: a, x: b)`, we probably shouldn't do this transformation at presyntax -
                             // we should do it in actual syntax, or at least have some way of keeping the two `'x`s separate.
                             // basicanlly, this should be hygienic in the macro sense, and the way we are currently doing it is not.
-                            // TODO number two: currying. which is related to 'self, if we want to do that ...
                             S(
                                 Box::new(Pre::RegionAnn(
                                     borrows
                                         .into_iter()
                                         .map(|x| S(Box::new(Pre::Var(x)), body.span()))
+                                        // also include 'self on the return type by default
+                                        .chain(std::iter::once(S(
+                                            Box::new(Pre::Var(cxt.db.name("'self"))),
+                                            body.span(),
+                                        )))
                                         .collect(),
                                     body.clone(),
                                 )),
@@ -1658,13 +1678,14 @@ impl SPre {
                 let scope = q.then(|| cxt.pop_uquant().unwrap());
                 (
                     scope.into_iter().flatten().rfold(
-                        Term::fun(Pi(*c), *i, s, aty, Arc::new(body)),
+                        Term::fun(Pi(*c), *i, s, Some(rself_sym), aty, Arc::new(body)),
                         |acc, (s, ty)| {
                             Term::fun(
                                 // use imm for the uquant pis
                                 Pi(FCap::Imm),
                                 Impl,
                                 s,
+                                None, // TODO what is the proper region assignment for uquant pis?
                                 ty.quote(cxt.qenv()),
                                 Arc::new(acc),
                             )
@@ -1676,7 +1697,7 @@ impl SPre {
             Pre::Sigma(_, Some(_), _, _, _) | Pre::Sigma(_, _, _, Some(_), _) => {
                 (self.check(Val::Type, cxt), Val::Type)
             }
-            // If no type is given, assume monomorphic (-0) lambdas
+            // If no type is given, assume monomorphic lambdas
             Pre::Lam(i, pat, body) => {
                 let q = !cxt.has_uquant();
                 if q {
@@ -1722,23 +1743,25 @@ impl SPre {
                 let scope = q.then(|| cxt.pop_uquant().unwrap());
                 (
                     scope.iter().flatten().rfold(
-                        Term::fun(Lam, *i, s, aty2.clone(), Arc::new(body)),
+                        Term::fun(Lam, *i, s, None, aty2.clone(), Arc::new(body)),
                         |acc, (s, ty)| {
                             // Don't introduce a redex, the user clearly intended to make a polymorphic lambda
                             should_insert_metas = false;
-                            Term::fun(Lam, Impl, *s, ty.quote(cxt.qenv()), Arc::new(acc))
+                            Term::fun(Lam, Impl, *s, None, ty.quote(cxt.qenv()), Arc::new(acc))
                         },
                     ),
                     scope
                         .into_iter()
                         .flatten()
                         .fold(
-                            Term::fun(Pi(cap), *i, s, aty2, Arc::new(rty)),
+                            // TODO 'self region assignment
+                            Term::fun(Pi(cap), *i, s, None, aty2, Arc::new(rty)),
                             |acc, (s, ty)| {
                                 Term::fun(
                                     Pi(FCap::Imm),
                                     Impl,
                                     s,
+                                    None,
                                     ty.quote(cxt.qenv()),
                                     Arc::new(acc),
                                 )
@@ -1761,6 +1784,7 @@ impl SPre {
                         *i,
                         s,
                         aty,
+                        None,
                         Arc::new(bty),
                         Arc::new(cxt.env().clone()),
                     ),
@@ -1861,7 +1885,8 @@ impl SPre {
                     }
                 }
                 let t = p.compile(&bodies, &cxt);
-                let t = Term::fun(Lam, Expl, s, p.ty.quote(cxt.qenv()), Arc::new(t));
+                // TODO do we need 'self regions here?
+                let t = Term::fun(Lam, Expl, s, None, p.ty.quote(cxt.qenv()), Arc::new(t));
                 (Term::App(Box::new(t), TElim::App(Expl, Box::new(x))), rty)
             }
             Pre::Assign(a, b) => {
@@ -1940,7 +1965,10 @@ impl SPre {
 
                 let va = Val::Neutral(Head::Sym(sym), default());
                 // TODO why doesn't as_small() work here
-                let rty = ty.as_big().app(va.clone());
+                let rty = match treg.clone() {
+                    None => ty.as_big().app(va.clone()),
+                    Some(treg) => ty.as_big().app_rself(va.clone(), Val::Region(treg)),
+                };
                 cxt.push_closure(sym);
                 let mut cxt = pat.bind(0, &default(), &cxt);
                 // TODO should we do anything with this dependency?
@@ -1989,7 +2017,7 @@ impl SPre {
                     );
                 }
                 let body = pat.compile(&[body], &cxt);
-                Term::fun(Lam, *i, sym, aty, Arc::new(body))
+                Term::fun(Lam, *i, sym, None, aty, Arc::new(body))
             }
             // when checking pair against type, assume sigma
             (Pre::Sigma(i, n1, aty, n2, body), Val::Type) => {
@@ -1999,7 +2027,7 @@ impl SPre {
                 let vaty = aty.eval(cxt.env());
                 let (s, cxt) = cxt.bind(n1, vaty);
                 let body = body.check(Val::Type, &cxt);
-                Term::fun(Sigma(n2), *i, s, aty, Arc::new(body))
+                Term::fun(Sigma(n2), *i, s, None, aty, Arc::new(body))
             }
             (
                 Pre::Sigma(i, None, a, None, b),
@@ -2046,7 +2074,8 @@ impl SPre {
                 let (sym, cxt) = cxt.bind(n, aty.clone());
                 let rty = ty.as_small().app(Val::Neutral(Head::Sym(sym), default()));
                 let body = self.check(rty, &cxt);
-                Term::fun(Lam, Impl, sym, aty2, Arc::new(body))
+                // TODO does 'self matter here?
+                Term::fun(Lam, Impl, sym, None, aty2, Arc::new(body))
             }
             // and similar for implicit sigma
             (
