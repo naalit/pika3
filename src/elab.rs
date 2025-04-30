@@ -1362,6 +1362,11 @@ fn elab_block(block: &[PreStmt], last_: &SPre, ty: Option<GVal>, cxt1: &Cxt) -> 
                 (sym, deps, aty.as_small(), Some(pat), body, span)
             }
         };
+        let deps = t
+            .uncap()
+            .1
+            .map(|v| Region::from_val(v, &deps, &cxt))
+            .unwrap_or(deps);
         deps.check(&cxt, span);
         let t2 = t.quote(&cxt.qenv());
         if let Some(p) = &p {
@@ -1624,13 +1629,13 @@ impl SPre {
                 if q {
                     cxt.push_uquant();
                 }
-                let mut borrows = Vec::new();
+                //let mut borrows = Vec::new();
 
                 let (rself_sym, mut cxt) =
                     cxt.bind(cxt.db.name("'self"), Arc::new(Builtin::Region.into()));
                 cxt.rself = Some(rself_sym);
 
-                let paty = paty.insert_par_regions(*n, &mut borrows, &cxt.db);
+                //let paty = paty.insert_par_regions(*n, &mut borrows, &cxt.db);
                 let aty = cxt.as_eval(|| paty.check(Val::Type, &cxt));
                 let vaty = aty.eval(cxt.env());
                 let (s, cxt) = cxt.bind(*n, vaty.clone());
@@ -1641,37 +1646,37 @@ impl SPre {
                     &cxt,
                     |cxt| {
                         // we don't want just leaving off the return type (which then generates a hole) to mean anything about the return region, that should be inferred
-                        let body = if matches!(&***body, Pre::RegionAnn(_, _))
-                            || matches!(&***body, Pre::Var(v) if *v == cxt.db.name("_"))
-                        {
-                            body.clone()
-                        } else {
-                            // TODO:
-                            // (_: a, _: b) -> a
-                            // ->
-                            // (_: '_ a, _: '_ b) -> '_ '_ a
-                            // but this is a *presyntax* transformation - those '_s aren't separate, they're literally the same variable!
-                            // which... is not really what we want, to be *perfectly* honest.
-                            // partly because '_ should never be the same variable as another '_ - it's the *anonymous* lifetime.
-                            // and partly because, even if you have `(x: a, x: b)`, we probably shouldn't do this transformation at presyntax -
-                            // we should do it in actual syntax, or at least have some way of keeping the two `'x`s separate.
-                            // basicanlly, this should be hygienic in the macro sense, and the way we are currently doing it is not.
-                            S(
-                                Box::new(Pre::RegionAnn(
-                                    borrows
-                                        .into_iter()
-                                        .map(|x| S(Box::new(Pre::Var(x)), body.span()))
-                                        // also include 'self on the return type by default
-                                        .chain(std::iter::once(S(
-                                            Box::new(Pre::Var(cxt.db.name("'self"))),
-                                            body.span(),
-                                        )))
-                                        .collect(),
-                                    body.clone(),
-                                )),
-                                body.span(),
-                            )
-                        };
+                        // let body = if matches!(&***body, Pre::RegionAnn(_, _))
+                        //     || matches!(&***body, Pre::Var(v) if *v == cxt.db.name("_"))
+                        // {
+                        //     body.clone()
+                        // } else {
+                        //     // TODO:
+                        //     // (_: a, _: b) -> a
+                        //     // ->
+                        //     // (_: '_ a, _: '_ b) -> '_ '_ a
+                        //     // but this is a *presyntax* transformation - those '_s aren't separate, they're literally the same variable!
+                        //     // which... is not really what we want, to be *perfectly* honest.
+                        //     // partly because '_ should never be the same variable as another '_ - it's the *anonymous* lifetime.
+                        //     // and partly because, even if you have `(x: a, x: b)`, we probably shouldn't do this transformation at presyntax -
+                        //     // we should do it in actual syntax, or at least have some way of keeping the two `'x`s separate.
+                        //     // basicanlly, this should be hygienic in the macro sense, and the way we are currently doing it is not.
+                        //     S(
+                        //         Box::new(Pre::RegionAnn(
+                        //             borrows
+                        //                 .into_iter()
+                        //                 .map(|x| S(Box::new(Pre::Var(x)), body.span()))
+                        //                 // also include 'self on the return type by default
+                        //                 .chain(std::iter::once(S(
+                        //                     Box::new(Pre::Var(cxt.db.name("'self"))),
+                        //                     body.span(),
+                        //                 )))
+                        //                 .collect(),
+                        //             body.clone(),
+                        //         )),
+                        //         body.span(),
+                        //     )
+                        // };
                         body.check(Val::Type, cxt)
                     },
                 );

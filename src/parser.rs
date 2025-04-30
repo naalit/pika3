@@ -322,6 +322,13 @@ impl Parser {
                 S(Box::new(self.reparse_pattern(lhs, message)), lhs.span()),
                 rhs.clone(),
             ),
+            Pre::Unit => PrePat::Binder(
+                S(
+                    Box::new(PrePat::Name(false, S(self.db.name("_"), param.span()))),
+                    param.span(),
+                ),
+                S(Box::new(Pre::Unit), param.span()),
+            ),
             Pre::Cap(Cap::Mut, p) => match &***p {
                 Pre::Var(name) => PrePat::Name(true, S(*name, param.span())),
                 _ => {

@@ -270,7 +270,7 @@ impl Val {
         match self {
             // Types can't contain (accessible) pointers so they don't care about regions
             // The compiler knowing that makes type-level programming a bit nicer
-            Val::Type => Val::Type,
+            // Val::Type => Val::Type,
             Val::Cap(e, r2, rest) if r.is_none() => Val::Cap(e, r2, rest),
             Val::Cap(e, _, rest) => Val::Cap(e, r, rest),
             _ => Val::Cap(Cap::Own, r, Arc::new(self)),
