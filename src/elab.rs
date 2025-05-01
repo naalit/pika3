@@ -1645,13 +1645,12 @@ impl SPre {
                 let (rself_sym, mut cxt) =
                     cxt.bind(cxt.db.name("'self"), Arc::new(Builtin::Region.into()));
                 cxt.rself = Some(rself_sym);
-                let ra = cxt.bind_(cxt.db.name("'_"), Arc::new(Builtin::Region.into()));
+                // let ra = cxt.bind_(cxt.db.name("'_"), Arc::new(Builtin::Region.into()));
 
                 //let paty = paty.insert_par_regions(*n, &mut borrows, &cxt.db);
                 let aty = cxt.as_eval(|| paty.check(Val::Type, &cxt));
-                let vaty = aty
-                    .eval(cxt.env())
-                    .with_region(Some(vec![Arc::new(Val::sym(ra))]));
+                let vaty = aty.eval(cxt.env());
+                //.with_region(Some(vec![Arc::new(Val::sym(ra))]));
                 let aty = vaty.quote(cxt.qenv());
                 let (s, cxt) = cxt.bind(*n, vaty.clone());
                 let body = pat_bind_type(
@@ -1700,7 +1699,7 @@ impl SPre {
                     scope
                         .into_iter()
                         .flatten()
-                        .chain(std::iter::once((ra, Arc::new(Builtin::Region.into()))))
+                        // .chain(std::iter::once((ra, Arc::new(Builtin::Region.into()))))
                         .rfold(
                             Term::fun(Pi(*c), *i, s, Some(rself_sym), aty, Arc::new(body)),
                             |acc, (s, ty)| {
@@ -1731,6 +1730,11 @@ impl SPre {
                 let before_syms: FxHashSet<_> = cxt.vars.keys().copied().collect();
                 let (s, pat) = PMatch::new(None, &[pat.clone()], None, &mut cxt2);
                 let aty = pat.ty.clone();
+                // // TODO do we need this region??
+                // let ra = cxt2.bind_(cxt.db.name("'_"), Arc::new(Builtin::Region.into()));
+                // let aty3 = (*pat.ty)
+                //     .clone()
+                //     .with_region(Some(vec![Arc::new(Val::sym(ra))]));
                 let aty2 = aty.quote(cxt.qenv());
 
                 cxt2.push_closure(s);
@@ -1979,13 +1983,13 @@ impl SPre {
                 let c = *c;
                 let mut cxt = cxt.clone();
                 let before_syms: FxHashSet<_> = cxt.vars.keys().copied().collect();
-                let (sym, pat) = PMatch::new(
-                    Some((**aty2).clone().glued()),
-                    &[pat.clone()],
-                    None,
-                    &mut cxt,
-                );
                 let aty = aty2.quote(cxt.qenv());
+                let ra = cxt.bind_(cxt.db.name("'_"), Arc::new(Builtin::Region.into()));
+                let aty3 = (**aty2)
+                    .clone()
+                    .with_region(Some(vec![Arc::new(Val::sym(ra))]));
+                let (sym, pat) =
+                    PMatch::new(Some(aty3.clone().glued()), &[pat.clone()], None, &mut cxt);
 
                 let va = Val::Neutral(Head::Sym(sym), default());
                 // TODO why doesn't as_small() work here
