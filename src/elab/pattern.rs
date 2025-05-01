@@ -707,7 +707,7 @@ fn compile_rows(rows: &[PRow], pcxt: &mut PCxt, state: &PState, cxt: &Cxt) -> PT
             .flat_map(|r| &r.cols)
             .any(|(s, _, p)| s == var && p.needs_split(&cxt.db))
             || matches!(
-                &**ty,
+                ty.uncap().2,
                 Val::Fun(VFun {
                     class: Sigma(_),
                     icit: Impl,

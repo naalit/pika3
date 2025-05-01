@@ -2233,6 +2233,20 @@ impl GVal {
             .1
             .map(|x| Region::from_val(x, &r, cxt))
             .unwrap_or(r);
+        if matches!((to.whnf(cxt), self.whnf(cxt)), (Val::Neutral(Head::Meta(m), v), Val::Cap(Cap::Own, r, _))
+            if cxt.meta_val(*m).is_none()
+            && r.iter().flatten().any(|p| matches!(&**p, Val::Neutral(Head::Sym(s), v2) if v2.is_empty() && !v.contains(&VElim::App(Expl, Arc::new(Val::sym(*s)))))))
+        {
+            // We're trying to solve `?1 a b c` to `'d t`, where `'d` is *not* in scope for `?1`
+            // That's actually fine (since we know we're coercing - this needs to be here and not in `unify`), we just coerce `'d t` to `t`
+            return self
+                .as_big()
+                .uncap()
+                .2
+                .clone()
+                .glued()
+                .coerce(to, r, span, cxt);
+        }
         if !to.clone().unify(None, self.clone(), r.values(), span, cxt) {
             // Try to coerce if possible
             match (to.whnf(cxt), self.whnf(cxt)) {
