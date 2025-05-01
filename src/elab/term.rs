@@ -320,7 +320,13 @@ impl VFun {
                 icit: self.icit,
                 psym: self.psym,
                 rself_sym: self.rself_sym,
-                pty: Box::new(self.pty.quote_(env)?),
+                pty: Box::new(self.pty.quote_(&env.clone().tap_mut(|x| {
+                    if let Some(pcxt) = &mut x.partial_cxt {
+                        if let Some(r) = self.rself_sym {
+                            pcxt.insert(r);
+                        }
+                    }
+                }))?),
                 body: self.body.clone(),
             })
         } else {
