@@ -36,7 +36,7 @@ pub struct Module {
 #[derive(Clone, Debug)]
 pub struct DefElabResult {
     pub def: DefElab,
-    pub unsolved_metas: Vec<(Meta, S<MetaSource>)>,
+    pub unsolved_metas: Vec<(Meta, S<MetaSource>, Arc<Val>)>,
     pub solved_metas: Vec<(Meta, Arc<Val>)>,
     pub errors: Arc<[Error]>,
 }
@@ -60,12 +60,12 @@ pub fn elab_module(file: File, def: Def, db: &DB) -> ModuleElabResult {
         if let Ok(elab) = db.elab.def_value(def, db) {
             let span = elab.def.name.span();
             defs.push(elab.def);
-            for (m, source) in elab.unsolved_metas {
+            for (m, source, ty) in elab.unsolved_metas {
                 if root_cxt.meta_val(m).is_none() {
                     source_map.insert(m, source);
-                    root_cxt.metas.with_mut(|v| {
-                        v.insert(m, MetaEntry::Unsolved(Arc::new(Val::Error), source))
-                    });
+                    root_cxt
+                        .metas
+                        .with_mut(|v| v.insert(m, MetaEntry::Unsolved(ty, source)));
                 }
             }
             for (m, val) in elab.solved_metas {
@@ -332,7 +332,7 @@ pub fn elab_def(def: Def, db: &DB) -> Option<DefElabResult> {
         unsolved_metas: cxt.metas.with(|m| {
             m.iter()
                 .filter_map(|(m, v)| match v {
-                    MetaEntry::Unsolved(_, source) => Some((*m, *source)),
+                    MetaEntry::Unsolved(t, source) => Some((*m, *source, t.clone())),
                     MetaEntry::Solved(_) => None,
                 })
                 .collect()
@@ -537,15 +537,15 @@ impl VarResult<'_> {
 
                 cxt.add_deps(deps.clone());
                 if let Val::Cap(_, Some(r), _) = &mut ty {
-                    eprintln!(
-                        "{} / {}",
-                        Val::Region(r.clone()).pretty(&cxt.db),
-                        Val::Region(deps.values()).pretty(&cxt.db)
-                    );
+                    // eprintln!(
+                    //     "{} / {}",
+                    //     Val::Region(r.clone()).pretty(&cxt.db),
+                    //     Val::Region(deps.values()).pretty(&cxt.db)
+                    // );
                     *r = Region::from_val(r.clone(), &default(), cxt)
                         .tap_mut(|r| r.add(deps, cxt))
                         .values();
-                    eprintln!("-> {}", Val::Region(r.clone()).pretty(&cxt.db));
+                    // eprintln!("-> {}", Val::Region(r.clone()).pretty(&cxt.db));
                     //r.extend(deps.values);
                 }
 
@@ -1323,7 +1323,6 @@ fn insert_metas(term: Term, mut ty: GVal, cxt: &Cxt, span: Span) -> (Term, GVal)
             pty: aty,
             ..
         }) => {
-            eprintln!("{}", aty.pretty(&cxt.db));
             let m = cxt.new_meta((**aty).clone(), MetaSource::ImpArg(n.0), span);
             let term = Term::App(
                 Box::new(term),
@@ -1634,10 +1633,14 @@ impl SPre {
                 let (rself_sym, mut cxt) =
                     cxt.bind(cxt.db.name("'self"), Arc::new(Builtin::Region.into()));
                 cxt.rself = Some(rself_sym);
+                let ra = cxt.bind_(cxt.db.name("'_"), Arc::new(Builtin::Region.into()));
 
                 //let paty = paty.insert_par_regions(*n, &mut borrows, &cxt.db);
                 let aty = cxt.as_eval(|| paty.check(Val::Type, &cxt));
-                let vaty = aty.eval(cxt.env());
+                let vaty = aty
+                    .eval(cxt.env())
+                    .with_region(Some(vec![Arc::new(Val::sym(ra))]));
+                let aty = vaty.quote(cxt.qenv());
                 let (s, cxt) = cxt.bind(*n, vaty.clone());
                 let body = pat_bind_type(
                     &paty,
@@ -1682,20 +1685,24 @@ impl SPre {
                 );
                 let scope = q.then(|| cxt.pop_uquant().unwrap());
                 (
-                    scope.into_iter().flatten().rfold(
-                        Term::fun(Pi(*c), *i, s, Some(rself_sym), aty, Arc::new(body)),
-                        |acc, (s, ty)| {
-                            Term::fun(
-                                // use imm for the uquant pis
-                                Pi(FCap::Imm),
-                                Impl,
-                                s,
-                                None, // TODO what is the proper region assignment for uquant pis?
-                                ty.quote(cxt.qenv()),
-                                Arc::new(acc),
-                            )
-                        },
-                    ),
+                    scope
+                        .into_iter()
+                        .flatten()
+                        .chain(std::iter::once((ra, Arc::new(Builtin::Region.into()))))
+                        .rfold(
+                            Term::fun(Pi(*c), *i, s, Some(rself_sym), aty, Arc::new(body)),
+                            |acc, (s, ty)| {
+                                Term::fun(
+                                    // use imm for the uquant pis
+                                    Pi(FCap::Imm),
+                                    Impl,
+                                    s,
+                                    None, // TODO what is the proper region assignment for uquant pis?
+                                    ty.quote(cxt.qenv()),
+                                    Arc::new(acc),
+                                )
+                            },
+                        ),
                     Val::Type,
                 )
             }

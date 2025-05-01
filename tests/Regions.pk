@@ -1,0 +1,12 @@
+def empty (x : '() a) : '() a = x
+def named (x : 'a a) : 'a a = x
+def unnamed (x : a) : a = x
+def explicit ('a : Region, x : 'a a) : 'a a = x
+
+def coerce_away (x : 'a t) : t = x
+def coerce_into (x : t) : 'a t = x
+
+# hey look a soundness bug!
+def helper_ty = () ~> '() Data
+def return_closure : Data -> helper_ty = x => () => x
+def erase_region : 'a Data -> '() Data = x => return_closure x ()

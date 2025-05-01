@@ -271,8 +271,9 @@ impl Val {
             // Types can't contain (accessible) pointers so they don't care about regions
             // The compiler knowing that makes type-level programming a bit nicer
             // Val::Type => Val::Type,
-            Val::Cap(e, r2, rest) if r.is_none() => Val::Cap(e, r2, rest),
-            Val::Cap(e, _, rest) => Val::Cap(e, r, rest),
+            Val::Cap(e, r2, rest) if r2.is_none() => Val::Cap(e, r, rest),
+            // if both are real regions just keep the existing one
+            Val::Cap(e, r2, rest) => Val::Cap(e, r2, rest),
             _ => Val::Cap(Cap::Own, r, Arc::new(self)),
         }
     }
@@ -995,7 +996,7 @@ impl Pretty for Term {
         match self {
             // "expected ?42.8 x y y _ 'a _" is likely not a terribly helpful error message
             _ if matches!(self.head(), Term::Head(Head::Meta(_))) => Doc::start("_"),
-            Term::Head(Head::Sym(s)) => Doc::start(db.get(s.0)),
+            Term::Head(Head::Sym(s)) => Doc::start(db.get(s.0)), // + "." + Doc::start(s.1),
             Term::Head(Head::Def(d)) => db.idefs.get(*d).name().pretty(db),
             Term::Head(Head::Meta(m)) => m.pretty(db),
             Term::Head(Head::Builtin(b)) => Doc::start(b),

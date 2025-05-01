@@ -19,7 +19,7 @@ pub fn pat_bind_type(
     if !ty_pat_bind_needed(pre_ty, cxt) {
         return body(cxt);
     }
-    match (&***pre_ty, ty) {
+    match (&***pre_ty, ty.uncap().2) {
         (
             Pre::Sigma(i, n1, _, n2, rest),
             Val::Fun(VFun {
