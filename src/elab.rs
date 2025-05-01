@@ -205,6 +205,18 @@ pub fn elab_def(def: Def, db: &DB) -> Option<DefElabResult> {
                 .take()
                 .check(&cxt, value.as_ref().map_or(name.span(), |x| x.span()));
 
+            // Solve unsolved regions to '()
+            cxt.metas.with_mut(|m| {
+                m.iter_mut().for_each(|(m, e)| match e {
+                    MetaEntry::Unsolved(t, _)
+                        if matches!(**t, Val::Neutral(Head::Builtin(Builtin::Region), _)) =>
+                    {
+                        *e = MetaEntry::Solved(Arc::new(Val::Region(Vec::new())))
+                    }
+                    _ => (),
+                })
+            });
+
             body.as_mut().map(|x| x.zonk(&cxt, false));
             let ty = ty.zonk(&cxt, true);
             if !solved_ty {

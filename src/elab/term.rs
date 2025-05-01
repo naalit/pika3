@@ -700,6 +700,10 @@ impl VElim {
                 q
             }
 
+            // HACK: we solve unsolved region metas to '(), but we don't know how many pis to insert
+            // so we have to do this (TODO better way of doing this obviously, this is just a fundamental problem with the way meta types are handled)
+            (VElim::App(_, _), v @ Val::Region(_)) => v,
+
             (s, v) => {
                 // TODO how do we get the error out of here?
                 eprintln!("illegal elimination {:?}\non {:?}", s, v);
