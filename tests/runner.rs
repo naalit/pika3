@@ -42,7 +42,7 @@ fn demo() {
 #[test]
 fn demo_errors() {
     // TODO: this is fine for now but i think some of these errors are duplicates that we should try to get rid of at some point
-    test(&["DemoErr.pk"]).num_errors(56);
+    test(&["DemoErr.pk"]).num_errors(55);
 }
 
 #[test]
@@ -53,4 +53,9 @@ fn multifile() {
 #[test]
 fn sum_type() {
     test(&["SumType.pk"]).succeeds();
+}
+
+#[test]
+fn regions() {
+    test(&["Regions.pk"]).num_errors(2);
 }

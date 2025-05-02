@@ -734,6 +734,12 @@ impl Cxt {
         let r = f();
         (self.current_deps.set(before), r)
     }
+    fn start_record_deps(&self) -> Region {
+        self.current_deps.take()
+    }
+    fn end_record_deps(&self, r: Region) -> Region {
+        self.current_deps.set(r)
+    }
 
     fn lookup(&self, n: SName) -> Option<VarResult> {
         // first try locals
@@ -1478,6 +1484,7 @@ impl SPre {
         with_stack(|| self.infer_(cxt, should_insert_metas, Cap::Own))
     }
     fn infer_(&self, cxt: &Cxt, mut should_insert_metas: bool, borrow_as: Cap) -> (Term, GVal) {
+        let checkpoint = cxt.start_record_deps();
         let (s, sty) = match &***self {
             Pre::Var(name) if cxt.db.name("_") == *name => {
                 // hole
@@ -1800,11 +1807,15 @@ impl SPre {
             }
             // Similarly assume non-dependent pair
             Pre::Sigma(i, None, a, None, b) => {
-                let (a, aty) = a.infer(cxt, true);
-                let aty = Arc::new(aty.as_small());
+                let (ra, (a, aty)) = cxt.record_deps(|| a.infer(cxt, true));
+                let aty = Arc::new(aty.as_small().with_region(Some(ra.values())));
                 let (s, cxt) = cxt.bind(cxt.db.name("_"), aty.clone());
-                let (b, bty) = b.infer(&cxt, true);
-                let bty = bty.small().quote(cxt.qenv());
+                let (rb, (b, bty)) = cxt.record_deps(|| b.infer(&cxt, true));
+                let bty = bty
+                    .small()
+                    .clone()
+                    .with_region(Some(rb.values()))
+                    .quote(cxt.qenv());
                 (
                     Term::Pair(Box::new(a), Box::new(b)),
                     Val::fun(
@@ -1838,6 +1849,7 @@ impl SPre {
             }
             // temporary desugaring (eventually we do need the larger structure for method syntax)
             Pre::Dot(lhs, dot, Some((icit, rhs))) => {
+                cxt.end_record_deps(checkpoint);
                 return S(
                     Box::new(Pre::App(
                         S(Box::new(Pre::Dot(lhs.clone(), *dot, None)), self.span()),
@@ -1846,7 +1858,7 @@ impl SPre {
                     )),
                     self.span(),
                 )
-                .infer_(cxt, should_insert_metas, borrow_as)
+                .infer_(cxt, should_insert_metas, borrow_as);
             }
             Pre::Dot(lhs, dot, None) => {
                 let lspan = lhs.span();
@@ -1893,29 +1905,9 @@ impl SPre {
                 }
             }
             Pre::Case(x, branches) => {
-                let span = x.span();
-                let (xdeps, (x, xty)) = cxt.record_deps(|| x.infer(cxt, true));
-                let pats: Vec<_> = branches.iter().map(|(a, _)| a.clone()).collect();
-                let mut cxt = cxt.clone();
-                let (s, p) = PMatch::new(Some(xty), &pats, Some(span), &mut cxt);
                 let rty = cxt.new_meta(Val::Type, MetaSource::Hole, self.span());
-                let mut bodies = Vec::new();
-                for (i, (_, v)) in branches.iter().enumerate() {
-                    if !p.reached(i as u32) {
-                        // Really, this should probably be a warning, but that would require checking the body anyway for other type errors
-                        // Which is not super easy to do with the current pattern matching system, so we're leaving this for now
-                        cxt.err("unreachable match branch", v.span());
-                        bodies.push(Term::Error);
-                    } else {
-                        let cxt = p.bind(i as u32, &xdeps, &cxt);
-                        let v = v.check(rty.clone(), &cxt);
-                        bodies.push(v);
-                    }
-                }
-                let t = p.compile(&bodies, &cxt);
-                // TODO do we need 'self regions here?
-                let t = Term::fun(Lam, Expl, s, None, p.ty.quote(cxt.qenv()), Arc::new(t));
-                (Term::App(Box::new(t), TElim::App(Expl, Box::new(x))), rty)
+                let t = elab_case(cxt, x, branches, rty.clone().glued());
+                (t, rty)
             }
             Pre::Assign(a, b) => {
                 let (a, aty) = a.infer_(cxt, true, Cap::Mut);
@@ -1941,6 +1933,12 @@ impl SPre {
             Pre::Type => (Term::Type, Val::Type),
             Pre::Error => (Term::Error, Val::Error),
         };
+        let r = cxt.end_record_deps(checkpoint);
+        let (sty, r) = match sty {
+            Val::Cap(Cap::Own, Some(r2), sty) => ((*sty).clone(), Region::from_val(r2, &r, cxt)),
+            sty => (sty, r),
+        };
+        cxt.add_deps(r);
         let sty = sty.glued();
         if should_insert_metas
             && !matches!(
@@ -2081,6 +2079,7 @@ impl SPre {
                 Term::Pair(Box::new(a), Box::new(b))
             }
             (Pre::Do(block, last), _) => return elab_block(block, last, Some(ty), cxt).0,
+            (Pre::Case(x, branches), _) => return elab_case(cxt, x, branches, ty),
             (Pre::Unit, Val::Type) => Builtin::UnitType.into(),
 
             // insert lambda when checking (non-implicit lambda) against implicit function type
@@ -2177,6 +2176,36 @@ impl SPre {
         }
         r
     }
+}
+
+fn elab_case(
+    cxt: &Cxt,
+    x: &S<Box<Pre>>,
+    branches: &Vec<(S<Box<PrePat>>, S<Box<Pre>>)>,
+    rty: GVal,
+) -> Term {
+    let span = x.span();
+    let (xdeps, (x, xty)) = cxt.record_deps(|| x.infer(cxt, true));
+    let pats: Vec<_> = branches.iter().map(|(a, _)| a.clone()).collect();
+    let mut cxt = cxt.clone();
+    let (s, p) = PMatch::new(Some(xty), &pats, Some(span), &mut cxt);
+    let mut bodies = Vec::new();
+    for (i, (_, v)) in branches.iter().enumerate() {
+        if !p.reached(i as u32) {
+            // Really, this should probably be a warning, but that would require checking the body anyway for other type errors
+            // Which is not super easy to do with the current pattern matching system, so we're leaving this for now
+            cxt.err("unreachable match branch", v.span());
+            bodies.push(Term::Error);
+        } else {
+            let cxt = p.bind(i as u32, &xdeps, &cxt);
+            let v = v.check(rty.clone(), &cxt);
+            bodies.push(v);
+        }
+    }
+    let t = p.compile(&bodies, &cxt);
+    // TODO do we need 'self regions here?
+    let t = Term::fun(Lam, Expl, s, None, p.ty.quote(cxt.qenv()), Arc::new(t));
+    Term::App(Box::new(t), TElim::App(Expl, Box::new(x)))
 }
 fn coerce_region(from: &Region, to: &Region, span: Span, cxt: &Cxt) -> bool {
     // Necessary to deal with metas solved to borrows
