@@ -1660,6 +1660,12 @@ impl SPre {
                 //.with_region(Some(vec![Arc::new(Val::sym(ra))]));
                 let aty = vaty.quote(cxt.qenv());
                 let (s, cxt) = cxt.bind(*n, vaty.clone());
+                // Any curried pis with unspecified caps (from function syntax) will be updated to be owned functions
+                let body = if vaty.is_owned() {
+                    body.update_fcaps_to_own()
+                } else {
+                    body.clone()
+                };
                 let body = pat_bind_type(
                     &paty,
                     Val::Neutral(Head::Sym(s), default()),
@@ -1708,7 +1714,14 @@ impl SPre {
                         .flatten()
                         // .chain(std::iter::once((ra, Arc::new(Builtin::Region.into()))))
                         .rfold(
-                            Term::fun(Pi(*c), *i, s, Some(rself_sym), aty, Arc::new(body)),
+                            Term::fun(
+                                Pi(c.unwrap_or(FCap::Imm)),
+                                *i,
+                                s,
+                                Some(rself_sym),
+                                aty,
+                                Arc::new(body),
+                            ),
                             |acc, (s, ty)| {
                                 Term::fun(
                                     // use imm for the uquant pis
@@ -2175,6 +2188,21 @@ impl SPre {
             }
         }
         r
+    }
+    fn update_fcaps_to_own(&self) -> SPre {
+        match &***self {
+            Pre::Pi(i, n, None, aty, rty) => S(
+                Box::new(Pre::Pi(
+                    *i,
+                    *n,
+                    Some(FCap::Own),
+                    aty.clone(),
+                    rty.update_fcaps_to_own(),
+                )),
+                self.span(),
+            ),
+            _ => self.clone(),
+        }
     }
 }
 

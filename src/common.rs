@@ -426,7 +426,11 @@ pub struct Label {
 }
 impl Label {
     fn ariadne(self, file: File, db: &DB) -> ariadne::Label<CharSpan> {
-        let span = self.span.abs(file).chars(db);
+        let mut span = self.span.abs(file).chars(db);
+        if span.1.start > span.1.end {
+            eprintln!("INTERNAL WARNING: span start after span end");
+            std::mem::swap(&mut span.1.start, &mut span.1.end);
+        }
         let mut l = ariadne::Label::new(span).with_message(self.message.to_string(true));
         if let Some(color) = self.color {
             l = l.with_color(color);

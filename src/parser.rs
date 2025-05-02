@@ -58,7 +58,8 @@ pub enum Pre {
     Var(Name),
     Binder(SPre, SPre),
     App(SPre, SPre, Icit),
-    Pi(Icit, Name, FCap, SPre, SPre),
+    // FCap is ommitted in function syntax so we can infer -> or ~> with currying
+    Pi(Icit, Name, Option<FCap>, SPre, SPre),
     Sigma(Icit, Option<SName>, SPre, Option<SName>, SPre),
     Lam(Icit, SPrePat, SPre),
     Do(Vec<PreStmt>, SPre),
@@ -655,7 +656,7 @@ impl Parser {
             let (name, lhs) = self.reparse_pi_param(lhs);
             let name = name.map(|x| *x).unwrap_or(self.db.name("_"));
             S(
-                Box::new(Pre::Pi(icit, name, c, lhs, rhs)),
+                Box::new(Pre::Pi(icit, name, Some(c), lhs, rhs)),
                 Span(start, self.pos_right()),
             )
         } else if self.maybe(Tok::WideArrow) {
@@ -742,7 +743,7 @@ impl Parser {
                                 Box::new(Pre::Pi(
                                     *icit,
                                     name.as_deref().copied().unwrap_or(self.db.name("_")),
-                                    FCap::Imm,
+                                    None,
                                     aty,
                                     ty,
                                 )),
@@ -768,7 +769,13 @@ impl Parser {
 
         self.expect(Tok::DefKw);
         let name = self.spanned(Self::name);
+        let mut last = self.pos - 1;
         let args: Vec<_> = std::iter::from_fn(|| {
+            // make sure this iterator doesn't run infinitely (possible in weird edge cases)
+            if self.pos == last {
+                return None;
+            }
+            last = self.pos;
             self.maybe(Tok::COpen)
                 .then(|| {
                     let a = self.term();
@@ -799,14 +806,18 @@ impl Parser {
             .map(|mut ty| {
                 for (icit, arg) in args.iter().rev() {
                     let span = Span(arg.span().0, ty.span().1);
-                    let arg = arg.extract_ty(&self.db);
+                    // TODO ???
+                    let arg = arg.extract_ty(&self.db).unwrap_or_else(|| {
+                        self.error("illegal type argument (??)", arg.span());
+                        S(Box::new(Pre::Error), arg.span())
+                    });
                     let (name, aty) = self.reparse_pi_param(arg.clone());
                     ty = S(
                         Box::new(Pre::Pi(
                             *icit,
                             name.as_deref().copied().unwrap_or(self.db.name("_")),
                             // TODO how do we specify these on function definitions?
-                            FCap::Imm,
+                            None,
                             aty,
                             ty,
                         )),
@@ -855,15 +866,15 @@ impl Parser {
 }
 
 impl SPrePat {
-    pub fn extract_ty(&self, db: &DB) -> SPre {
-        S(
+    pub fn extract_ty(&self, db: &DB) -> Option<SPre> {
+        Some(S(
             Box::new(match &***self {
                 PrePat::Name(_, s) => Pre::Binder(
                     S(Box::new(Pre::Var(**s)), s.span()),
                     S(Box::new(Pre::Var(db.name("_"))), s.span()),
                 ),
                 PrePat::Binder(s, s1) => {
-                    let s = s.extract_ty(db);
+                    let s = s.extract_ty(db)?;
                     match &**s {
                         // Hopefully we're not ignoring anything important!
                         Pre::Binder(x, _) => Pre::Binder(x.clone(), s1.clone()),
@@ -871,7 +882,7 @@ impl SPrePat {
                     }
                 }
                 PrePat::Pair(icit, a, b) => {
-                    let mut a = a.extract_ty(db);
+                    let mut a = a.extract_ty(db)?;
                     let n1 = match &**a {
                         Pre::Binder(x, y) => match &***x {
                             Pre::Var(n) => {
@@ -883,7 +894,7 @@ impl SPrePat {
                         },
                         _ => None,
                     };
-                    let mut b = b.extract_ty(db);
+                    let mut b = b.extract_ty(db)?;
                     let n2 = match &**b {
                         Pre::Binder(x, y) => match &***x {
                             Pre::Var(n) => {
@@ -897,11 +908,11 @@ impl SPrePat {
                     };
                     Pre::Sigma(*icit, n1, a, n2, b)
                 }
-                PrePat::Cons(s, _) => todo!(),
+                PrePat::Cons(s, _) => return None,
                 PrePat::Error => Pre::Error,
             }),
             self.span(),
-        )
+        ))
     }
 }
 

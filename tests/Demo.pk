@@ -317,3 +317,5 @@ def p55_fun_impl {x : Data} = x
 
 def return_borrow (x : mut 'a Data) : '(_) imm Data = x
 def return_borrow2 (x : 'a mut Data) : 'a Type = p30_imm x
+
+def curry_owned (x : Data) (y : Data) : Data = x # should have type: Data -> Data ~> Data
