@@ -182,27 +182,21 @@ def p15_ambient : ('a Nat, 'b Nat) -> 'a 'b Nat = (x, y) => add x y
 # this works because 'r can't be solved to 'a because of meta scope restrictions ('r is a parameter of with_fun but 'a is a parameter of the closure)
 def with_fun : ({'a:_} -> 'a (U ~> U) ~> 'r r) -> r = f => f {'()} (x => x)
 def p21_good =
-  with_fun (f => do
-    let f2 = with_fun
-      (g => do
-        let (f2, g2) = (f, g)
-        g2 U
-        f2
-      )
+  with_fun do f =>
+    let f2 = with_fun do g =>
+      let (f2, g2) = (f, g)
+      g2 U
+      f2
     f2 U
     U
-  )
 # def p22_bad_e =
-#   with_fun (f => do
-#     let f2 = with_fun
-#       (g => do
-#         let (f2, g2) = (f, g)
-#         f2 U
-#         g2 # not allowed to escape this with_fun call!
-#       )
+#   with_fun do f =>
+#     let f2 = with_fun do g =>
+#       let (f2, g2) = (f, g)
+#       f2 U
+#       g2 # not allowed to escape this with_fun call!
 #     f2 U
 #     U
-#   )
 
 # def p23_dup_e : a -> (a, a) = x => (x, x)
 def p24_dup_type : Type -> (Type, Type) = x => (x, x)

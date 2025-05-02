@@ -248,6 +248,22 @@ impl Parser {
             );
         }
     }
+    fn maybe_raw(&mut self, t: Tok) -> bool {
+        if self.peek() == t {
+            self.next_raw();
+            true
+        } else {
+            false
+        }
+    }
+    fn expect_raw(&mut self, t: Tok) {
+        if !self.maybe_raw(t) {
+            self.error(
+                &format!("expected {}, found {}", t, self.peek()),
+                self.tok_span(),
+            );
+        }
+    }
 
     fn spanned<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> S<T> {
         let start = self.pos();
@@ -408,11 +424,40 @@ impl Parser {
                     *t.0
                 }
                 Tok::DoKw => {
+                    let kw_span = s.tok_span();
                     s.next_raw();
                     s.skip_trivia_();
-                    if s.maybe(Tok::Indent) {
+                    let pat = if s.maybe(Tok::Indent) {
                         s.indent_stack.push(false);
-                    }
+                        None
+                    } else {
+                        // Do-lambda!!
+                        let icit = s.maybe(Tok::COpen);
+                        let lhs = (s.peek() != Tok::WideArrow).then(|| s.app());
+                        let pat = S(
+                            Box::new(match &lhs {
+                                Some(lhs) => s.reparse_pattern(
+                                    lhs,
+                                    &Doc::start("expected pattern in lambda argument"),
+                                ),
+                                None => PrePat::Binder(
+                                    S(
+                                        Box::new(PrePat::Name(false, S(s.db.name("_"), kw_span))),
+                                        kw_span,
+                                    ),
+                                    S(Box::new(Pre::Unit), kw_span),
+                                ),
+                            }),
+                            lhs.map_or(kw_span, |x| x.span()),
+                        );
+                        if icit {
+                            s.expect(Tok::CClose);
+                        }
+                        s.expect_raw(Tok::WideArrow);
+                        s.expect(Tok::Indent);
+                        s.indent_stack.push(false);
+                        Some((pat, icit))
+                    };
                     let r = s.indent_stack.len();
                     let mut v = Vec::new();
                     loop {
@@ -449,7 +494,14 @@ impl Parser {
                             );
                             s.spanned(|_| Box::new(Pre::Error))
                         });
-                    Pre::Do(v, last)
+                    let t = Pre::Do(v, last);
+                    match pat {
+                        None => t,
+                        Some((pat, implicit)) => {
+                            let t = S(Box::new(t), Span(kw_span.0, s.pos_right()));
+                            Pre::Lam(if implicit { Impl } else { Expl }, pat, t)
+                        }
+                    }
                 }
                 _ => {
                     s.error("expected expression", s.tok_span());
