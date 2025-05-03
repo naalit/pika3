@@ -1737,6 +1737,7 @@ impl SPre {
                     Val::Type,
                 )
             }
+            // TODO do we still default to interpreting `(x : a, y : b)` as a type? or a named sigma literal?
             Pre::Sigma(_, Some(_), _, _, _) | Pre::Sigma(_, _, _, Some(_), _) => {
                 (self.check(Val::Type, cxt), Val::Type)
             }
@@ -2068,6 +2069,183 @@ impl SPre {
                 let body = body.check(Val::Type, &cxt);
                 Term::fun(Sigma(n2), *i, s, None, aty, Arc::new(body))
             }
+            // process named sigma literals
+            (
+                Pre::Sigma(i, Some(_), _, _, _),
+                Val::Fun(VFun {
+                    class: Sigma(_),
+                    icit: i2,
+                    ..
+                }),
+            ) if i == i2 => {
+                // TODO I don't think we properly handle sigmas with mixed icits here (probably we should just error in that case though)
+                let mut cxt = cxt.clone();
+                let mut map = HashMap::new();
+                let mut s = self.clone();
+                let mut terms: Vec<(Icit, SName, Term, Val)> = Vec::new();
+                loop {
+                    match &**s {
+                        Pre::Sigma(i, Some(n1), r1, n2, r2) => {
+                            if let Some((_, n, _, _)) =
+                                terms.iter().find(|(_, n, _, _)| n.0 == **n1)
+                            {
+                                cxt.errors.push(
+                                    Error::simple(
+                                        "duplicate field "
+                                            + n1.pretty(&cxt.db)
+                                            + " in struct literal",
+                                        n1.span(),
+                                    )
+                                    .with_secondary(Label {
+                                        span: n.span(),
+                                        message: "this field has the same name".into(),
+                                        color: Some(Doc::COLOR2),
+                                    }),
+                                );
+                                break;
+                            }
+                            let t1 = ty.big().extract_sigma_type(**n1, &map).unwrap_or_else(|| {
+                                cxt.err(
+                                    "field "
+                                        + n1.pretty(&cxt.db)
+                                        + " undefined for type "
+                                        + ty.small().pretty(&cxt.db),
+                                    n1.span(),
+                                );
+                                Val::Error
+                            });
+                            let (can_eval, r1) = cxt.maybe_as_eval(|| r1.check(t1.clone(), &cxt));
+                            if can_eval.is_none() {
+                                map.insert(**n1, Arc::new(r1.eval(cxt.env())));
+                            }
+                            terms.push((*i, *n1, r1, t1));
+                            match n2 {
+                                None => s = r2.clone(),
+                                Some(n2) => {
+                                    s = S(
+                                        Box::new(Pre::Sigma(
+                                            Expl,
+                                            Some(*n2),
+                                            r2.clone(),
+                                            None,
+                                            // Pre::Error is the signal to stop (lets us not repeat the code above)
+                                            S(Box::new(Pre::Error), Span(0, 0)),
+                                        )),
+                                        s.span(),
+                                    )
+                                }
+                            }
+                        }
+                        Pre::Error => break,
+                        _ => {
+                            cxt.err("expected named field in named struct literal", s.span());
+                            break;
+                        }
+                    }
+                }
+                let term = terms
+                    .iter()
+                    .rfold(None, |acc, (_, _, t, _)| match acc {
+                        None => Some(t.clone()),
+                        Some(t2) => Some(Term::Pair(Box::new(t.clone()), Box::new(t2.clone()))),
+                    })
+                    .unwrap();
+                let mut syms: Vec<_> = terms
+                    .iter()
+                    .map(|(_, n, _, t)| cxt.bind_(**n, t.clone()))
+                    .collect();
+                let mut terms2 = Vec::new();
+                let mut t = ty.big().clone();
+                loop {
+                    match t {
+                        Val::Fun(VFun {
+                            class: Sigma(n2),
+                            psym,
+                            ..
+                        }) => {
+                            let v = if let Some(sym) = syms.iter().find(|s| s.0 == psym.0) {
+                                terms2.push(Term::Head(Head::Sym(*sym)));
+                                Val::sym(*sym)
+                            } else {
+                                cxt.err(
+                                    "missing field "
+                                        + psym.0.pretty(&cxt.db)
+                                        + " in named struct literal of type "
+                                        + ty.small().pretty(&cxt.db),
+                                    self.span(),
+                                );
+                                Val::Error
+                            };
+                            if n2 != cxt.db.name("_") {
+                                if let Some(sym) = syms.iter().find(|s| s.0 == n2) {
+                                    terms2.push(Term::Head(Head::Sym(*sym)));
+                                } else {
+                                    cxt.err(
+                                        "missing field "
+                                            + n2.pretty(&cxt.db)
+                                            + " in named struct literal of type "
+                                            + ty.small().pretty(&cxt.db),
+                                        self.span(),
+                                    );
+                                }
+                                break;
+                            } else {
+                                t = t.app(v);
+                            }
+                        }
+                        _ => {
+                            cxt.err(
+                                "named struct literal not allowed with type "
+                                    + ty.small().pretty(&cxt.db)
+                                    + " which has unnamed fields",
+                                self.span(),
+                            );
+                            break;
+                        }
+                    }
+                }
+                let term2 = terms2
+                    .iter()
+                    .rfold(None, |acc, t| match acc {
+                        None => Some(t.clone()),
+                        Some(t2) => Some(Term::Pair(Box::new(t.clone()), Box::new(t2.clone()))),
+                    })
+                    .unwrap();
+                // we're building a term like:
+                // (b, a, c)
+                //   case b, _1 => (_1
+                //      case a, c => (a, b, c))
+                let mut rterm = term2;
+                let mut rsym = None;
+                let mut term = Some(term);
+                while !syms.is_empty() {
+                    let sb = rsym.unwrap_or_else(|| syms.pop().unwrap());
+                    let sa = syms.pop().unwrap_or_else(|| {
+                        // this is always downstream of another error so we don't need to emit one here
+                        cxt.bind_(cxt.db.name("_"), Val::Error)
+                    });
+                    let lterm = if syms.is_empty() {
+                        term.take().unwrap()
+                    } else {
+                        let s = cxt.bind_(cxt.db.name("_"), Val::Error);
+                        rsym = Some(s);
+                        Term::Head(Head::Sym(s))
+                    };
+                    rterm = Term::App(
+                        Box::new(lterm),
+                        TElim::Match(
+                            vec![(
+                                PCons::Pair(Expl),
+                                vec![(Expl, sa), (Expl, sb)],
+                                Arc::new(rterm),
+                            )],
+                            None,
+                        ),
+                    );
+                }
+
+                rterm
+            }
             (
                 Pre::Sigma(i, None, a, None, b),
                 Val::Fun(VFun {
@@ -2206,12 +2384,39 @@ impl SPre {
     }
 }
 
-fn elab_case(
-    cxt: &Cxt,
-    x: &S<Box<Pre>>,
-    branches: &Vec<(S<Box<PrePat>>, S<Box<Pre>>)>,
-    rty: GVal,
-) -> Term {
+impl Val {
+    fn extract_sigma_type(&self, name: Name, values: &HashMap<Name, Arc<Val>>) -> Option<Val> {
+        let mut s = self.clone();
+        loop {
+            match s {
+                Val::Fun(VFun {
+                    class: Sigma(n2),
+                    psym,
+                    ref pty,
+                    ..
+                }) => {
+                    if psym.0 == name {
+                        break Some((**pty).clone());
+                    } else {
+                        let arg = values
+                            .get(&psym.0)
+                            .map(|v| (**v).clone())
+                            .unwrap_or_else(|| Val::Unknown);
+                        if n2 == name {
+                            break Some(s.app(arg));
+                        } else {
+                            s = s.app(arg);
+                            continue;
+                        }
+                    }
+                }
+                _ => break None,
+            }
+        }
+    }
+}
+
+fn elab_case(cxt: &Cxt, x: &SPre, branches: &Vec<(SPrePat, SPre)>, rty: GVal) -> Term {
     let span = x.span();
     let (xdeps, (x, xty)) = cxt.record_deps(|| x.infer(cxt, true));
     let pats: Vec<_> = branches.iter().map(|(a, _)| a.clone()).collect();

@@ -319,3 +319,23 @@ def return_borrow (x : mut 'a Data) : '(_) imm Data = x
 def return_borrow2 (x : 'a mut Data) : 'a Type = p30_imm x
 
 def curry_owned (x : Data) (y : Data) : Data = x # should have type: Data -> Data ~> Data
+
+def named_sigma : (x : Data, y : U) = (y : Data, x : (U => U))
+def named_sigma2 : (x : Data, y : U) = (x : (U => U), y : Data)
+# def named_sigma_e1 : (x : Data, y : U) = (y : Data, x : Data)
+# def named_sigma_e2 : (x : Data, y : U) = (y : Data, y : Data)
+# def named_sigma_e3 : (x: Data, y: U, U) = (y : Data, x : (U => U), U)
+
+def named_params (a : U, b : U, c : U, d : U, e : U) : U = a
+def named_args1 = named_params (d: U, c: U, e: U, b: U, a: U)
+def named_args2 = named_params (U, U, d: U, e: U, c: U)
+# def named_args3_e = named_params (U, U, d: U, e: U, c: U, f: U)
+# def named_args4_e = named_params (U, U, d: U, e: U, c: U, e: U)
+
+# would pass this to named_params but we don't have <| yet
+def trailing_comma : (a : U, b : U, c : U, d : U, e : U) =
+  d: U,
+  c: U,
+  e: U,
+  b: U,
+  a: U,

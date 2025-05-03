@@ -672,15 +672,23 @@ impl Parser {
                 Box::new(Pre::Lam(icit, pat, rhs)),
                 Span(start, self.pos_right()),
             )
-        } else if pair && self.maybe(Tok::Comma) {
-            // sigma
-            let rhs = self.fun(true);
-            let (name, lhs) = self.reparse_pi_param(lhs);
-            let (name2, rhs) = self.reparse_pi_param(rhs);
-            S(
-                Box::new(Pre::Sigma(icit, name, lhs, name2, rhs)),
-                Span(start, self.pos_right()),
-            )
+        } else if pair && self.maybe_raw(Tok::Comma) {
+            // Ignore trailing commas when they're immediately followed by a dedent
+            self.skip_trivia_();
+            if self.peek() == Tok::Dedent {
+                self.skip_trivia(false);
+                lhs
+            } else {
+                self.skip_trivia(false);
+                // sigma
+                let rhs = self.fun(true);
+                let (name, lhs) = self.reparse_pi_param(lhs);
+                let (name2, rhs) = self.reparse_pi_param(rhs);
+                S(
+                    Box::new(Pre::Sigma(icit, name, lhs, name2, rhs)),
+                    Span(start, self.pos_right()),
+                )
+            }
         } else {
             lhs
         }
