@@ -165,15 +165,41 @@ pub fn elab_def(def: Def, db: &DB) -> Option<DefElabResult> {
     eprintln!("[elab def {}]", def.pretty(db));
 
     let mut cxt = Cxt::new(def, AbsSpan(file, pre.name().span()), db.clone());
-    let def_elab = match &**pre {
+    let def_elab = elab_def_raw(pre, Meta(def, 0), &mut cxt);
+    Some(DefElabResult {
+        def: def_elab,
+        unsolved_metas: cxt.metas.with(|m| {
+            m.iter()
+                .filter_map(|(m, v)| match v {
+                    MetaEntry::Unsolved(t, source) => Some((*m, *source, t.clone())),
+                    MetaEntry::Solved(_) => None,
+                })
+                .collect()
+        }),
+        solved_metas: cxt
+            .metas
+            .take()
+            .into_iter()
+            .filter(|(m, _)| m.0 != def || m.1 == 0)
+            .filter_map(|(m, v)| match v {
+                MetaEntry::Unsolved(_, _) => None,
+                MetaEntry::Solved(val) => Some((m, val)),
+            })
+            .collect(),
+        errors: cxt.errors.errors.take().into_iter().collect(),
+    })
+}
+
+fn elab_def_raw(pre: &S<PreDef>, def_head: Head, ty_meta: Meta, cxt: &mut Cxt) -> DefElab {
+    match &**pre {
         PreDef::Val { name, ty, value } => {
             let ty = ty
                 .as_ref()
-                .map(|ty| cxt.as_eval(|| ty.check(Val::Type, &cxt)));
+                .map(|ty| cxt.as_eval(|| ty.check(Val::Type, &*cxt)));
             let solved_ty = match &ty {
                 Some(ty) => {
-                    let ty = ty.eval(cxt.env()).zonk(&cxt, true);
-                    cxt.solve_meta(Meta(def, 0), &vec![], ty, Some(name.span()));
+                    let ty = ty.eval(cxt.env()).zonk(&*cxt, true);
+                    cxt.solve_meta(ty_meta, &vec![], ty, Some(name.span()));
                     true
                 }
                 None => false,
@@ -181,9 +207,9 @@ pub fn elab_def(def: Def, db: &DB) -> Option<DefElabResult> {
             let (mut body, ty) = if let Some((val, ty)) = value.as_ref().map(|val| match &ty {
                 Some(ty) => {
                     let vty = ty.eval(&cxt.env());
-                    (val.check(vty.clone(), &cxt), vty)
+                    (val.check(vty.clone(), &*cxt), vty)
                 }
-                None => val.infer(&cxt, true).pipe(|(x, y)| (x, y.as_small())),
+                None => val.infer(&*cxt, true).pipe(|(x, y)| (x, y.as_small())),
             }) {
                 (Some(val), ty)
             } else if let Some(ty) = ty {
@@ -194,16 +220,16 @@ pub fn elab_def(def: Def, db: &DB) -> Option<DefElabResult> {
             if body.is_none() {
                 cxt.err(
                     "definition does not have a body: `"
-                        + name.pretty(db)
+                        + name.pretty(&cxt.db)
                         + "` of type "
-                        + ty.pretty(db),
+                        + ty.pretty(&cxt.db),
                     name.span(),
                 );
             }
 
             cxt.current_deps
                 .take()
-                .check(&cxt, value.as_ref().map_or(name.span(), |x| x.span()));
+                .check(&*cxt, value.as_ref().map_or(name.span(), |x| x.span()));
 
             // Solve unsolved regions to '()
             cxt.metas.with_mut(|m| {
@@ -217,14 +243,14 @@ pub fn elab_def(def: Def, db: &DB) -> Option<DefElabResult> {
                 })
             });
 
-            body.as_mut().map(|x| x.zonk(&cxt, false));
-            let ty = ty.zonk(&cxt, true);
+            body.as_mut().map(|x| x.zonk(&*cxt, false));
+            let ty = ty.zonk(&*cxt, true);
             if !solved_ty {
-                let ety = Val::Neutral(Head::Meta(Meta(def, 0)), default()).zonk(&cxt, true);
+                let ety = Val::Neutral(Head::Meta(ty_meta), default()).zonk(&*cxt, true);
                 if !ty
                     .clone()
                     .glued()
-                    .unify(None, ety.clone().glued(), None, name.span(), &cxt)
+                    .unify(None, ety.clone().glued(), None, name.span(), &*cxt)
                 {
                     cxt.err(
                         "definition body has type "
@@ -252,18 +278,18 @@ pub fn elab_def(def: Def, db: &DB) -> Option<DefElabResult> {
             let before_cxt = cxt.clone();
             let m: Vec<_> = args
                 .iter()
-                .map(|(icit, arg)| (*icit, PMatch::new(None, &[arg.clone()], None, &mut cxt)))
+                .map(|(icit, arg)| (*icit, PMatch::new(None, &[arg.clone()], None, cxt)))
                 .collect();
             let ty = m
                 .iter()
                 .rfold(Term::Type, |acc, (i, (s, m))| {
                     let aty = m.ty.quote(cxt.qenv());
-                    let body = m.compile(&[acc], &cxt);
+                    let body = m.compile(&[acc], &*cxt);
                     Term::fun(Pi(FCap::Imm), *i, *s, None, aty, Arc::new(body))
                 })
                 .eval(cxt.env())
-                .zonk(&cxt, true);
-            cxt.solve_meta(Meta(def, 0), &vec![], ty.clone(), Some(name.span()));
+                .zonk(&*cxt, true);
+            cxt.solve_meta(ty_meta, &vec![], ty.clone(), Some(name.span()));
 
             let mut children = Vec::new();
             for (vname, vargs, vty) in variants {
@@ -283,18 +309,16 @@ pub fn elab_def(def: Def, db: &DB) -> Option<DefElabResult> {
                         for (_, (_, m)) in &m {
                             cxt = m.bind(0, &default(), &cxt);
                         }
-                        let rty = m
-                            .iter()
-                            .fold(Term::Head(Head::Def(def)), |acc, (i, (s, _))| {
-                                Term::App(
-                                    Box::new(acc),
-                                    TElim::App(*i, Box::new(Term::Head(Head::Sym(*s)))),
-                                )
-                            });
+                        let rty = m.iter().fold(Term::Head(def_head), |acc, (i, (s, _))| {
+                            Term::App(
+                                Box::new(acc),
+                                TElim::App(*i, Box::new(Term::Head(Head::Sym(*s)))),
+                            )
+                        });
                         let vty = vargs.as_ref().map_or(rty.clone(), |(i, paty)| {
                             let aty = cxt.as_eval(|| paty.check(Val::Type, &cxt));
                             let vaty = aty.eval(cxt.env());
-                            let (s, cxt) = cxt.bind(db.name("_"), vaty.clone());
+                            let (s, cxt) = cxt.bind(cxt.db.name("_"), vaty.clone());
                             let body = pat_bind_type(
                                 &paty,
                                 Val::Neutral(Head::Sym(s), default()),
@@ -311,10 +335,11 @@ pub fn elab_def(def: Def, db: &DB) -> Option<DefElabResult> {
                         })
                     }
                 };
-                let vty = vty.eval(cxt.env()).zonk(&cxt, true);
+                let vty = vty.eval(cxt.env()).zonk(&*cxt, true);
                 children.push((
                     // TODO error on duplicate names
-                    db.idefs.intern(&DefLoc::Child(def, **vname)),
+                    // TODO what do we do here for local defs ???
+                    cxt.db.idefs.intern(&DefLoc::Child(def, **vname)),
                     DefElab {
                         name: *vname,
                         ty: Arc::new(vty),
@@ -324,10 +349,10 @@ pub fn elab_def(def: Def, db: &DB) -> Option<DefElabResult> {
                     },
                 ));
             }
-            let ty = ty.zonk(&cxt, true);
+            let ty = ty.zonk(&*cxt, true);
             // Re-zonk metas in variant types to make sure we get them all
             for (_, elab) in &mut children {
-                elab.ty = Arc::new(elab.ty.zonk(&cxt, true));
+                elab.ty = Arc::new(elab.ty.zonk(&*cxt, true));
             }
 
             DefElab {
@@ -338,29 +363,7 @@ pub fn elab_def(def: Def, db: &DB) -> Option<DefElabResult> {
                 children,
             }
         }
-    };
-    Some(DefElabResult {
-        def: def_elab,
-        unsolved_metas: cxt.metas.with(|m| {
-            m.iter()
-                .filter_map(|(m, v)| match v {
-                    MetaEntry::Unsolved(t, source) => Some((*m, *source, t.clone())),
-                    MetaEntry::Solved(_) => None,
-                })
-                .collect()
-        }),
-        solved_metas: cxt
-            .metas
-            .take()
-            .into_iter()
-            .filter(|(m, _)| m.0 != def || m.1 == 0)
-            .filter_map(|(m, v)| match v {
-                MetaEntry::Unsolved(_, _) => None,
-                MetaEntry::Solved(val) => Some((m, val)),
-            })
-            .collect(),
-        errors: cxt.errors.errors.take().into_iter().collect(),
-    })
+    }
 }
 
 // -- elaboration context --
