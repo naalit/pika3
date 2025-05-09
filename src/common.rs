@@ -162,8 +162,16 @@ impl<A: Copy> Ref<A> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Span(pub u32, pub u32);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, Eq, PartialOrd, Ord, Hash)]
 pub struct S<A>(pub A, pub Span);
+
+impl<A: PartialEq> PartialEq for S<A> {
+    fn eq(&self, other: &Self) -> bool {
+        // skip spans for better incrementality (adding a space shouldn't invalidate all the terms!
+        // would change error messages though so we might have to change this in some circumstances)
+        self.0 == other.0
+    }
+}
 impl<A> S<A> {
     pub fn span(&self) -> Span {
         self.1

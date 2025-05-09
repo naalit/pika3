@@ -207,6 +207,7 @@ pub enum Term {
     /// Argument type annotation
     Fun(TFun),
     Pair(Box<Term>, Box<Term>),
+    Mod(Vec<(Sym, Arc<Term>)>),
     Cap(Cap, Box<Term>),
     Assign(Box<Term>, Box<Term>),
     Region(Vec<Term>),
@@ -240,6 +241,7 @@ pub enum Val {
     Neutral(Head, Spine),
     Fun(VFun),
     Pair(Arc<Val>, Arc<Val>),
+    Mod(Vec<(Sym, Arc<Term>)>, Arc<Env>),
     Cap(Cap, Option<Vec<Arc<Val>>>, Arc<Val>),
     Region(Vec<Arc<Val>>),
     Borrow(Vec<Borrow>),
@@ -435,6 +437,7 @@ impl Term {
             Term::Fun(f) => Val::Fun(f.eval(env)),
             Term::Cap(c, x) => x.eval(env).as_cap(*c),
             Term::Pair(a, b) => Val::Pair(Arc::new(a.eval(env)), Arc::new(b.eval(env))),
+            Term::Mod(m) => Val::Mod(m.clone(), Arc::new(env.clone())),
             Term::Assign(_, _) => panic!("L0-evaluating term with mutation"),
             Term::Region(r) => {
                 let mut v = Vec::new();
@@ -515,6 +518,19 @@ impl Term {
             Term::Fun(f) => Term::Fun(f.subst(env)?),
             Term::Cap(c, x) => Term::Cap(*c, Box::new(x.subst(env)?)),
             Term::Pair(a, b) => Term::Pair(Box::new(a.subst(env)?), Box::new(b.subst(env)?)),
+            Term::Mod(m) => {
+                let mut env = env.clone();
+                let m = m
+                    .iter()
+                    .map(|(s, t)| {
+                        let t = Arc::new(t.subst(&env)?);
+                        let (s, env2) = env.bind(*s);
+                        env = env2;
+                        Ok((s, t))
+                    })
+                    .collect::<Result<_, _>>()?;
+                Term::Mod(m)
+            }
             Term::Assign(a, b) => Term::Assign(Box::new(a.subst(env)?), Box::new(b.subst(env)?)),
             Term::Region(r) => {
                 Term::Region(r.iter().map(|x| x.subst(env)).collect::<Result<_, _>>()?)
@@ -571,6 +587,7 @@ impl Val {
                 Box::new(Term::Cap(*c, Box::new(x.quote_(env)?))),
             ),
             Val::Pair(a, b) => Term::Pair(Box::new(a.quote_(env)?), Box::new(b.quote_(env)?)),
+            Val::Mod(m, env2) => Term::Mod(m.clone()).subst(&env.senv(env2))?,
             Val::Borrow(b) => Term::Borrow(b.clone()),
             Val::Unknown => Term::Unknown,
             Val::Error => Term::Error,
@@ -612,6 +629,11 @@ impl Term {
             Term::Pair(a, b) | Term::Assign(a, b) => {
                 a.zonk_(cxt, qenv, beta_reduce);
                 b.zonk_(cxt, qenv, beta_reduce);
+            }
+            Term::Mod(m) => {
+                m.iter_mut().for_each(|(_, x)| {
+                    Arc::make_mut(x).zonk_(cxt, qenv, beta_reduce);
+                });
             }
             Term::Cap(_, x) => {
                 x.zonk_(cxt, qenv, beta_reduce);
@@ -1060,6 +1082,16 @@ impl Pretty for Term {
                 (a.pretty(db).nest(Prec::Pi) + ", " + b.pretty(db).nest(Prec::Pair))
                     .prec(Prec::Pair)
             }
+            Term::Mod(m) => Doc::keyword("mod")
+                .hardline()
+                .chain(Doc::intersperse(
+                    m.iter().map(|(s, x)| {
+                        // TODO should we include types for these defs in the core syntax?
+                        Doc::keyword("def").space() + s.0.pretty(db) + " = " + x.pretty(db).indent()
+                    }),
+                    Doc::none().hardline(),
+                ))
+                .indent(),
             Term::Assign(a, b) => {
                 (a.pretty(db).nest(Prec::Pi) + " = " + b.pretty(db).nest(Prec::Pi)).prec(Prec::Term)
             }

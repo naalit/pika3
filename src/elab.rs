@@ -400,7 +400,7 @@ impl Val {
             }) => a.is_owned() || self.clone().app(Val::sym(*s)).is_owned(),
             Val::Fun(VFun { class: Pi(c), .. }) => *c == FCap::Own,
             Val::Fun { .. } => true,
-            Val::Pair(_, _) | Val::Region(_) | Val::Borrow(_) => unreachable!(),
+            Val::Pair(_, _) | Val::Mod(_, _) | Val::Region(_) | Val::Borrow(_) => unreachable!(),
             Val::Cap(c, _, t) => *c != Cap::Imm && t.is_owned(),
             Val::Unknown => true,
             Val::Error => false,
