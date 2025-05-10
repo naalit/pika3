@@ -59,3 +59,8 @@ fn sum_type() {
 fn regions() {
     test(&["Regions.pk"]).num_errors(2);
 }
+
+#[test]
+fn local_def() {
+    test(&["LocalDef.pk"]).succeeds();
+}

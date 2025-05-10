@@ -717,7 +717,7 @@ impl VElim {
             }
         }
     }
-    fn quote_(&self, env: &QEnv) -> Result<TElim, Sym> {
+    pub(super) fn quote_(&self, env: &QEnv) -> Result<TElim, Sym> {
         Ok(match self {
             VElim::Match(v, fallback, inner_env) => TElim::Match(
                 v.iter()
@@ -837,21 +837,7 @@ impl Val {
                 .map(|x| Val::Cap(*c, r.clone(), Arc::new(x))),
             Val::Neutral(h, spine) => {
                 if let Some(val) = match h {
-                    Head::Def(d) => {
-                        if let Ok(elab) = cxt.db.elab.def_value(*d, &cxt.db) {
-                            elab.def
-                                .can_eval
-                                .then(|| {
-                                    elab.def.body.and_then(|x| match x {
-                                        DefBody::Val(x) => Some(Arc::new(x.eval(cxt.env()))),
-                                        DefBody::Type(_) => None,
-                                    })
-                                })
-                                .flatten()
-                        } else {
-                            None
-                        }
-                    }
+                    Head::Def(d) => cxt.def_value(*d).map(Arc::new),
                     Head::Sym(s) => cxt.local_val(*s),
                     Head::Meta(m) => cxt.meta_val(*m),
                     // TODO resolve applicable builtins

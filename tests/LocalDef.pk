@@ -1,0 +1,13 @@
+def test1 = do
+  def f (x : Type) = x
+  f Type
+
+def out_of_order = do
+  def f x = g x
+  def g (x : Type) = x
+  def unused (x : Type) = g x
+  f Type
+
+def recursive = do
+  def recursive_ : a -> a = x => recursive_ x
+  ()

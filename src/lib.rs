@@ -123,7 +123,7 @@ pub fn elab_files(filenames: &[PathBuf]) -> Result<ElabResult, (Option<PathBuf>,
 }
 
 fn pretty_def(e: &DefElab, db: &DB) -> Doc {
-    let mut doc = Doc::keyword("val ") + e.name.pretty(&db) + " : " + e.ty.pretty(&db);
+    let mut doc = (Doc::keyword("val ") + e.name.pretty(&db) + " : " + e.ty.pretty(&db)).indent();
     // + " = "
     // + e.body.as_ref().map_or("".into(), |x| match x {
     //     elab::DefBody::Val(x) => x.pretty(&db),
@@ -131,14 +131,16 @@ fn pretty_def(e: &DefElab, db: &DB) -> Doc {
     // });
 
     for (_, i) in &e.children {
-        doc = doc.hardline() + pretty_def(i, db);
+        doc = doc.chain((Doc::none().hardline() + pretty_def(i, db)).indent());
     }
-    doc = if e.can_eval {
-        "@transparent\n" + doc
+    if e.can_eval {
+        Doc::start("@transparent")
+            .style(Doc::style_annotation())
+            .hardline()
+            + doc
     } else {
         doc
-    };
-    doc.indent()
+    }
 }
 
 pub fn driver(config: Config) {

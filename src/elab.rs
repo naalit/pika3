@@ -10,6 +10,7 @@ pub use term::{Builtin, Head, Term, Val};
 
 use crate::common::*;
 use crate::parser::{Pre, PreDef, PrePat, PreStmt, SPre, SPrePat};
+use crate::query::DefElabError;
 
 // -- entry point (per-file elab query) --
 
@@ -165,14 +166,48 @@ pub fn elab_def(def: Def, db: &DB) -> Option<DefElabResult> {
     eprintln!("[elab def {}]", def.pretty(db));
 
     let mut cxt = Cxt::new(def, AbsSpan(file, pre.name().span()), db.clone());
-    let def_elab = match &**pre {
+    let mut def_elab = elab_def_raw(def, pre, &mut cxt);
+    let keys = cxt
+        .child_defs
+        .with(|x| x.keys().copied().collect::<Vec<_>>());
+    def_elab.children.extend(
+        keys.into_iter()
+            .map(|k| (k, cxt.try_local_def_elab(k).unwrap())),
+    );
+    Some(DefElabResult {
+        def: def_elab,
+        unsolved_metas: cxt.metas.with(|m| {
+            m.iter()
+                .filter_map(|(m, v)| match v {
+                    MetaEntry::Unsolved(t, source) => Some((*m, *source, t.clone())),
+                    MetaEntry::Solved(_) => None,
+                })
+                .collect()
+        }),
+        solved_metas: cxt
+            .metas
+            .take()
+            .into_iter()
+            // TODO local defs
+            .filter(|(m, _)| m.0 != def || m.1 == 0)
+            .filter_map(|(m, v)| match v {
+                MetaEntry::Unsolved(_, _) => None,
+                MetaEntry::Solved(val) => Some((m, val)),
+            })
+            .collect(),
+        errors: cxt.errors.errors.take().into_iter().collect(),
+    })
+}
+
+fn elab_def_raw(def: Def, pre: &S<PreDef>, cxt: &mut Cxt) -> DefElab {
+    match &**pre {
         PreDef::Val { name, ty, value } => {
             let ty = ty
                 .as_ref()
-                .map(|ty| cxt.as_eval(|| ty.check(Val::Type, &cxt)));
+                .map(|ty| cxt.as_eval(|| ty.check(Val::Type, cxt)));
             let solved_ty = match &ty {
                 Some(ty) => {
-                    let ty = ty.eval(cxt.env()).zonk(&cxt, true);
+                    let ty = ty.eval(cxt.env()).zonk(cxt, true);
                     cxt.solve_meta(Meta(def, 0), &vec![], ty, Some(name.span()));
                     true
                 }
@@ -181,9 +216,9 @@ pub fn elab_def(def: Def, db: &DB) -> Option<DefElabResult> {
             let (mut body, ty) = if let Some((val, ty)) = value.as_ref().map(|val| match &ty {
                 Some(ty) => {
                     let vty = ty.eval(&cxt.env());
-                    (val.check(vty.clone(), &cxt), vty)
+                    (val.check(vty.clone(), cxt), vty)
                 }
-                None => val.infer(&cxt, true).pipe(|(x, y)| (x, y.as_small())),
+                None => val.infer(&*cxt, true).pipe(|(x, y)| (x, y.as_small())),
             }) {
                 (Some(val), ty)
             } else if let Some(ty) = ty {
@@ -194,16 +229,16 @@ pub fn elab_def(def: Def, db: &DB) -> Option<DefElabResult> {
             if body.is_none() {
                 cxt.err(
                     "definition does not have a body: `"
-                        + name.pretty(db)
+                        + name.pretty(&cxt.db)
                         + "` of type "
-                        + ty.pretty(db),
+                        + ty.pretty(&cxt.db),
                     name.span(),
                 );
             }
 
             cxt.current_deps
                 .take()
-                .check(&cxt, value.as_ref().map_or(name.span(), |x| x.span()));
+                .check(cxt, value.as_ref().map_or(name.span(), |x| x.span()));
 
             // Solve unsolved regions to '()
             cxt.metas.with_mut(|m| {
@@ -217,14 +252,14 @@ pub fn elab_def(def: Def, db: &DB) -> Option<DefElabResult> {
                 })
             });
 
-            body.as_mut().map(|x| x.zonk(&cxt, false));
-            let ty = ty.zonk(&cxt, true);
+            body.as_mut().map(|x| x.zonk(cxt, false));
+            let ty = ty.zonk(cxt, true);
             if !solved_ty {
-                let ety = Val::Neutral(Head::Meta(Meta(def, 0)), default()).zonk(&cxt, true);
+                let ety = Val::Neutral(Head::Meta(Meta(def, 0)), default()).zonk(cxt, true);
                 if !ty
                     .clone()
                     .glued()
-                    .unify(None, ety.clone().glued(), None, name.span(), &cxt)
+                    .unify(None, ety.clone().glued(), None, name.span(), cxt)
                 {
                     cxt.err(
                         "definition body has type "
@@ -252,17 +287,17 @@ pub fn elab_def(def: Def, db: &DB) -> Option<DefElabResult> {
             let before_cxt = cxt.clone();
             let m: Vec<_> = args
                 .iter()
-                .map(|(icit, arg)| (*icit, PMatch::new(None, &[arg.clone()], None, &mut cxt)))
+                .map(|(icit, arg)| (*icit, PMatch::new(None, &[arg.clone()], None, cxt)))
                 .collect();
             let ty = m
                 .iter()
                 .rfold(Term::Type, |acc, (i, (s, m))| {
                     let aty = m.ty.quote(cxt.qenv());
-                    let body = m.compile(&[acc], &cxt);
+                    let body = m.compile(&[acc], cxt);
                     Term::fun(Pi(FCap::Imm), *i, *s, None, aty, Arc::new(body))
                 })
                 .eval(cxt.env())
-                .zonk(&cxt, true);
+                .zonk(cxt, true);
             cxt.solve_meta(Meta(def, 0), &vec![], ty.clone(), Some(name.span()));
 
             let mut children = Vec::new();
@@ -294,7 +329,7 @@ pub fn elab_def(def: Def, db: &DB) -> Option<DefElabResult> {
                         let vty = vargs.as_ref().map_or(rty.clone(), |(i, paty)| {
                             let aty = cxt.as_eval(|| paty.check(Val::Type, &cxt));
                             let vaty = aty.eval(cxt.env());
-                            let (s, cxt) = cxt.bind(db.name("_"), vaty.clone());
+                            let (s, cxt) = cxt.bind(cxt.db.name("_"), vaty.clone());
                             let body = pat_bind_type(
                                 &paty,
                                 Val::Neutral(Head::Sym(s), default()),
@@ -311,10 +346,10 @@ pub fn elab_def(def: Def, db: &DB) -> Option<DefElabResult> {
                         })
                     }
                 };
-                let vty = vty.eval(cxt.env()).zonk(&cxt, true);
+                let vty = vty.eval(cxt.env()).zonk(cxt, true);
                 children.push((
                     // TODO error on duplicate names
-                    db.idefs.intern(&DefLoc::Child(def, **vname)),
+                    cxt.db.idefs.intern(&DefLoc::Child(def, **vname)),
                     DefElab {
                         name: *vname,
                         ty: Arc::new(vty),
@@ -324,10 +359,10 @@ pub fn elab_def(def: Def, db: &DB) -> Option<DefElabResult> {
                     },
                 ));
             }
-            let ty = ty.zonk(&cxt, true);
+            let ty = ty.zonk(cxt, true);
             // Re-zonk metas in variant types to make sure we get them all
             for (_, elab) in &mut children {
-                elab.ty = Arc::new(elab.ty.zonk(&cxt, true));
+                elab.ty = Arc::new(elab.ty.zonk(cxt, true));
             }
 
             DefElab {
@@ -338,29 +373,7 @@ pub fn elab_def(def: Def, db: &DB) -> Option<DefElabResult> {
                 children,
             }
         }
-    };
-    Some(DefElabResult {
-        def: def_elab,
-        unsolved_metas: cxt.metas.with(|m| {
-            m.iter()
-                .filter_map(|(m, v)| match v {
-                    MetaEntry::Unsolved(t, source) => Some((*m, *source, t.clone())),
-                    MetaEntry::Solved(_) => None,
-                })
-                .collect()
-        }),
-        solved_metas: cxt
-            .metas
-            .take()
-            .into_iter()
-            .filter(|(m, _)| m.0 != def || m.1 == 0)
-            .filter_map(|(m, v)| match v {
-                MetaEntry::Unsolved(_, _) => None,
-                MetaEntry::Solved(val) => Some((m, val)),
-            })
-            .collect(),
-        errors: cxt.errors.errors.take().into_iter().collect(),
-    })
+    }
 }
 
 // -- elaboration context --
@@ -631,16 +644,30 @@ impl Region {
 }
 
 #[derive(Clone)]
+enum ChildDefState {
+    NotStarted(Vec<Sym>, Arc<S<PreDef>>, Cxt),
+    InProgress,
+    Finished(DefElab),
+}
+
+#[derive(Clone)]
+enum VarBinding {
+    Local(Sym),
+    LocalDef(Def, Vec<VElim>),
+}
+
+#[derive(Clone)]
 struct Cxt {
     db: DB,
     def: Def,
-    bindings: im::HashMap<Name, Sym>,
+    bindings: im::HashMap<Name, VarBinding>,
     vars: im::HashMap<Sym, VarEntry>,
     metas: Ref<FxHashMap<Meta, MetaEntry>>,
     zonked_metas: Ref<FxHashMap<(Meta, bool), Val>>,
     env: SEnv,
     uquant_stack: Ref<Vec<Vec<(Sym, Arc<Val>)>>>,
     closure_stack: Vec<(Arc<FxHashSet<Sym>>, Ref<FxHashMap<Sym, (Span, Cap)>>)>,
+    child_defs: Ref<FxHashMap<Def, ChildDefState>>,
     current_deps: Ref<Region>,
     rself: Option<Sym>,
     can_eval: Ref<Option<Span>>,
@@ -681,6 +708,7 @@ impl Cxt {
             metas,
             uquant_stack: default(),
             closure_stack: default(),
+            child_defs: default(),
             current_deps: default(),
             rself: None,
             can_eval: default(),
@@ -741,12 +769,155 @@ impl Cxt {
         self.current_deps.set(r)
     }
 
+    fn try_local_def_elab(&self, def: Def) -> Result<DefElab, DefElabError> {
+        match self.child_defs.with(|x| x.get(&def).cloned()) {
+            Some(ChildDefState::Finished(elab)) => Ok(elab),
+            Some(ChildDefState::InProgress) => Err(DefElabError::Recursive),
+            Some(ChildDefState::NotStarted(scope, pre, mut cxt)) => {
+                self.child_defs
+                    .with_mut(|x| x.insert(def, ChildDefState::InProgress));
+                let elab = elab_def_raw(def, &pre, &mut cxt);
+                let body = match &elab.body {
+                    Some(DefBody::Val(body)) => Some(DefBody::Val(Arc::new(
+                        scope.iter().rfold((**body).clone(), |acc, s| {
+                            Term::fun(Lam, Expl, *s, None, Term::Error, Arc::new(acc))
+                        }),
+                    ))),
+                    body => body.clone(),
+                };
+                let ty = scope.iter().rfold(elab.ty.clone(), |acc, s| {
+                    Arc::new(Val::fun(
+                        Lam,
+                        Expl,
+                        *s,
+                        Arc::new(Val::Error),
+                        None,
+                        Arc::new(acc.quote(self.qenv())),
+                        // TODO these envs are definitely not correct... not sure if it matters
+                        Arc::new(self.env().clone()),
+                    ))
+                });
+
+                let elab = DefElab { body, ty, ..elab };
+                self.child_defs
+                    .with_mut(|x| x.insert(def, ChildDefState::Finished(elab.clone())));
+                Ok(elab)
+            }
+            None => Err(DefElabError::NotFound),
+        }
+    }
+
+    fn def_elab(&self, def: Def) -> Option<DefElab> {
+        match self.try_local_def_elab(def) {
+            Ok(elab) => Some(elab),
+            Err(DefElabError::Recursive) => None,
+            Err(DefElabError::NotFound) => {
+                self.db.elab.def_value(def, &self.db).ok().map(|x| x.def)
+            }
+        }
+    }
+
+    fn def_value(&self, def: Def) -> Option<Val> {
+        let elab = self.def_elab(def)?;
+        elab.can_eval
+            .then(|| {
+                elab.body.and_then(|x| match x {
+                    DefBody::Val(x) => Some(x.eval(self.env())),
+                    DefBody::Type(_) => None,
+                })
+            })
+            .flatten()
+    }
+
+    fn def_type(&self, def: Def) -> Result<Arc<Val>, DefElabError> {
+        match self.try_local_def_elab(def) {
+            Ok(elab) => Ok(elab.ty),
+            Err(DefElabError::Recursive) => Err(DefElabError::Recursive),
+            Err(DefElabError::NotFound) => self.db.elab.def_type(def, &self.db),
+        }
+    }
+
+    fn pre_bind_local_def(&mut self, pre: &S<PreDef>) -> Def {
+        let name = pre.name();
+        let def = self.db.idefs.intern(&DefLoc::Child(
+            self.def,
+            // avoid conflicts
+            self.db.name(&format!(
+                "{}${}",
+                self.db.get(*name),
+                self.child_defs.with(|x| x.len())
+            )),
+        ));
+        let syms: Vec<_> = self
+            .vars
+            .keys()
+            .copied()
+            .chain(self.uquant_stack.with(|v| {
+                v.iter()
+                    .flatten()
+                    .map(|(s, _)| s)
+                    .copied()
+                    .collect::<Vec<_>>()
+            }))
+            .collect();
+        let scope: Vec<_> = syms
+            .iter()
+            .map(|&s| VElim::App(Expl, Arc::new(Val::sym(s))))
+            .collect();
+        self.bindings
+            .insert(*name, VarBinding::LocalDef(def, scope));
+        def
+    }
+
+    /// Assumes you've called `pre_bind_local_def` (to get the `Def` to pass to this method)
+    fn bind_local_def(&mut self, def: Def, pre: S<PreDef>) {
+        let syms: Vec<_> = self
+            .vars
+            .keys()
+            .copied()
+            .chain(self.uquant_stack.with(|v| {
+                v.iter()
+                    .flatten()
+                    .map(|(s, _)| s)
+                    .copied()
+                    .collect::<Vec<_>>()
+            }))
+            .collect();
+        self.child_defs.with_mut(|v| {
+            v.insert(
+                def,
+                ChildDefState::NotStarted(syms, Arc::new(pre), self.clone()),
+            )
+        });
+    }
+
     fn lookup(&self, n: SName) -> Option<VarResult> {
         // first try locals
         self.bindings
             .get(&n.0)
-            .and_then(|s| self.vars.get(s))
-            .map(|entry| VarResult::Local(n.span(), entry))
+            .and_then(|s| match s {
+                VarBinding::Local(s) => self
+                    .vars
+                    .get(s)
+                    .map(|entry| VarResult::Local(n.span(), entry)),
+                VarBinding::LocalDef(def, spine) => {
+                    let ty = self.def_type(*def).unwrap_or_else(|e| match e {
+                        DefElabError::NotFound => unreachable!(),
+                        DefElabError::Recursive => {
+                            Arc::new(Val::Neutral(Head::Meta(Meta(*def, 0)), default()))
+                        }
+                    });
+                    let ty = Arc::new(
+                        spine
+                            .iter()
+                            .fold((*ty).clone(), |acc, x| x.clone().elim(acc)),
+                    );
+                    let term = spine.iter().fold(Term::Head(Head::Def(*def)), |acc, x| {
+                        Term::App(Box::new(acc), x.quote_(self.qenv()).unwrap())
+                    });
+                    Some(VarResult::Other(term, ty))
+                }
+            })
             .or_else(|| {
                 self.db.lookup_def_name(self.def, n.0).map(|(d, t)| {
                     VarResult::Other(
@@ -831,11 +1002,11 @@ impl Cxt {
         e.mutable = mutable;
     }
     fn bind_existing_var(&mut self, n: Name, sym: Sym) {
-        self.bindings.insert(n, sym);
+        self.bindings.insert(n, VarBinding::Local(sym));
     }
     fn bind_raw(&mut self, name: Name, sym: Sym, ty: impl Into<Arc<Val>>) -> Sym {
         self.env.env.0.insert(sym, Arc::new(Val::sym(sym)));
-        self.bindings.insert(name, sym);
+        self.bindings.insert(name, VarBinding::Local(sym));
         assert!(
             self.vars
                 .insert(
@@ -1356,7 +1527,13 @@ fn insert_metas(term: Term, mut ty: GVal, cxt: &Cxt, span: Span) -> (Term, GVal)
 fn elab_block(block: &[PreStmt], last_: &SPre, ty: Option<GVal>, cxt1: &Cxt) -> (Term, Val) {
     let mut cxt = cxt1.clone();
     let mut v = Vec::new();
+    let mut def_acc = Vec::new();
     for x in block {
+        if !matches!(x, PreStmt::Def(_)) {
+            def_acc
+                .drain(..)
+                .for_each(|(x, y)| cxt.bind_local_def(x, y));
+        }
         let (vsym, deps, t, p, x, span) = match x {
             PreStmt::Expr(x) => {
                 let span = x.span();
@@ -1378,6 +1555,11 @@ fn elab_block(block: &[PreStmt], last_: &SPre, ty: Option<GVal>, cxt1: &Cxt) -> 
                 let (sym, pat) = PMatch::new(Some(aty.clone()), &[pat.clone()], None, &mut cxt);
                 (sym, deps, aty.as_small(), Some(pat), body, span)
             }
+            PreStmt::Def(def) => {
+                let def_id = cxt.pre_bind_local_def(def);
+                def_acc.push((def_id, def.clone()));
+                continue;
+            }
         };
         let deps = t
             .uncap()
@@ -1392,6 +1574,9 @@ fn elab_block(block: &[PreStmt], last_: &SPre, ty: Option<GVal>, cxt1: &Cxt) -> 
         }
         v.push((vsym, t2, p, x));
     }
+    def_acc
+        .drain(..)
+        .for_each(|(x, y)| cxt.bind_local_def(x, y));
     let explicit_ty = ty.is_some();
     // give better error messages on block return dependencies
     let (r, (last, lty)) = cxt.record_deps(|| last_.elab(ty, &cxt));
@@ -1882,7 +2067,7 @@ impl SPre {
                 match lhs.eval(cxt.env()) {
                     Val::Neutral(Head::Def(d), v) if v.is_empty() => {
                         let child = cxt.db.idefs.intern(&DefLoc::Child(d, **dot));
-                        match cxt.db.elab.def_type(child, &cxt.db) {
+                        match cxt.def_type(child) {
                             Ok(t) => r = Some((Term::Head(Head::Def(child)), (*t).clone())),
                             Err(crate::query::DefElabError::NotFound) => {
                                 cxt.err(

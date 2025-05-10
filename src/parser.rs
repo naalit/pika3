@@ -4,7 +4,7 @@ use crate::lexer::*;
 // `def f {x y} {z w} (a b): t = ...`
 // but for now:
 // `def f : t = ...`
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum PreDef {
     Val {
         name: SName,
@@ -51,6 +51,7 @@ impl PrePat {
 pub enum PreStmt {
     Expr(SPre),
     Let(SPrePat, SPre),
+    Def(S<PreDef>),
 }
 #[derive(Debug, Clone)]
 pub enum Pre {
@@ -193,7 +194,7 @@ impl Parser {
         *self
             .starts
             .get(self.pos)
-            .unwrap_or_else(|| self.starts.last().unwrap())
+            .unwrap_or_else(|| self.starts.last().unwrap_or(&0))
     }
     fn pos_right(&self) -> u32 {
         *self
@@ -473,6 +474,9 @@ impl Parser {
                             s.expect(Tok::Equals);
                             let body = s.term();
                             v.push(PreStmt::Let(pat, body));
+                        } else if s.peek().starts_def() {
+                            let def = s.spanned(|s| s.def());
+                            v.push(PreStmt::Def(def));
                         } else {
                             let body = s.term();
                             v.push(PreStmt::Expr(body));
@@ -943,6 +947,12 @@ impl Tok {
                 | Tok::IntLit
                 | Tok::StringLit
                 | Tok::FloatLit
+        )
+    }
+    fn starts_def(self) -> bool {
+        matches!(
+            self,
+            Tok::DefKw | Tok::TypeKw | Tok::TraitKw | Tok::EffKw | Tok::ImplKw
         )
     }
     fn is_trivia(self) -> bool {

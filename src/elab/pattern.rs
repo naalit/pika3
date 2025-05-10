@@ -134,22 +134,16 @@ fn split_ty(
             }])
         }
 
-        Val::Neutral(Head::Def(d), _) => match cxt.db.elab.def_value(*d, &cxt.db) {
-            Ok(DefElabResult {
-                def:
-                    DefElab {
-                        body: Some(DefBody::Type(ctors)),
-                        ..
-                    },
+        Val::Neutral(Head::Def(d), _) => match cxt.def_elab(*d) {
+            Some(DefElab {
+                body: Some(DefBody::Type(ctors)),
                 ..
             }) => Some(
                 ctors
                     .into_iter()
                     .filter_map(|cons| {
                         let mut cty = cxt
-                            .db
-                            .elab
-                            .def_type(cons, &cxt.db)
+                            .def_type(cons)
                             .map(Arc::unwrap_or_clone)
                             .unwrap_or(Val::Error);
                         let mut var_tys = Vec::new();

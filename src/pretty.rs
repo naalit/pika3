@@ -108,6 +108,10 @@ impl Doc {
         Color::Cyan.style()
     }
 
+    pub fn style_annotation() -> Style {
+        Color::Fixed(8).style()
+    }
+
     /// Applies `style` to any string data directly in this Doc.
     /// Does not apply to nested Docs.
     pub fn style(mut self, style: impl IntoStyle) -> Self {
@@ -257,7 +261,7 @@ impl Doc {
 
     /// Marks that any line breaks in what we have so far should be indented another level
     pub fn indent(mut self) -> Self {
-        self.indent += 4;
+        self.indent += 2;
         // We need another doc so the indent doesn't extend farther
         Doc::none().chain(self)
     }

@@ -261,6 +261,7 @@ struct CacheEntry {
     checked_revision: u64,
 }
 
+#[derive(Debug)]
 pub enum DefElabError {
     NotFound,
     Recursive,
