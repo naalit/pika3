@@ -803,7 +803,15 @@ impl Cxt {
                     .with_mut(|x| x.insert(def, ChildDefState::Finished(elab.clone())));
                 Ok(elab)
             }
-            None => Err(DefElabError::NotFound),
+            None => self
+                .db
+                .idefs
+                .get(def)
+                .parent()
+                .and_then(|def| self.try_local_def_elab(def).ok())
+                .and_then(|elab| elab.children.iter().find(|(d, _)| *d == def).cloned())
+                .map(|(_, elab)| elab)
+                .ok_or(DefElabError::NotFound),
         }
     }
 

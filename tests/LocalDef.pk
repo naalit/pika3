@@ -11,3 +11,18 @@ def out_of_order = do
 def recursive = do
   def recursive_ : a -> a = x => recursive_ x
   ()
+
+def local_type = do
+  # copied from SumType.pk
+  type Option a of
+    None
+    Some a
+
+  type Pair a b of New (a, b)
+
+  def fst : Pair a b -> a = Pair.New (x, _) => x
+  def snd : Pair a b -> b = Pair.New (_, x) => x
+  def t : Option (Type -> Type) = Option.None
+  def p = Pair.New (Type, t)
+
+  ()
