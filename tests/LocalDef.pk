@@ -41,3 +41,23 @@ def const (a : imm t) : imm t -> imm t = do
   f
 
 def eval_outside : const Type () = Type
+
+def Num = mod
+  def Nat = (a : Type) -> (a -> a) -> a -> a
+  def zero: Nat = _ => f => x => x
+  def suc: Nat -> Nat = n => a => f => x => f (n a f x)
+  def one = suc zero
+  def add (n: Nat, m: Nat): Nat = a => f => x => n a f (m a f x)
+
+def two = Num.add (Num.one, Num.one)
+
+type Eq {t: _} (a: t) (b: t) of
+  Refl : {} -> Eq a a # need {} -> so it's a pi and triggers uquant insertion - TODO we should maybe make that apply to variants regardless
+
+# TODO we shouldn't need this `{}`
+def two_is_two : Eq {imm Num.Nat} two two = (Eq {}).Refl
+
+# evaluation/conversion checking on these does work properly! the types the compiler prints out are Not readable though, like not even a little bit
+def two_is_two_2 : Eq {imm Num.Nat} two (Num.suc (Num.one)) = (Eq {}).Refl
+# def two_is_three_e : Eq {imm Num.Nat} two (Num.suc (Num.suc (Num.one))) = (Eq {}).Refl
+

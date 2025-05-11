@@ -41,6 +41,7 @@ pub enum Tok {
     TraitKw,
     AsKw,
     IsKw,
+    ModKw,
     Colon,
     Equals,
     Arrow,
@@ -222,7 +223,7 @@ impl Lexer {
 
     fn lex_name(&mut self) -> STok {
         while let Some(next) = self.peek() {
-            if next.is_alphanumeric() || next == '_' {
+            if name_char(next) {
                 self.next();
             } else {
                 break;
@@ -258,6 +259,7 @@ impl Lexer {
             "trait" => Tok::TraitKw,
             "as" => Tok::AsKw,
             "is" => Tok::IsKw,
+            "mod" => Tok::ModKw,
             _ => Tok::Name,
         };
         self.tok_in_place(tok)
@@ -445,7 +447,7 @@ impl Lexer {
 
             // This is called after `try_lex_binop()`, so if we get a '-' it must be a number
             x if x.is_numeric() || x == '-' => self.lex_number(),
-            x if x.is_alphabetic() || x == '_' => self.lex_name(),
+            x if name_start_char(x) => self.lex_name(),
             x => {
                 self.next();
                 self.errors.push(S(LexError::InvalidToken(x), self.span()));
@@ -494,6 +496,21 @@ impl Lexer {
             start,
             errors: self.errors.split_off(0),
         }
+    }
+}
+
+fn name_char(c: char) -> bool {
+    match c {
+        _ if c.is_alphanumeric() => true,
+        '_' | '?' | '\'' => true,
+        _ => false,
+    }
+}
+fn name_start_char(c: char) -> bool {
+    match c {
+        _ if c.is_alphabetic() => true,
+        '_' | '?' => true,
+        _ => false,
     }
 }
 
@@ -555,6 +572,7 @@ impl<'i> fmt::Display for Tok {
             Tok::TraitKw => "'trait'",
             Tok::AsKw => "'as'",
             Tok::IsKw => "'is'",
+            Tok::ModKw => "'mod'",
             Tok::Colon => "':'",
             Tok::Equals => "'='",
             Tok::Arrow => "'->'",

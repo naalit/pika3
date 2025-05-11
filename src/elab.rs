@@ -1647,8 +1647,9 @@ fn elab_block(block: &[PreStmt], last_: &SPre, ty: Option<GVal>, cxt1: &Cxt) -> 
 impl SPre {
     fn insert_par_regions(&self, name: Name, bucket: &mut Vec<Name>, db: &DB) -> SPre {
         match &***self {
-            Pre::Sigma(i, n1, left, n2, right) => S(
+            Pre::Sigma(b, i, n1, left, n2, right) => S(
                 Box::new(Pre::Sigma(
+                    *b,
                     *i,
                     *n1,
                     left.insert_par_regions(
@@ -1964,7 +1965,7 @@ impl SPre {
                 )
             }
             // TODO do we still default to interpreting `(x : a, y : b)` as a type? or a named sigma literal?
-            Pre::Sigma(_, Some(_), _, _, _) | Pre::Sigma(_, _, _, Some(_), _) => {
+            Pre::Sigma(false, _, Some(_), _, _, _) | Pre::Sigma(false, _, _, _, Some(_), _) => {
                 (self.check(Val::Type, cxt), Val::Type)
             }
             // If no type is given, assume monomorphic lambdas
@@ -2046,20 +2047,26 @@ impl SPre {
                 )
             }
             // Similarly assume non-dependent pair
-            Pre::Sigma(i, None, a, None, b) => {
+            Pre::Sigma(_, i, n1 @ None, a, n2 @ None, b) | Pre::Sigma(true, i, n1, a, n2, b) => {
+                let n1 = n1.as_deref().copied().unwrap_or(cxt.db.name("_"));
+                let n2 = n2.as_deref().copied().unwrap_or(cxt.db.name("_"));
                 let (ra, (a, aty)) = cxt.record_deps(|| a.infer(cxt, true));
-                let aty = Arc::new(aty.as_small().with_region(Some(ra.values())));
-                let (s, cxt) = cxt.bind(cxt.db.name("_"), aty.clone());
+                let raty = Arc::new(aty.small().clone().with_region(Some(ra.values())));
+                let (s, cxt) = cxt.bind(n1, raty.clone());
                 let (rb, (b, bty)) = cxt.record_deps(|| b.infer(&cxt, true));
-                let bty = bty
-                    .small()
-                    .clone()
-                    .with_region(Some(rb.values()))
-                    .quote(cxt.qenv());
+                let mut bty = bty.small().clone();
+                let aty = if ra == rb {
+                    cxt.add_deps(ra);
+                    Arc::new(aty.as_small())
+                } else {
+                    bty = bty.with_region(Some(rb.values()));
+                    raty
+                };
+                let bty = bty.quote(cxt.qenv());
                 (
                     Term::Pair(Box::new(a), Box::new(b)),
                     Val::fun(
-                        Sigma(cxt.db.name("_")),
+                        Sigma(n2),
                         *i,
                         s,
                         aty,
@@ -2105,31 +2112,94 @@ impl SPre {
                 let (lhs, mut lty) = lhs.infer(cxt, true);
                 // TODO this is messy
                 let mut r = None;
-                match lhs.eval(cxt.env()) {
-                    // TODO any problems from allowing nonempty spine?
-                    Val::Neutral(Head::Def(d), _) => {
-                        let child = cxt.db.idefs.intern(&DefLoc::Child(d, **dot));
-                        match cxt.def_type(child) {
-                            Ok(t) => r = Some((Term::Head(Head::Def(child)), (*t).clone())),
-                            Err(crate::query::DefElabError::NotFound) => {
-                                cxt.err(
-                                    "definition "
-                                        + lhs.pretty(&cxt.db)
-                                        + " has no member "
-                                        + dot.pretty(&cxt.db),
-                                    lspan,
-                                );
-                                r = Some((Term::Error, Val::Error));
+                // Accessing named fields of sigma types
+                if let mut v @ Val::Fun(VFun {
+                    class: Sigma(_), ..
+                }) = lty.whnf(cxt).clone()
+                {
+                    let mut cxt2 = cxt.clone();
+                    let mut spine = Vec::new();
+                    let mut t = None;
+                    loop {
+                        match v.uncap().2 {
+                            Val::Fun(VFun {
+                                class: Sigma(n2),
+                                psym,
+                                icit,
+                                pty,
+                                ..
+                            }) => {
+                                let s1 = cxt2.bind_(psym.0, Val::Error);
+                                let s2 = cxt2.bind_(*n2, Val::Error);
+                                spine.push((PCons::Pair(*icit), vec![(Expl, s1), (Expl, s2)]));
+                                if psym.0 == **dot {
+                                    t = Some(Term::Head(Head::Sym(s1)));
+                                    v = (**pty).clone();
+                                    break;
+                                } else if *n2 == **dot {
+                                    t = Some(Term::Head(Head::Sym(s2)));
+                                    v = v.app(Val::sym(s1));
+                                    break;
+                                } else {
+                                    v = v.app(Val::sym(s1));
+                                    continue;
+                                }
                             }
-                            Err(crate::query::DefElabError::Recursive) => {
-                                r = Some((
-                                    Term::Head(Head::Def(child)),
-                                    Val::Neutral(Head::Meta(Meta(child, 0)), default()),
-                                ))
+                            _ => {
+                                break;
                             }
                         }
                     }
-                    _ => (),
+                    if let Some(t) = t {
+                        r = Some((
+                            spine
+                                .iter()
+                                .enumerate()
+                                .rfold(t, |acc, (i, (pcons, syms))| {
+                                    let lhs = if i == 0 {
+                                        lhs.clone()
+                                    } else {
+                                        Term::Head(Head::Sym(spine[i - 1].1[1].1))
+                                    };
+                                    Term::App(
+                                        Box::new(lhs),
+                                        TElim::Match(
+                                            vec![(*pcons, syms.clone(), Arc::new(acc))],
+                                            None,
+                                        ),
+                                    )
+                                }),
+                            v,
+                        ));
+                    }
+                }
+                if r.is_none() {
+                    match lhs.eval(cxt.env()) {
+                        // TODO any problems from allowing nonempty spine?
+                        Val::Neutral(Head::Def(d), _) => {
+                            let child = cxt.db.idefs.intern(&DefLoc::Child(d, **dot));
+                            match cxt.def_type(child) {
+                                Ok(t) => r = Some((Term::Head(Head::Def(child)), (*t).clone())),
+                                Err(crate::query::DefElabError::NotFound) => {
+                                    cxt.err(
+                                        "definition "
+                                            + lhs.pretty(&cxt.db)
+                                            + " has no member "
+                                            + dot.pretty(&cxt.db),
+                                        lspan,
+                                    );
+                                    r = Some((Term::Error, Val::Error));
+                                }
+                                Err(crate::query::DefElabError::Recursive) => {
+                                    r = Some((
+                                        Term::Head(Head::Def(child)),
+                                        Val::Neutral(Head::Meta(Meta(child, 0)), default()),
+                                    ))
+                                }
+                            }
+                        }
+                        _ => (),
+                    }
                 }
                 if let Some(r) = r {
                     r
@@ -2291,7 +2361,7 @@ impl SPre {
                 Term::fun(Lam, *i, sym, None, aty, Arc::new(body))
             }
             // when checking pair against type, assume sigma
-            (Pre::Sigma(i, n1, aty, n2, body), Val::Type) => {
+            (Pre::Sigma(false, i, n1, aty, n2, body), Val::Type) => {
                 let n1 = n1.map(|x| *x).unwrap_or(cxt.db.name("_"));
                 let n2 = n2.map(|x| *x).unwrap_or(cxt.db.name("_"));
                 let aty = cxt.as_eval(|| aty.check(Val::Type, cxt));
@@ -2302,7 +2372,7 @@ impl SPre {
             }
             // process named sigma literals
             (
-                Pre::Sigma(i, Some(_), _, _, _),
+                Pre::Sigma(_, i, Some(_), _, _, _),
                 Val::Fun(VFun {
                     class: Sigma(_),
                     icit: i2,
@@ -2316,7 +2386,7 @@ impl SPre {
                 let mut terms: Vec<(Icit, SName, Term, Val)> = Vec::new();
                 loop {
                     match &**s {
-                        Pre::Sigma(i, Some(n1), r1, n2, r2) => {
+                        Pre::Sigma(_, i, Some(n1), r1, n2, r2) => {
                             if let Some((_, n, _, _)) =
                                 terms.iter().find(|(_, n, _, _)| n.0 == **n1)
                             {
@@ -2355,6 +2425,7 @@ impl SPre {
                                 Some(n2) => {
                                     s = S(
                                         Box::new(Pre::Sigma(
+                                            true,
                                             Expl,
                                             Some(*n2),
                                             r2.clone(),
@@ -2478,7 +2549,7 @@ impl SPre {
                 rterm
             }
             (
-                Pre::Sigma(i, None, a, None, b),
+                Pre::Sigma(_, i, None, a, None, b),
                 Val::Fun(VFun {
                     class: Sigma(_),
                     icit: i2,

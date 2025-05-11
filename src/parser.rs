@@ -66,7 +66,8 @@ pub enum Pre {
     App(SPre, SPre, Icit),
     // FCap is ommitted in function syntax so we can infer -> or ~> with currying
     Pi(Icit, Name, Option<FCap>, SPre, SPre),
-    Sigma(Icit, Option<SName>, SPre, Option<SName>, SPre),
+    // if the bool is true it means this is obligatorily interpreted as a term not a type (only used by `mod` currently)
+    Sigma(bool, Icit, Option<SName>, SPre, Option<SName>, SPre),
     Lam(Icit, SPrePat, SPre),
     Do(Vec<PreStmt>, SPre),
     Cap(Cap, SPre),
@@ -247,12 +248,15 @@ impl Parser {
             false
         }
     }
-    fn expect(&mut self, t: Tok) {
+    fn expect(&mut self, t: Tok) -> bool {
         if !self.maybe(t) {
             self.error(
                 &format!("expected {}, found {}", t, self.peek()),
                 self.tok_span(),
             );
+            false
+        } else {
+            true
         }
     }
     fn maybe_raw(&mut self, t: Tok) -> bool {
@@ -361,7 +365,7 @@ impl Parser {
             },
             Pre::Var(name) => PrePat::Name(false, S(*name, param.span())),
             // TODO (mut a : T, mut b : T)
-            Pre::Sigma(i, n1, a, n2, b) => {
+            Pre::Sigma(_, i, n1, a, n2, b) => {
                 let a = match n1 {
                     Some(n) => S(
                         Box::new(PrePat::Binder(
@@ -430,6 +434,75 @@ impl Parser {
                     s.expect(Tok::PClose);
                     *t.0
                 }
+                Tok::ModKw => {
+                    // Desugar `mod` to a `do` block with a bunch of local defs and a pair at the end
+                    let kw_span = s.tok_span();
+                    s.next_raw();
+                    s.skip_trivia_();
+                    if s.expect(Tok::Indent) {
+                        s.indent_stack.push(false);
+                    }
+
+                    let r = s.indent_stack.len();
+                    let mut v = Vec::new();
+                    let mut any_term = false;
+                    loop {
+                        v.push(PreStmt::Def(s.spanned(|s| {
+                            let d = s.def();
+                            if !any_term
+                                && matches!(
+                                    d,
+                                    PreDef::Type { .. } | PreDef::Val { value: Some(_), .. }
+                                )
+                            {
+                                any_term = true;
+                            }
+                            d
+                        })));
+                        if s.indent_stack.len() < r || !s.maybe(Tok::Newline) {
+                            break;
+                        }
+                    }
+                    let last = v
+                        .iter()
+                        .rfold::<Option<SPre>, _>(None, |acc, x| {
+                            let name = match x {
+                                PreStmt::Def(def) => def.name(),
+                                _ => unreachable!(),
+                            };
+                            let t = S(Box::new(Pre::Var(*name)), name.span());
+                            Some(match acc {
+                                None => t,
+                                Some(x) => match &**x {
+                                    Pre::Var(n2) => S(
+                                        Box::new(Pre::Sigma(
+                                            true,
+                                            Expl,
+                                            Some(name),
+                                            t,
+                                            Some(S(*n2, x.span())),
+                                            x,
+                                        )),
+                                        kw_span,
+                                    ),
+                                    Pre::Sigma { .. } => S(
+                                        Box::new(Pre::Sigma(
+                                            any_term,
+                                            Expl,
+                                            Some(name),
+                                            t,
+                                            None,
+                                            x,
+                                        )),
+                                        kw_span,
+                                    ),
+                                    _ => unreachable!(),
+                                },
+                            })
+                        })
+                        .unwrap_or_else(|| S(Box::new(Pre::Error), kw_span));
+                    Pre::Do(v, last)
+                }
                 Tok::DoKw => {
                     let kw_span = s.tok_span();
                     s.next_raw();
@@ -440,7 +513,8 @@ impl Parser {
                     } else {
                         // Do-lambda!!
                         let icit = s.maybe(Tok::COpen);
-                        let lhs = (s.peek() != Tok::WideArrow).then(|| s.app());
+                        let lhs = (s.peek() != Tok::WideArrow && s.peek() != Tok::CClose)
+                            .then(|| s.app());
                         let pat = S(
                             Box::new(match &lhs {
                                 Some(lhs) => s.reparse_pattern(
@@ -595,10 +669,15 @@ impl Parser {
                 continue;
             }
             let dot = self.maybe(Tok::Dot).then(|| self.spanned(|s| s.name()));
+            let sstart = self.pos();
             let (icit, arg) = if self.maybe(Tok::COpen) {
-                let term = self.term();
-                self.expect(Tok::CClose);
-                (Impl, term)
+                if self.maybe(Tok::CClose) {
+                    (Impl, S(Box::new(Pre::Unit), Span(sstart, self.pos_right())))
+                } else {
+                    let term = self.term();
+                    self.expect(Tok::CClose);
+                    (Impl, term)
+                }
             } else if !self.peek().starts_atom() && dot.is_some() {
                 let dot = dot.unwrap();
                 a = S(
@@ -643,7 +722,11 @@ impl Parser {
         let start = self.pos();
         let implicit = self.maybe(Tok::COpen);
         let lhs = if implicit {
-            self.term()
+            if self.peek() == Tok::CClose {
+                S(Box::new(Pre::Unit), Span(start, self.tok_span().1))
+            } else {
+                self.term()
+            }
         } else if pair {
             self.fun(false)
         } else {
@@ -694,7 +777,7 @@ impl Parser {
                 let (name, lhs) = self.reparse_pi_param(lhs);
                 let (name2, rhs) = self.reparse_pi_param(rhs);
                 S(
-                    Box::new(Pre::Sigma(icit, name, lhs, name2, rhs)),
+                    Box::new(Pre::Sigma(false, icit, name, lhs, name2, rhs)),
                     Span(start, self.pos_right()),
                 )
             }
@@ -716,11 +799,16 @@ impl Parser {
         if self.maybe(Tok::TypeKw) {
             let name = self.spanned(Self::name);
             let args: Vec<_> = std::iter::from_fn(|| {
+                let sstart = self.pos();
                 self.maybe(Tok::COpen)
                     .then(|| {
-                        let a = self.term();
-                        self.expect(Tok::CClose);
-                        (Impl, a)
+                        if self.maybe(Tok::CClose) {
+                            (Impl, S(Box::new(Pre::Unit), Span(sstart, self.pos_right())))
+                        } else {
+                            let a = self.term();
+                            self.expect(Tok::CClose);
+                            (Impl, a)
+                        }
                     })
                     .or_else(|| self.peek().starts_atom().then(|| (Expl, self.atom())))
                     .map(|(i, p)| {
@@ -741,12 +829,17 @@ impl Parser {
             let mut variants = Vec::new();
             while self.has_indent(plen) {
                 let name = self.spanned(Self::name);
+                let sstart = self.pos();
                 let arg = self
                     .maybe(Tok::COpen)
                     .then(|| {
-                        let a = self.term();
-                        self.expect(Tok::CClose);
-                        (Impl, a)
+                        if self.maybe(Tok::CClose) {
+                            (Impl, S(Box::new(Pre::Unit), Span(sstart, self.pos_right())))
+                        } else {
+                            let a = self.term();
+                            self.expect(Tok::CClose);
+                            (Impl, a)
+                        }
                     })
                     .or_else(|| self.peek().starts_atom().then(|| (Expl, self.atom())));
                 let ty = self
@@ -793,11 +886,16 @@ impl Parser {
                 return None;
             }
             last = self.pos;
+            let sstart = self.pos();
             self.maybe(Tok::COpen)
                 .then(|| {
-                    let a = self.term();
-                    self.expect(Tok::CClose);
-                    (Impl, a)
+                    if self.maybe(Tok::CClose) {
+                        (Impl, S(Box::new(Pre::Unit), Span(sstart, self.pos_right())))
+                    } else {
+                        let a = self.term();
+                        self.expect(Tok::CClose);
+                        (Impl, a)
+                    }
                 })
                 .or_else(|| self.peek().starts_atom().then(|| (Expl, self.atom())))
                 .map(|(i, p)| {
@@ -924,7 +1022,7 @@ impl SPrePat {
                         },
                         _ => None,
                     };
-                    Pre::Sigma(*icit, n1, a, n2, b)
+                    Pre::Sigma(false, *icit, n1, a, n2, b)
                 }
                 PrePat::Cons(s, _) => return None,
                 PrePat::Error => Pre::Error,

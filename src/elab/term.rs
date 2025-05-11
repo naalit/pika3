@@ -755,11 +755,13 @@ impl TElim {
                 v.iter()
                     .map(|(l, vars, t)| {
                         let mut env = env.clone();
-                        for (_, s) in vars {
-                            let (_, e) = env.bind(*s);
+                        let mut vars2 = Vec::new();
+                        for (i, s) in vars {
+                            let (s, e) = env.bind(*s);
+                            vars2.push((*i, s));
                             env = e;
                         }
-                        Ok((*l, vars.clone(), Arc::new(t.subst(&env)?)))
+                        Ok((*l, vars2, Arc::new(t.subst(&env)?)))
                     })
                     .collect::<Result<_, _>>()?,
                 fallback

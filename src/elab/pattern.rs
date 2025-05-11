@@ -2,7 +2,7 @@ use super::*;
 
 fn ty_pat_bind_needed(pre_ty: &SPre, cxt: &Cxt) -> bool {
     match &***pre_ty {
-        Pre::Sigma(_, n1, _, n2, rest) => {
+        Pre::Sigma(_, _, n1, _, n2, rest) => {
             n1.is_some() || n2.is_some() || ty_pat_bind_needed(rest, cxt)
         }
         _ => false,
@@ -21,7 +21,7 @@ pub fn pat_bind_type(
     }
     match (&***pre_ty, ty.uncap().2) {
         (
-            Pre::Sigma(i, n1, _, n2, rest),
+            Pre::Sigma(_, i, n1, _, n2, rest),
             Val::Fun(VFun {
                 class: Sigma(_),
                 icit: i2,
