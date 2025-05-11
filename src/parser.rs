@@ -53,9 +53,14 @@ pub enum PreStmt {
     Let(SPrePat, SPre),
     Def(S<PreDef>),
 }
+#[derive(Debug, Clone, Copy)]
+pub enum HoleSource {
+    TypeOf(SName),
+}
 #[derive(Debug, Clone)]
 pub enum Pre {
     Type,
+    Hole(HoleSource),
     Var(Name),
     Binder(SPre, SPre),
     App(SPre, SPre, Icit),
@@ -813,7 +818,8 @@ impl Parser {
             .maybe(Tok::Colon)
             .then(|| self.fun(true))
             .or_else(|| {
-                (!args.is_empty()).then(|| S(Box::new(Pre::Var(self.db.name("_"))), name.span()))
+                (!args.is_empty())
+                    .then(|| S(Box::new(Pre::Hole(HoleSource::TypeOf(name))), name.span()))
             })
             .map(|mut ty| {
                 for (icit, arg) in args.iter().rev() {
@@ -883,7 +889,7 @@ impl SPrePat {
             Box::new(match &***self {
                 PrePat::Name(_, s) => Pre::Binder(
                     S(Box::new(Pre::Var(**s)), s.span()),
-                    S(Box::new(Pre::Var(db.name("_"))), s.span()),
+                    S(Box::new(Pre::Hole(HoleSource::TypeOf(*s))), s.span()),
                 ),
                 PrePat::Binder(s, s1) => {
                     let s = s.extract_ty(db)?;

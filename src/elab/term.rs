@@ -16,8 +16,13 @@ impl Sym {
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Meta(pub(super) Def, pub(super) u32);
 impl Pretty for Meta {
-    fn pretty(&self, _db: &DB) -> Doc {
-        "?" + Doc::start(self.0.num()) + "." + Doc::start(self.1)
+    fn pretty(&self, db: &DB) -> Doc {
+        if self.1 == 0 {
+            // TODO this is for when `Meta::pretty` gets called for missing meta sources - if we put meta printing in terms back this will need to change
+            Doc::start("type of ") + db.idefs.get(self.0).name().pretty(db)
+        } else {
+            "?" + Doc::start(self.0.num()) + "." + Doc::start(self.1)
+        }
     }
 }
 
@@ -252,7 +257,7 @@ impl Val {
         Val::Neutral(Head::Sym(sym), default())
     }
     pub fn as_cap(self, c: Cap) -> Val {
-        if c == Cap::Own {
+        if c == Cap::Own || (c == Cap::Imm && !self.is_owned()) {
             return self;
         }
         match self {
@@ -834,7 +839,8 @@ impl Val {
             // We do need to whnf in caps because we call `.whnf().uncap()` and that needs to work
             Val::Cap(c, r, x) => x
                 .maybe_whnf(cxt)
-                .map(|x| Val::Cap(*c, r.clone(), Arc::new(x))),
+                // TODO do the order of these calls matter?
+                .map(|x| x.as_cap(*c).with_region(r.clone())),
             Val::Neutral(h, spine) => {
                 if let Some(val) = match h {
                     Head::Def(d) => cxt.def_value(*d).map(Arc::new),

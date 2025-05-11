@@ -63,7 +63,7 @@ pub fn elab_module(file: File, def: Def, db: &DB) -> ModuleElabResult {
             defs.push(elab.def);
             for (m, source, ty) in elab.unsolved_metas {
                 if root_cxt.meta_val(m).is_none() {
-                    source_map.insert(m, source);
+                    source_map.insert(m, source.clone());
                     root_cxt
                         .metas
                         .with_mut(|v| v.insert(m, MetaEntry::Unsolved(ty, source)));
@@ -87,13 +87,13 @@ pub fn elab_module(file: File, def: Def, db: &DB) -> ModuleElabResult {
                             vec![]
                         },
                         ..Error::simple(
-                            "conflicting meta solutions: "
+                            "conflicting solutions for "
                                 + source_map
                                     .get(&m)
                                     .map_or("metavariable " + m.pretty(db), |s| {
                                         s.pretty(db) + " (" + m.pretty(db) + ")"
                                     })
-                                + " previously solved to "
+                                + ": previously solved to "
                                 + mval.pretty(db)
                                 + " but then attempted to solve to "
                                 + val.pretty(db),
@@ -166,7 +166,7 @@ pub fn elab_def(def: Def, db: &DB) -> Option<DefElabResult> {
     eprintln!("[elab def {}]", def.pretty(db));
 
     let mut cxt = Cxt::new(def, AbsSpan(file, pre.name().span()), db.clone());
-    let mut def_elab = elab_def_raw(def, pre, &mut cxt);
+    let mut def_elab = elab_def_raw(def, pre, &[], &mut cxt);
     let keys = cxt
         .child_defs
         .with(|x| x.keys().copied().collect::<Vec<_>>());
@@ -179,7 +179,7 @@ pub fn elab_def(def: Def, db: &DB) -> Option<DefElabResult> {
         unsolved_metas: cxt.metas.with(|m| {
             m.iter()
                 .filter_map(|(m, v)| match v {
-                    MetaEntry::Unsolved(t, source) => Some((*m, *source, t.clone())),
+                    MetaEntry::Unsolved(t, source) => Some((*m, source.clone(), t.clone())),
                     MetaEntry::Solved(_) => None,
                 })
                 .collect()
@@ -199,7 +199,11 @@ pub fn elab_def(def: Def, db: &DB) -> Option<DefElabResult> {
     })
 }
 
-fn elab_def_raw(def: Def, pre: &S<PreDef>, cxt: &mut Cxt) -> DefElab {
+fn elab_def_raw(def: Def, pre: &S<PreDef>, scope_vars: &[Sym], cxt: &mut Cxt) -> DefElab {
+    let mspine: Arr<_> = scope_vars
+        .iter()
+        .map(|s| VElim::App(Expl, Arc::new(Val::sym(*s))))
+        .collect();
     match &**pre {
         PreDef::Val { name, ty, value } => {
             let ty = ty
@@ -208,7 +212,7 @@ fn elab_def_raw(def: Def, pre: &S<PreDef>, cxt: &mut Cxt) -> DefElab {
             let solved_ty = match &ty {
                 Some(ty) => {
                     let ty = ty.eval(cxt.env()).zonk(cxt, true);
-                    cxt.solve_meta(Meta(def, 0), &vec![], ty, Some(name.span()));
+                    cxt.solve_meta(Meta(def, 0), &mspine, ty, Some(name.span()));
                     true
                 }
                 None => false,
@@ -255,7 +259,7 @@ fn elab_def_raw(def: Def, pre: &S<PreDef>, cxt: &mut Cxt) -> DefElab {
             body.as_mut().map(|x| x.zonk(cxt, false));
             let ty = ty.zonk(cxt, true);
             if !solved_ty {
-                let ety = Val::Neutral(Head::Meta(Meta(def, 0)), default()).zonk(cxt, true);
+                let ety = Val::Neutral(Head::Meta(Meta(def, 0)), mspine.to_vec()).zonk(cxt, true);
                 if !ty
                     .clone()
                     .glued()
@@ -273,7 +277,7 @@ fn elab_def_raw(def: Def, pre: &S<PreDef>, cxt: &mut Cxt) -> DefElab {
 
             DefElab {
                 name: *name,
-                ty: Arc::new(ty),
+                ty: Arc::new(ty.as_cap(Cap::Imm)),
                 body: body.map(|x| DefBody::Val(Arc::new(x))),
                 can_eval: cxt.can_eval.take().is_none(),
                 children: Vec::new(),
@@ -298,7 +302,15 @@ fn elab_def_raw(def: Def, pre: &S<PreDef>, cxt: &mut Cxt) -> DefElab {
                 })
                 .eval(cxt.env())
                 .zonk(cxt, true);
-            cxt.solve_meta(Meta(def, 0), &vec![], ty.clone(), Some(name.span()));
+            cxt.solve_meta(Meta(def, 0), &mspine, ty.clone(), Some(name.span()));
+            let base_rty = scope_vars
+                .iter()
+                .fold(Term::Head(Head::Def(def)), |acc, s| {
+                    Term::App(
+                        Box::new(acc),
+                        TElim::App(Expl, Box::new(Term::Head(Head::Sym(*s)))),
+                    )
+                });
 
             let mut children = Vec::new();
             for (vname, vargs, vty) in variants {
@@ -318,14 +330,12 @@ fn elab_def_raw(def: Def, pre: &S<PreDef>, cxt: &mut Cxt) -> DefElab {
                         for (_, (_, m)) in &m {
                             cxt = m.bind(0, &default(), &cxt);
                         }
-                        let rty = m
-                            .iter()
-                            .fold(Term::Head(Head::Def(def)), |acc, (i, (s, _))| {
-                                Term::App(
-                                    Box::new(acc),
-                                    TElim::App(*i, Box::new(Term::Head(Head::Sym(*s)))),
-                                )
-                            });
+                        let rty = m.iter().fold(base_rty.clone(), |acc, (i, (s, _))| {
+                            Term::App(
+                                Box::new(acc),
+                                TElim::App(*i, Box::new(Term::Head(Head::Sym(*s)))),
+                            )
+                        });
                         let vty = vargs.as_ref().map_or(rty.clone(), |(i, paty)| {
                             let aty = cxt.as_eval(|| paty.check(Val::Type, &cxt));
                             let vaty = aty.eval(cxt.env());
@@ -384,18 +394,22 @@ enum MetaEntry {
     Solved(Arc<Val>),
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum MetaSource {
     TypeOf(Name),
     ImpArg(Name),
     Hole,
+    Unknown,
+    Other(Str),
 }
 impl Pretty for MetaSource {
     fn pretty(&self, db: &DB) -> Doc {
         match self {
-            MetaSource::TypeOf(n) => "type of " + n.pretty(db),
+            MetaSource::TypeOf(n) => "inferred type of " + n.pretty(db),
             MetaSource::ImpArg(n) => "implicit argument " + n.pretty(db),
-            MetaSource::Hole => "hole".into(),
+            MetaSource::Hole => "value of _".into(),
+            MetaSource::Unknown => "metavariable".into(),
+            MetaSource::Other(s) => s.into(),
         }
     }
 }
@@ -403,7 +417,9 @@ impl Pretty for MetaSource {
 impl Val {
     fn is_owned(&self) -> bool {
         match self {
-            Val::Neutral(Head::Builtin(Builtin::Region), v) if v.is_empty() => false,
+            Val::Neutral(Head::Builtin(Builtin::Region | Builtin::UnitType), v) if v.is_empty() => {
+                false
+            }
             Val::Neutral(_, _) => true,
             Val::Fun(VFun {
                 class: Sigma(_),
@@ -633,6 +649,7 @@ impl Region {
                 }
             } else {
                 okay = false;
+                // TODO this can happen when returning something from a function that borrows locals, that should be possible to do but we need to check somewhere that they haven't been invalidated
                 cxt.errors.push(Error::simple(
                     "internal error: couldnt find " + s.0.pretty(&cxt.db),
                     b.span,
@@ -776,7 +793,7 @@ impl Cxt {
             Some(ChildDefState::NotStarted(scope, pre, mut cxt)) => {
                 self.child_defs
                     .with_mut(|x| x.insert(def, ChildDefState::InProgress));
-                let elab = elab_def_raw(def, &pre, &mut cxt);
+                let elab = elab_def_raw(def, &pre, &scope, &mut cxt);
                 let body = match &elab.body {
                     Some(DefBody::Val(body)) => Some(DefBody::Val(Arc::new(
                         scope.iter().rfold((**body).clone(), |acc, s| {
@@ -787,7 +804,7 @@ impl Cxt {
                 };
                 let ty = scope.iter().rfold(elab.ty.clone(), |acc, s| {
                     Arc::new(Val::fun(
-                        Lam,
+                        Pi(FCap::Imm),
                         Expl,
                         *s,
                         Arc::new(Val::Error),
@@ -912,7 +929,7 @@ impl Cxt {
                     let ty = self.def_type(*def).unwrap_or_else(|e| match e {
                         DefElabError::NotFound => unreachable!(),
                         DefElabError::Recursive => {
-                            Arc::new(Val::Neutral(Head::Meta(Meta(*def, 0)), default()))
+                            Arc::new(Val::Neutral(Head::Meta(Meta(*def, 0)), spine.clone()))
                         }
                     });
                     let ty = Arc::new(
@@ -1070,7 +1087,7 @@ impl Cxt {
             ..
         }) = &ty
         {
-            let m1 = self.new_meta((**aty).clone(), source, span);
+            let m1 = self.new_meta((**aty).clone(), source.clone(), span);
             let bty = ty.app(m1.clone());
             let m2 = self.new_meta(bty, source, span);
             let val = Val::Pair(Arc::new(m1), Arc::new(m2));
@@ -1115,7 +1132,7 @@ impl Cxt {
     fn meta_source(&self, m: Meta) -> Option<S<MetaSource>> {
         self.metas.with(|x| {
             x.get(&m).and_then(|x| match x {
-                MetaEntry::Unsolved(_, source) => Some(*source),
+                MetaEntry::Unsolved(_, source) => Some(source.clone()),
                 MetaEntry::Solved(_) => None,
             })
         })
@@ -1139,13 +1156,13 @@ impl Cxt {
                 Some(v)
             })
     }
-    fn solve_meta(&self, meta: Meta, spine: &Spine, solution: Val, span: Option<Span>) -> bool {
+    fn solve_meta(&self, meta: Meta, spine: &[VElim], solution: Val, span: Option<Span>) -> bool {
         self.solve_meta_(meta, spine, solution, span, false)
     }
     fn solve_meta_(
         &self,
         meta: Meta,
-        spine: &Spine,
+        spine: &[VElim],
         solution: Val,
         span: Option<Span>,
         zonked: bool,
@@ -1153,7 +1170,7 @@ impl Cxt {
         if spine.iter().any(|x| !matches!(x, VElim::App(_, _))) {
             self.err(
                 "cannot solve meta with non-app in spine: "
-                    + Val::Neutral(Head::Meta(meta), spine.clone()).pretty(&self.db),
+                    + Val::Neutral(Head::Meta(meta), spine.to_vec()).pretty(&self.db),
                 span,
             );
         }
@@ -1200,11 +1217,11 @@ impl Cxt {
             }
             Err(s) => {
                 self.err(
-                    Doc::start("cannot solve meta ")
+                    Doc::start("solution for ")
                         + self
                             .meta_source(meta)
                             .map_or(meta.pretty(&self.db), |m| m.pretty(&self.db))
-                        + " to a term referencing local variable "
+                        + " references local variable "
                         + s.0.pretty(&self.db)
                         + ": `"
                         + solution.pretty(&self.db)
@@ -1679,6 +1696,22 @@ impl SPre {
     fn infer_(&self, cxt: &Cxt, mut should_insert_metas: bool, borrow_as: Cap) -> (Term, GVal) {
         let checkpoint = cxt.start_record_deps();
         let (s, sty) = match &***self {
+            Pre::Hole(source) => {
+                // hole
+                let mty =
+                    cxt.new_meta(Val::Type, MetaSource::TypeOf(cxt.db.name("_")), self.span());
+                let m = cxt
+                    .new_meta(
+                        mty.clone(),
+                        match source {
+                            // TODO can we do something with this span?
+                            crate::parser::HoleSource::TypeOf(s) => MetaSource::TypeOf(**s),
+                        },
+                        self.span(),
+                    )
+                    .quote(&cxt.qenv());
+                (m, mty)
+            }
             Pre::Var(name) if cxt.db.name("_") == *name => {
                 // hole
                 let mty = cxt.new_meta(Val::Type, MetaSource::TypeOf(*name), self.span());
@@ -1759,8 +1792,8 @@ impl SPre {
                             Val::Type,
                             cxt.meta_source(*m)
                                 .as_deref()
-                                .copied()
-                                .unwrap_or(MetaSource::Hole),
+                                .cloned()
+                                .unwrap_or(MetaSource::Unknown),
                             fs.span(),
                             spine.clone(),
                         );
@@ -1769,8 +1802,8 @@ impl SPre {
                             Val::Type,
                             cxt.meta_source(*m)
                                 .as_deref()
-                                .copied()
-                                .unwrap_or(MetaSource::Hole),
+                                .cloned()
+                                .unwrap_or(MetaSource::Unknown),
                             fs.span(),
                             spine
                                 .iter()
@@ -2073,7 +2106,8 @@ impl SPre {
                 // TODO this is messy
                 let mut r = None;
                 match lhs.eval(cxt.env()) {
-                    Val::Neutral(Head::Def(d), v) if v.is_empty() => {
+                    // TODO any problems from allowing nonempty spine?
+                    Val::Neutral(Head::Def(d), _) => {
                         let child = cxt.db.idefs.intern(&DefLoc::Child(d, **dot));
                         match cxt.def_type(child) {
                             Ok(t) => r = Some((Term::Head(Head::Def(child)), (*t).clone())),
@@ -2112,7 +2146,11 @@ impl SPre {
                 }
             }
             Pre::Case(x, branches) => {
-                let rty = cxt.new_meta(Val::Type, MetaSource::Hole, self.span());
+                let rty = cxt.new_meta(
+                    Val::Type,
+                    MetaSource::Other("return type of `case`".into()),
+                    self.span(),
+                );
                 let t = elab_case(cxt, x, branches, rty.clone().glued());
                 (t, rty)
             }

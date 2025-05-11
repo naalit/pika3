@@ -88,6 +88,7 @@ impl Display for Cap {
 }
 
 pub type Str = Arc<str>;
+pub type Arr<T> = Arc<[T]>;
 
 pub trait ToRope {
     fn rope(self) -> Rope;

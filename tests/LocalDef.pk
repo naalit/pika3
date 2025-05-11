@@ -26,3 +26,18 @@ def local_type = do
   def p = Pair.New (Type, t)
 
   ()
+
+def Any: Type = {t:_},t
+def context_dependent (a : Type) : Any = do
+  type SpecializedOption of
+    None
+    Some a
+
+  SpecializedOption.None
+
+def const (a : imm t) : imm t -> imm t = do
+  # TODO this type annotation shouldn't be necessary
+  def f : imm t -> imm t = x => a
+  f
+
+def eval_outside : const Type () = Type
