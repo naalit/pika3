@@ -1645,41 +1645,6 @@ fn elab_block(block: &[PreStmt], last_: &SPre, ty: Option<GVal>, cxt1: &Cxt) -> 
 }
 
 impl SPre {
-    fn insert_par_regions(&self, name: Name, bucket: &mut Vec<Name>, db: &DB) -> SPre {
-        match &***self {
-            Pre::Sigma(b, i, n1, left, n2, right) => S(
-                Box::new(Pre::Sigma(
-                    *b,
-                    *i,
-                    *n1,
-                    left.insert_par_regions(
-                        n1.as_deref().copied().unwrap_or_else(|| db.name("_")),
-                        bucket,
-                        db,
-                    ),
-                    *n2,
-                    right.insert_par_regions(
-                        n2.as_deref().copied().unwrap_or_else(|| db.name("_")),
-                        bucket,
-                        db,
-                    ),
-                )),
-                self.span(),
-            ),
-            Pre::RegionAnn(_, _) => self.clone(),
-            _ => {
-                let name = db.name(&format!("'{}", db.get(name)));
-                bucket.push(name);
-                S(
-                    Box::new(Pre::RegionAnn(
-                        vec![S(Box::new(Pre::Var(name)), self.span())],
-                        self.clone(),
-                    )),
-                    self.span(),
-                )
-            }
-        }
-    }
     // Helper to delegate to infer or check
     fn elab(&self, ty: Option<GVal>, cxt: &Cxt) -> (Term, GVal) {
         match ty {
@@ -1874,17 +1839,13 @@ impl SPre {
                 if q {
                     cxt.push_uquant();
                 }
-                //let mut borrows = Vec::new();
 
                 let (rself_sym, mut cxt) =
                     cxt.bind(cxt.db.name("'self"), Arc::new(Builtin::Region.into()));
                 cxt.rself = Some(rself_sym);
-                // let ra = cxt.bind_(cxt.db.name("'_"), Arc::new(Builtin::Region.into()));
 
-                //let paty = paty.insert_par_regions(*n, &mut borrows, &cxt.db);
                 let aty = cxt.as_eval(|| paty.check(Val::Type, &cxt));
                 let vaty = aty.eval(cxt.env());
-                //.with_region(Some(vec![Arc::new(Val::sym(ra))]));
                 let aty = vaty.quote(cxt.qenv());
                 let (s, cxt) = cxt.bind(*n, vaty.clone());
                 // Any curried pis with unspecified caps (from function syntax) will be updated to be owned functions
@@ -1898,69 +1859,31 @@ impl SPre {
                     Val::Neutral(Head::Sym(s), default()),
                     &vaty,
                     &cxt,
-                    |cxt| {
-                        // we don't want just leaving off the return type (which then generates a hole) to mean anything about the return region, that should be inferred
-                        // let body = if matches!(&***body, Pre::RegionAnn(_, _))
-                        //     || matches!(&***body, Pre::Var(v) if *v == cxt.db.name("_"))
-                        // {
-                        //     body.clone()
-                        // } else {
-                        //     // TODO:
-                        //     // (_: a, _: b) -> a
-                        //     // ->
-                        //     // (_: '_ a, _: '_ b) -> '_ '_ a
-                        //     // but this is a *presyntax* transformation - those '_s aren't separate, they're literally the same variable!
-                        //     // which... is not really what we want, to be *perfectly* honest.
-                        //     // partly because '_ should never be the same variable as another '_ - it's the *anonymous* lifetime.
-                        //     // and partly because, even if you have `(x: a, x: b)`, we probably shouldn't do this transformation at presyntax -
-                        //     // we should do it in actual syntax, or at least have some way of keeping the two `'x`s separate.
-                        //     // basicanlly, this should be hygienic in the macro sense, and the way we are currently doing it is not.
-                        //     S(
-                        //         Box::new(Pre::RegionAnn(
-                        //             borrows
-                        //                 .into_iter()
-                        //                 .map(|x| S(Box::new(Pre::Var(x)), body.span()))
-                        //                 // also include 'self on the return type by default
-                        //                 .chain(std::iter::once(S(
-                        //                     Box::new(Pre::Var(cxt.db.name("'self"))),
-                        //                     body.span(),
-                        //                 )))
-                        //                 .collect(),
-                        //             body.clone(),
-                        //         )),
-                        //         body.span(),
-                        //     )
-                        // };
-                        body.check(Val::Type, cxt)
-                    },
+                    |cxt| body.check(Val::Type, cxt),
                 );
                 let scope = q.then(|| cxt.pop_uquant().unwrap());
                 (
-                    scope
-                        .into_iter()
-                        .flatten()
-                        // .chain(std::iter::once((ra, Arc::new(Builtin::Region.into()))))
-                        .rfold(
-                            Term::fun(
-                                Pi(c.unwrap_or(FCap::Imm)),
-                                *i,
-                                s,
-                                Some(rself_sym),
-                                aty,
-                                Arc::new(body),
-                            ),
-                            |acc, (s, ty)| {
-                                Term::fun(
-                                    // use imm for the uquant pis
-                                    Pi(FCap::Imm),
-                                    Impl,
-                                    s,
-                                    None, // TODO what is the proper region assignment for uquant pis?
-                                    ty.quote(cxt.qenv()),
-                                    Arc::new(acc),
-                                )
-                            },
+                    scope.into_iter().flatten().rfold(
+                        Term::fun(
+                            Pi(c.unwrap_or(FCap::Imm)),
+                            *i,
+                            s,
+                            Some(rself_sym),
+                            aty,
+                            Arc::new(body),
                         ),
+                        |acc, (s, ty)| {
+                            Term::fun(
+                                // use imm for the uquant pis
+                                Pi(FCap::Imm),
+                                Impl,
+                                s,
+                                None, // TODO what is the proper region assignment for uquant pis?
+                                ty.quote(cxt.qenv()),
+                                Arc::new(acc),
+                            )
+                        },
+                    ),
                     Val::Type,
                 )
             }
@@ -1978,11 +1901,6 @@ impl SPre {
                 let before_syms: FxHashSet<_> = cxt.vars.keys().copied().collect();
                 let (s, pat) = PMatch::new(None, &[pat.clone()], None, &mut cxt2);
                 let aty = pat.ty.clone();
-                // // TODO do we need this region??
-                // let ra = cxt2.bind_(cxt.db.name("'_"), Arc::new(Builtin::Region.into()));
-                // let aty3 = (*pat.ty)
-                //     .clone()
-                //     .with_region(Some(vec![Arc::new(Val::sym(ra))]));
                 let aty2 = aty.quote(cxt.qenv());
 
                 cxt2.push_closure(s);
