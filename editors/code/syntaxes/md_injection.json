@@ -1,0 +1,18 @@
+{
+    "fileTypes": [],
+    "scopeName": "markdown.injection.pika",
+    "injectionSelector": "L:markup.fenced_code.block.markdown",
+    "patterns": [
+        { "include": "#pika" }
+    ],
+    "repository": {
+        "pika": {
+            "begin": "(?<=```)(pk|pika)",
+            "end": "(?=```)",
+            "name": "meta.embedded.block.pika",
+            "patterns": [{
+                "include": "source.pika"
+            }]
+        }
+    }
+}

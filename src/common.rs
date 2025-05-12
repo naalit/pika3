@@ -331,6 +331,26 @@ fn byte_to_line(rope: &Rope, byte: usize) -> (usize, usize, Rope) {
         rope.len()
     )
 }
+pub fn line_to_byte(rope: &Rope, line: usize) -> (usize, Rope) {
+    let mut b = 0;
+    for (i, r) in rope.lines().enumerate() {
+        if i == line {
+            return (b, r);
+        }
+        b += r.len() + 1;
+    }
+    if rope.lines().count() == line {
+        return (rope.len(), default());
+    }
+    panic!(
+        "out of bounds: line {} in rope with len in lines {}",
+        line,
+        rope.lines().count()
+    )
+}
+pub fn char_to_byte(rope: &Rope, ch: usize) -> usize {
+    rope.char_indices().nth(ch).unwrap_or((rope.len(), '_')).0
+}
 
 /// Uses byte positions
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -500,11 +520,11 @@ impl Error {
         r.finish().eprint(cache).unwrap();
     }
 
-    pub fn to_lsp(self, split_span: &AbsSpan, db: &DB) -> lsp_types::Diagnostic {
-        let span = split_span.add(self.primary.span);
+    pub fn to_lsp(self, file: File, db: &DB) -> lsp_types::Diagnostic {
+        let primary_span = self.primary.span.abs(file);
 
         lsp_types::Diagnostic {
-            range: span.lsp_range(db),
+            range: primary_span.lsp_range(db),
             severity: Some(self.severity.lsp()),
             code: None,
             code_description: None,
@@ -516,8 +536,8 @@ impl Error {
                     .into_iter()
                     .map(|x| lsp_types::DiagnosticRelatedInformation {
                         location: lsp_types::Location {
-                            uri: db.ifiles.get(split_span.0).to_url().unwrap(),
-                            range: split_span.add(x.span).lsp_range(db),
+                            uri: db.ifiles.get(file).to_url().unwrap(),
+                            range: x.span.abs(file).lsp_range(db),
                         },
                         message: x.message.to_string(false),
                     })

@@ -5,6 +5,7 @@ mod lexer;
 mod parser;
 mod pretty;
 mod query;
+mod server;
 
 use std::{io::Read, path::PathBuf};
 
@@ -14,7 +15,7 @@ use pretty::IntoStyle;
 
 use crate::common::*;
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Hash, PartialEq, Eq)]
 pub struct ElabModule {
     pub file: File,
     pub def: Def,
@@ -92,27 +93,8 @@ pub fn elab_files(filenames: &[PathBuf]) -> Result<ElabResult, (Option<PathBuf>,
                 .map_err(|e| (file_name.clone().into(), e))?;
             (input.rope(), input)
         };
-
-        let file = db.ifiles.intern(&FileLoc::File(
-            std::path::Path::new(&file_name).canonicalize().unwrap(),
-        ));
-        let def = file_name
-            .components()
-            .skip(crate_root.components().count())
-            .fold(crate_def, |acc, component| {
-                db.idefs.intern(&DefLoc::Child(
-                    acc,
-                    // TODO better handling of multiple . in file names
-                    db.name(
-                        &component
-                            .as_os_str()
-                            .to_string_lossy()
-                            .trim_end_matches(".pk"),
-                    ),
-                ))
-            });
-        db.set_file_source(def, file, input.clone(), Some(input_s.into()));
-        files.push(ElabModule { file, def });
+        let module = elab_file(&mut db, &crate_root, crate_def, file_name, input, input_s);
+        files.push(module);
     }
 
     Ok(ElabResult {
@@ -120,6 +102,37 @@ pub fn elab_files(filenames: &[PathBuf]) -> Result<ElabResult, (Option<PathBuf>,
         db,
         crate_def,
     })
+}
+
+pub fn elab_file(
+    db: &mut DB,
+    crate_root: &PathBuf,
+    crate_def: Interned<DefLoc>,
+    file_name: &PathBuf,
+    input: Rope,
+    input_s: String,
+) -> ElabModule {
+    let file = db.ifiles.intern(&FileLoc::File(
+        std::path::Path::new(&file_name).canonicalize().unwrap(),
+    ));
+    let def = file_name
+        .components()
+        .skip(crate_root.components().count())
+        .fold(crate_def, |acc, component| {
+            db.idefs.intern(&DefLoc::Child(
+                acc,
+                // TODO better handling of multiple . in file names
+                db.name(
+                    &component
+                        .as_os_str()
+                        .to_string_lossy()
+                        .trim_end_matches(".pk"),
+                ),
+            ))
+        });
+    db.set_file_source(def, file, input.clone(), Some(input_s.into()));
+    let module = ElabModule { file, def };
+    module
 }
 
 fn pretty_def(e: &DefElab, db: &DB) -> Doc {
@@ -145,6 +158,13 @@ fn pretty_def(e: &DefElab, db: &DB) -> Doc {
 
 pub fn driver(config: Config) {
     // CLI driver
+    if config.command == args::Command::Server {
+        let mut server = crate::server::Server::start(default());
+        server.main_loop();
+        server.shutdown();
+        return;
+    }
+
     if config.files.is_empty() {
         Doc::none()
             .add("Error", ariadne::Color::Red.style())

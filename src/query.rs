@@ -45,6 +45,7 @@ use std::{
     collections::{HashMap, HashSet},
     hash::Hash,
     marker::PhantomData,
+    path::PathBuf,
     sync::RwLock,
 };
 
@@ -184,6 +185,20 @@ impl DB {
         self.idefs.intern(&DefLoc::Crate(name))
     }
 
+    pub fn find_crate(&self, mut f: File) -> Option<(Def, PathBuf)> {
+        loop {
+            if let Some(n) = self.crate_roots.get(&f) {
+                let f = self.ifiles.get(f).to_url().unwrap().to_file_path().unwrap();
+                break Some((self.idefs.intern(&DefLoc::Crate(*n)), f));
+            }
+            if let Some(p) = self.ifiles.get(f).parent() {
+                f = self.ifiles.intern(&p);
+            } else {
+                break None;
+            }
+        }
+    }
+
     /// If the Option<type> is None, then the definition is recursive and we need a meta
     pub fn lookup_def_name(&self, at: Def, name: Name) -> Option<(Def, Option<Arc<Val>>)> {
         let mut at = at;
@@ -219,6 +234,19 @@ impl DB {
         }
         let parsed = crate::parser::parse(rope, self);
         self.parsed.insert(f, Arc::new(parsed));
+        self.elab.invalidate_file(f, self);
+    }
+
+    pub fn modify_file_source(&mut self, f: File, callback: impl FnOnce(&mut Rope)) {
+        let source = self.files.get_mut(&f).unwrap();
+        callback(&mut source.rope);
+        source.str = None;
+
+        // reparse and invalidate elab stuff
+        let rope = source.rope.clone();
+        let parsed = crate::parser::parse(rope, self);
+        self.parsed.insert(f, Arc::new(parsed));
+        // TODO can we save any elabs from this file?? presumably we can check if AST matches
         self.elab.invalidate_file(f, self);
     }
 
