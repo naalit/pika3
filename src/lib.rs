@@ -6,6 +6,7 @@ mod parser;
 mod pretty;
 mod query;
 mod server;
+mod vm;
 
 use std::{io::Read, path::PathBuf};
 
@@ -195,8 +196,19 @@ pub fn driver(config: Config) {
 
     for m in r.files.clone() {
         let module = elab::elab_module(m.file, m.def, &r.db);
+        let mut m = None;
         for i in &module.module.defs {
             pretty_def(i, &r.db).emit_stderr();
+            if i.name.0 == r.db.name("main") {
+                if let Some(elab::DefBody::Val(f)) = &i.body {
+                    if let elab::Term::Fun(f) = &**f {
+                        m = Some(f.lower(&default()));
+                    }
+                }
+            }
+        }
+        if let Some((m, _)) = m {
+            println!("\nmain function bytecode:\n{}", m.pretty(&r.db));
         }
     }
 

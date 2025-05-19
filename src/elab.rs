@@ -6,7 +6,7 @@ use std::sync::Arc;
 use pattern::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use term::*;
-pub use term::{Builtin, Head, Term, Val};
+pub use term::{Builtin, Head, Sym, TElim, TFun, Term, VFun, Val};
 
 use crate::common::*;
 use crate::parser::{Pre, PreDef, PrePat, PreStmt, SPre, SPrePat};

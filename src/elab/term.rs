@@ -311,9 +311,9 @@ pub struct TFun {
     pub class: Class,
     pub icit: Icit,
     rself_sym: Option<Sym>,
-    psym: Sym,
-    pty: Box<Term>,
-    body: Arc<Term>,
+    pub psym: Sym,
+    pub pty: Box<Term>,
+    pub body: Arc<Term>,
 }
 impl VFun {
     fn quote_(&self, env: &QEnv) -> Result<TFun, Sym> {
